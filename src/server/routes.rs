@@ -1,0 +1,111 @@
+use std::sync::Arc;
+use parking_lot::Mutex;
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use crate::engine::Engine;
+use crate::server::dto::{
+    ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+    HealthResponse,
+};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub engine: Arc<Mutex<Engine>>,
+}
+
+pub fn create_app(engine: Arc<Mutex<Engine>>) -> Router {
+    let state = AppState { engine };
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/v1/chat/completions", post(chat_completions_handler))
+        .with_state(state)
+}
+
+async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let engine = state.engine.lock();
+    let resp = HealthResponse {
+        status: "ok".to_string(),
+        running: engine.running_count(),
+        waiting: engine.waiting_count(),
+        free_blocks: engine.free_blocks_count(),
+    };
+    Json(resp)
+}
+
+async fn chat_completions_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let max_tokens = req.max_tokens.unwrap_or(16);
+    
+    // Minimal mock tokenization: convert characters to token IDs
+    let prompt_text = req
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    
+    let prompt_tokens: Vec<u32> = prompt_text
+        .as_bytes()
+        .iter()
+        .map(|&b| (b % 40) as u32)
+        .collect();
+
+    let request_id = {
+        let mut engine = state.engine.lock();
+        engine.add_request(prompt_tokens, max_tokens)
+    };
+
+    // Run inference steps until request finishes
+    let mut generated_token_ids = Vec::new();
+    loop {
+        let outputs = {
+            let mut engine = state.engine.lock();
+            engine.step().map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Engine error: {}", e),
+                )
+            })?
+        };
+
+        let mut done = false;
+        for out in outputs {
+            if out.request_id == request_id {
+                generated_token_ids.push(out.token_id);
+                if out.is_finished {
+                    done = true;
+                }
+            }
+        }
+
+        if done {
+            break;
+        }
+    }
+
+    let response_text = format!("Response generated with {} tokens", generated_token_ids.len());
+
+    let resp = ChatCompletionResponse {
+        id: format!("chatcmpl-{}", request_id),
+        object: "chat.completion".to_string(),
+        created: 1775000000,
+        model: req.model,
+        choices: vec![ChatCompletionChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: response_text,
+            },
+            finish_reason: "stop".to_string(),
+        }],
+    };
+
+    Ok(Json(resp))
+}

@@ -1,0 +1,27 @@
+[package]
+name = "kanso-infer"
+version = "0.1.0"
+edition = "2024"
+description = "A minimalist LLM inference engine in Rust with Paged KV Cache, Continuous Batching, and Metal Shaders"
+
+[lib]
+name = "kanso_infer"
+path = "src/lib.rs"
+
+[dependencies]
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+tokenizers = "0.23.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "net"] }
+tokio-stream = "0.1"
+futures-util = { version = "0.3", default-features = false }
+axum = "0.8"
+clap = { version = "4.6.4", features = ["derive"] }
+rand = "0.9"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
