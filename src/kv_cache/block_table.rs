@@ -1,3 +1,5 @@
+use super::block_pool::BlockPool;
+
 #[derive(Debug, Clone, Default)]
 pub struct BlockTable {
     blocks: Vec<usize>,
@@ -35,5 +37,27 @@ impl BlockTable {
 
     pub fn required_blocks(&self, block_size: usize) -> usize {
         (self.num_tokens + block_size - 1) / block_size
+    }
+
+    pub fn rollback_blocks(
+        &mut self,
+        target_num_tokens: usize,
+        block_size: usize,
+        pool: &mut BlockPool,
+    ) -> Vec<usize> {
+        let needed_blocks = if target_num_tokens == 0 {
+            0
+        } else {
+            (target_num_tokens + block_size - 1) / block_size
+        };
+        let mut freed = Vec::new();
+        while self.blocks.len() > needed_blocks {
+            if let Some(blk) = self.blocks.pop() {
+                pool.free(blk);
+                freed.push(blk);
+            }
+        }
+        self.num_tokens = target_num_tokens;
+        freed
     }
 }

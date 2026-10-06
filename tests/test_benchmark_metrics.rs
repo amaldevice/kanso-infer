@@ -13,6 +13,26 @@ fn test_bench_metric_calculation() {
 }
 
 #[test]
+fn test_bench_itl_metrics_calculation() {
+    let ttfts = vec![10.0, 15.0];
+    let itls = vec![5.0, 10.0, 15.0, 20.0];
+    let report = kanso_infer::bench::evaluate_run_with_timings(
+        100,
+        1.0,
+        2,
+        &ttfts,
+        &itls,
+        10,
+        0.1,
+        20,
+        0.5,
+        12345,
+    );
+
+    assert_eq!(report.itl_mean_ms, 12.5);
+    assert_eq!(report.itl_p99_ms, 20.0);
+}
+#[test]
 fn test_run_synthetic_sweep_execution() {
     let model = kanso_infer::model::Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     let mut engine = kanso_infer::engine::Engine::new(model, 4, 30, 4);
@@ -27,4 +47,6 @@ fn test_run_synthetic_sweep_execution() {
     assert_eq!(report.num_requests, 2);
     assert_eq!(report.total_tokens, 6);
     assert!(report.total_tokens_per_sec > 0.0);
+    assert!(report.itl_mean_ms >= 0.0);
+    assert!(report.itl_p99_ms >= report.itl_mean_ms);
 }

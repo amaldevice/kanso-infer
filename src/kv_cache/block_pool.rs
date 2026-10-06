@@ -34,6 +34,23 @@ impl BlockPool {
             self.ref_counts[block] += 1;
         }
     }
+    pub fn claim_block(&mut self, block: usize) -> bool {
+        if block < self.total_blocks {
+            if self.ref_counts[block] > 0 {
+                self.ref_counts[block] += 1;
+                true
+            } else if let Some(pos) = self.free_blocks.iter().position(|&b| b == block) {
+                self.free_blocks.remove(pos);
+                self.ref_counts[block] = 1;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
 
     pub fn free(&mut self, block: usize) {
         if block < self.total_blocks && self.ref_counts[block] > 0 {
@@ -41,6 +58,12 @@ impl BlockPool {
             if self.ref_counts[block] == 0 {
                 self.free_blocks.push(block);
             }
+        }
+    }
+
+    pub fn rollback_blocks(&mut self, blocks: &[usize]) {
+        for &block in blocks {
+            self.free(block);
         }
     }
 }

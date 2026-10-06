@@ -7,6 +7,7 @@ pub enum EngineError {
     Config(String),
     Scheduler(String),
     Model(String),
+    Metal(String),
 }
 
 impl fmt::Display for EngineError {
@@ -17,6 +18,7 @@ impl fmt::Display for EngineError {
             Self::Config(e) => write!(f, "Config error: {}", e),
             Self::Scheduler(e) => write!(f, "Scheduler error: {}", e),
             Self::Model(e) => write!(f, "Model error: {}", e),
+            Self::Metal(e) => write!(f, "Metal error: {}", e),
         }
     }
 }
@@ -32,5 +34,11 @@ impl From<std::io::Error> for EngineError {
 impl From<candle_core::Error> for EngineError {
     fn from(e: candle_core::Error) -> Self {
         Self::Candle(e)
+    }
+}
+
+impl From<serde_json::Error> for EngineError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Config(e.to_string())
     }
 }
