@@ -322,4 +322,129 @@ impl Model {
         }
         Ok(last_logits.unwrap())
     }
+
+    pub fn forward_verify_tokens(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        block_table: &BlockTable,
+        kv_storage: &mut KvStorage,
+    ) -> Result<Tensor, EngineError> {
+        self.forward_verify_tokens_with_workspace(tokens, start_pos, block_table, kv_storage, None)
+    }
+
+    pub fn forward_verify_tokens_with_workspace(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        block_table: &BlockTable,
+        kv_storage: &mut KvStorage,
+        _workspace: Option<&mut ScratchpadWorkspace>,
+    ) -> Result<Tensor, EngineError> {
+        let seq_len = tokens.len();
+        if seq_len == 0 {
+            return Err(EngineError::Model("Empty input tokens".to_string()));
+        }
+
+        let head_dim = self.config.head_dim();
+        let num_q_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let block_size = kv_storage.block_size;
+        let total_tokens = start_pos + seq_len;
+
+        let token_ids = Tensor::from_slice(tokens, (seq_len,), &self.device)?;
+        let mut hidden = self.weights.embed_tokens.index_select(&token_ids, 0)?;
+
+        let causal_mask = if seq_len > 1 || total_tokens > 1 {
+            let mut mask_data = vec![0.0f32; seq_len * total_tokens];
+            for i in 0..seq_len {
+                let allowed_key_limit = start_pos + i;
+                for j in 0..total_tokens {
+                    if j > allowed_key_limit {
+                        mask_data[i * total_tokens + j] = -1e9f32;
+                    }
+                }
+            }
+            Some(Tensor::from_vec(
+                mask_data,
+                (1, seq_len, total_tokens),
+                &self.device,
+            )?)
+        } else {
+            None
+        };
+
+        for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
+
+            let q = normed.matmul(&layer.attn_q.t()?)?;
+            let k = normed.matmul(&layer.attn_k.t()?)?;
+            let v = normed.matmul(&layer.attn_v.t()?)?;
+
+            let q = q.reshape((seq_len, num_q_heads, head_dim))?.transpose(0, 1)?;
+            let k_reshaped = k.reshape((seq_len, num_kv_heads, head_dim))?;
+            let v_reshaped = v.reshape((seq_len, num_kv_heads, head_dim))?;
+
+            for i in 0..seq_len {
+                let pos = start_pos + i;
+                let block_idx = pos / block_size;
+                let offset = pos % block_size;
+
+                if block_idx >= block_table.blocks().len() {
+                    return Err(EngineError::Model(format!(
+                        "Position {} requires block index {} but block table only has {} blocks",
+                        pos,
+                        block_idx,
+                        block_table.blocks().len()
+                    )));
+                }
+                let physical_block = block_table.blocks()[block_idx];
+                let k_token = k_reshaped.i(i)?;
+                let v_token = v_reshaped.i(i)?;
+                kv_storage.write_kv_token(layer_idx, physical_block, offset, &k_token, &v_token)?;
+            }
+
+            let (k_all, v_all) = kv_storage.gather_blocks(
+                layer_idx,
+                block_table.blocks(),
+                total_tokens,
+            )?;
+
+            let k_all = k_all.transpose(0, 1)?;
+            let v_all = v_all.transpose(0, 1)?;
+
+            let (k_all, v_all) = if num_q_heads > num_kv_heads {
+                let factor = num_q_heads / num_kv_heads;
+                (k_all.repeat((factor, 1, 1))?, v_all.repeat((factor, 1, 1))?)
+            } else {
+                (k_all, v_all)
+            };
+
+            let scale = 1.0 / (head_dim as f64).sqrt();
+            let mut scores = (q.matmul(&k_all.t()?)? * scale)?;
+            if let Some(mask) = &causal_mask {
+                scores = scores.broadcast_add(mask)?;
+            }
+            let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
+            let attn_out = attn_weights.matmul(&v_all)?;
+
+            let attn_out = attn_out
+                .transpose(0, 1)?
+                .reshape((seq_len, num_q_heads * head_dim))?;
+            let attn_proj = attn_out.matmul(&layer.attn_output.t()?)?;
+            hidden = (hidden + attn_proj)?;
+
+            let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
+            let gate = ffn_normed.matmul(&layer.ffn_gate.t()?)?;
+            let up = ffn_normed.matmul(&layer.ffn_up.t()?)?;
+            let silu_gate = candle_nn::ops::silu(&gate)?;
+            let ffn_hidden = (silu_gate * up)?;
+            let ffn_out = ffn_hidden.matmul(&layer.ffn_down.t()?)?;
+            hidden = (hidden + ffn_out)?;
+        }
+
+        let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
+        let logits = final_normed.matmul(&self.weights.lm_head.t()?)?;
+        Ok(logits)
+    }
 }

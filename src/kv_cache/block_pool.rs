@@ -60,4 +60,10 @@ impl BlockPool {
             }
         }
     }
+
+    pub fn rollback_blocks(&mut self, blocks: &[usize]) {
+        for &block in blocks {
+            self.free(block);
+        }
+    }
 }

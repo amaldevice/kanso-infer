@@ -361,4 +361,71 @@ impl Engine {
 
         Ok(outputs)
     }
+
+    pub fn speculative_step(
+        &mut self,
+        request_id: u64,
+        draft_candidates: &[u32],
+    ) -> Result<crate::speculative::VerificationResult, EngineError> {
+        let seq_idx = self
+            .sequences
+            .iter()
+            .position(|s| s.id == request_id)
+            .ok_or_else(|| {
+                EngineError::Model(format!("Request {} not found", request_id))
+            })?;
+
+        let seq = &self.sequences[seq_idx];
+        if seq.status != SequenceStatus::Running || seq.is_finished() {
+            return Err(EngineError::Model(format!(
+                "Sequence {} is not running or already finished",
+                request_id
+            )));
+        }
+        if seq.prefilled_tokens < seq.prompt_tokens.len() || seq.generated_tokens.is_empty() {
+            return Err(EngineError::Model(format!(
+                "Sequence {} has not completed prefill yet",
+                request_id
+            )));
+        }
+
+        let last_token = *seq.generated_tokens.last().unwrap();
+        let start_pos = seq.prompt_tokens.len() + seq.generated_tokens.len() - 1;
+
+        let seq_mut = &mut self.sequences[seq_idx];
+        let verify_result = crate::speculative::SpeculativeVerifier::verify(
+            &self.model,
+            last_token,
+            draft_candidates,
+            start_pos,
+            &mut seq_mut.block_table,
+            &mut self.block_pool,
+            &mut self.kv_storage,
+            self.block_size,
+        )?;
+
+        let seq_mut = &mut self.sequences[seq_idx];
+        let mut committed = Vec::new();
+        for &tok in &verify_result.committed_tokens {
+            if seq_mut.generated_tokens.len() < seq_mut.max_tokens {
+                seq_mut.generated_tokens.push(tok);
+                committed.push(tok);
+            }
+        }
+
+        let total_seq_tokens = seq_mut.prompt_tokens.len() + seq_mut.generated_tokens.len();
+        seq_mut.block_table.rollback_blocks(
+            total_seq_tokens,
+            self.block_size,
+            &mut self.block_pool,
+        );
+
+        if seq_mut.generated_tokens.len() >= seq_mut.max_tokens {
+            seq_mut.status = SequenceStatus::Finished;
+        }
+
+        let mut final_result = verify_result;
+        final_result.committed_tokens = committed;
+        Ok(final_result)
+    }
 }
