@@ -17,8 +17,8 @@ impl MetalPipelineCache {
             (shaders::ROPE_SHADER, "rope_kernel", "rope"),
             (shaders::SILU_GATE_SHADER, "silu_gate_kernel", "silu_gate"),
             (shaders::PAGED_KV_SHADER, "paged_kv_gather_kernel", "paged_kv"),
+            (shaders::PAGED_ATTENTION_V2_SHADER, "paged_attention_v2_kernel", "paged_attention_v2"),
         ];
-
         for (source, kernel_name, key) in shader_defs {
             let library = device
                 .new_library_with_source(source, &compile_options)

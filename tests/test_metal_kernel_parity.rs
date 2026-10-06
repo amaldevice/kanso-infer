@@ -42,6 +42,7 @@ fn test_metal_shader_sources_embedded() {
     assert!(shaders.contains_key("rope.metal"));
     assert!(shaders.contains_key("silu_gate.metal"));
     assert!(shaders.contains_key("paged_kv.metal"));
+    assert!(shaders.contains_key("paged_attention_v2.metal"));
 
     for (name, source) in shaders {
         assert!(!source.trim().is_empty(), "Shader {} is empty", name);
