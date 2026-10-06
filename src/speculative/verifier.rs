@@ -102,6 +102,11 @@ impl SpeculativeVerifier {
         let valid_tokens = start_pos + 1 + num_accepted + 1;
         let rolled_back_blocks = block_table.rollback_blocks(valid_tokens, block_size, block_pool);
 
+        // Upon rejection, write target model's corrected token K and V at the rollback position
+        if num_rejected > 0 {
+            let rollback_pos = start_pos + 1 + num_accepted;
+            let _ = model.forward_decode_step(emitted, rollback_pos, block_table, kv_storage)?;
+        }
         let mut committed_tokens = accepted_tokens.clone();
         committed_tokens.push(emitted);
 

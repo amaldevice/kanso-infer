@@ -54,6 +54,8 @@ pub struct BenchmarkReport {
     pub avg_ms_per_step: f64,
     pub mean_ttft_ms: f64,
     pub max_ttft_ms: f64,
+    pub itl_mean_ms: f64,
+    pub itl_p99_ms: f64,
     pub prefill_tokens_per_sec: f64,
     pub decode_ms_per_step: f64,
     pub checksum: u64,
@@ -64,10 +66,11 @@ pub fn evaluate_run(
     total_duration_secs: f64,
     num_requests: usize,
 ) -> BenchmarkReport {
-    evaluate_run_with_metrics(
+    evaluate_run_with_timings(
         total_tokens,
         total_duration_secs,
         num_requests,
+        &[],
         &[],
         0,
         0.0,
@@ -82,6 +85,32 @@ pub fn evaluate_run_with_metrics(
     total_duration_secs: f64,
     num_requests: usize,
     ttft_ms_records: &[f64],
+    prefill_tokens: usize,
+    prefill_duration_secs: f64,
+    decode_steps: usize,
+    decode_duration_secs: f64,
+    checksum: u64,
+) -> BenchmarkReport {
+    evaluate_run_with_timings(
+        total_tokens,
+        total_duration_secs,
+        num_requests,
+        ttft_ms_records,
+        &[],
+        prefill_tokens,
+        prefill_duration_secs,
+        decode_steps,
+        decode_duration_secs,
+        checksum,
+    )
+}
+
+pub fn evaluate_run_with_timings(
+    total_tokens: usize,
+    total_duration_secs: f64,
+    num_requests: usize,
+    ttft_ms_records: &[f64],
+    itl_ms_records: &[f64],
     prefill_tokens: usize,
     prefill_duration_secs: f64,
     decode_steps: usize,
@@ -108,6 +137,20 @@ pub fn evaluate_run_with_metrics(
     };
     let max_ttft_ms = ttft_ms_records.iter().copied().fold(0.0f64, f64::max);
 
+    let itl_mean_ms = if !itl_ms_records.is_empty() {
+        itl_ms_records.iter().sum::<f64>() / (itl_ms_records.len() as f64)
+    } else {
+        0.0
+    };
+
+    let itl_p99_ms = if !itl_ms_records.is_empty() {
+        let mut sorted = itl_ms_records.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let rank = ((sorted.len() as f64 * 0.99).ceil() as usize).max(1).min(sorted.len());
+        sorted[rank - 1]
+    } else {
+        0.0
+    };
     let prefill_tokens_per_sec = if prefill_duration_secs > 0.0 {
         (prefill_tokens as f64) / prefill_duration_secs
     } else {
@@ -129,6 +172,8 @@ pub fn evaluate_run_with_metrics(
         avg_ms_per_step: decode_ms_per_step,
         mean_ttft_ms,
         max_ttft_ms,
+        itl_mean_ms,
+        itl_p99_ms,
         prefill_tokens_per_sec,
         decode_ms_per_step,
         checksum,
@@ -137,22 +182,24 @@ pub fn evaluate_run_with_metrics(
 
 fn execute_engine_run(
     engine: &mut Engine,
-    requests: &[(Vec<u32>, usize, usize)], // (prompt, gen_len, arrival_step)
+    requests: &[TraceEntry],
 ) -> Result<BenchmarkReport, EngineError> {
     let mut order: Vec<usize> = (0..requests.len()).collect();
-    order.sort_by_key(|&i| requests[i].2);
+    order.sort_by_key(|&i| requests[i].arrival_step);
 
     let mut next_pending = 0;
     let mut step_idx = 0;
 
     let mut request_start_times: HashMap<u64, Instant> = HashMap::new();
     let mut first_token_times: HashMap<u64, Instant> = HashMap::new();
+    let mut last_token_times: HashMap<u64, Instant> = HashMap::new();
     let mut ttft_records: Vec<f64> = Vec::new();
+    let mut itl_records: Vec<f64> = Vec::new();
     let mut generated_tokens: Vec<u32> = Vec::new();
 
     let mut total_prompt_tokens = 0;
-    for (prompt, _, _) in requests {
-        total_prompt_tokens += prompt.len();
+    for entry in requests {
+        total_prompt_tokens += entry.prompt_len;
     }
 
     let mut prefill_duration = std::time::Duration::ZERO;
@@ -161,11 +208,14 @@ fn execute_engine_run(
 
     let overall_start = Instant::now();
     loop {
-        while next_pending < order.len() && requests[order[next_pending]].2 <= step_idx {
+        while next_pending < order.len() && requests[order[next_pending]].arrival_step <= step_idx {
             let req_idx = order[next_pending];
             next_pending += 1;
-            let (prompt, gen_len, _) = &requests[req_idx];
-            let req_id = engine.add_request(prompt.clone(), *gen_len);
+            let entry = &requests[req_idx];
+            let prompt: Vec<u32> = (0..entry.prompt_len)
+                .map(|p| ((req_idx * 10 + p) % 30) as u32)
+                .collect();
+            let req_id = engine.add_request(prompt, entry.gen_len);
             request_start_times.insert(req_id, Instant::now());
         }
 
@@ -193,14 +243,18 @@ fn execute_engine_run(
 
         for out in outputs {
             generated_tokens.push(out.token_id);
+            let now = Instant::now();
             if let std::collections::hash_map::Entry::Vacant(e) = first_token_times.entry(out.request_id) {
-                let now = Instant::now();
                 e.insert(now);
                 if let Some(start_t) = request_start_times.get(&out.request_id) {
                     let ttft_ms = now.duration_since(*start_t).as_secs_f64() * 1000.0;
                     ttft_records.push(ttft_ms);
                 }
+            } else if let Some(last_t) = last_token_times.get(&out.request_id) {
+                let itl_ms = now.duration_since(*last_t).as_secs_f64() * 1000.0;
+                itl_records.push(itl_ms);
             }
+            last_token_times.insert(out.request_id, now);
         }
 
         step_idx += 1;
@@ -209,11 +263,12 @@ fn execute_engine_run(
     let overall_elapsed = overall_start.elapsed().as_secs_f64();
     let checksum = fnv1a_64(&generated_tokens);
 
-    Ok(evaluate_run_with_metrics(
+    Ok(evaluate_run_with_timings(
         generated_tokens.len(),
         overall_elapsed,
         requests.len(),
         &ttft_records,
+        &itl_records,
         total_prompt_tokens,
         prefill_duration.as_secs_f64(),
         decode_steps,
@@ -224,7 +279,7 @@ fn execute_engine_run(
 
 pub fn run_benchmark_workload(
     engine: &mut Engine,
-    requests: &[(Vec<u32>, usize, usize)],
+    requests: &[TraceEntry],
     warmup: bool,
 ) -> Result<BenchmarkReport, EngineError> {
     if warmup {
@@ -243,10 +298,11 @@ pub fn run_synthetic_benchmark(
     gen_len: usize,
     warmup: bool,
 ) -> Result<BenchmarkReport, EngineError> {
-    let requests: Vec<(Vec<u32>, usize, usize)> = (0..batch_size)
-        .map(|i| {
-            let prompt: Vec<u32> = (0..prompt_len).map(|p| ((i * 10 + p) % 30) as u32).collect();
-            (prompt, gen_len, 0)
+    let requests: Vec<TraceEntry> = (0..batch_size)
+        .map(|_| TraceEntry {
+            prompt_len,
+            gen_len,
+            arrival_step: 0,
         })
         .collect();
     run_benchmark_workload(engine, &requests, warmup)
@@ -257,17 +313,8 @@ pub fn run_trace_benchmark(
     trace: &[TraceEntry],
     warmup: bool,
 ) -> Result<BenchmarkReport, EngineError> {
-    let requests: Vec<(Vec<u32>, usize, usize)> = trace
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            let prompt: Vec<u32> = (0..entry.prompt_len).map(|p| ((i * 10 + p) % 30) as u32).collect();
-            (prompt, entry.gen_len, entry.arrival_step)
-        })
-        .collect();
-    run_benchmark_workload(engine, &requests, warmup)
+    run_benchmark_workload(engine, trace, warmup)
 }
-
 pub fn run_synthetic_sweep(
     engine: &mut Engine,
     batch_size: usize,

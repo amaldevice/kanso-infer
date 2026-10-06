@@ -54,10 +54,12 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
         report.tokens_per_sec_per_request,
     );
     println!(
-        "{:<24} ttft_ms(mean/max)={:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} checksum={:016x}",
+        "{:<24} ttft_ms(mean/max)={:.1}/{:.1} itl_ms(mean/p99)={:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} checksum={:016x}",
         "",
         report.mean_ttft_ms,
         report.max_ttft_ms,
+        report.itl_mean_ms,
+        report.itl_p99_ms,
         report.prefill_tokens_per_sec,
         report.decode_ms_per_step,
         report.checksum,

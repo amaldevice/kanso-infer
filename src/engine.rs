@@ -191,8 +191,7 @@ impl Engine {
                 seq.block_table.advance_tokens(1);
 
                 let current_blocks = seq.block_table.blocks().len();
-                let needed_blocks =
-                    (seq.block_table.num_tokens() + self.block_size - 1) / self.block_size;
+                let needed_blocks = seq.block_table.required_blocks(self.block_size);
                 if needed_blocks > current_blocks {
                     if let Some(blk) = self.block_pool.allocate() {
                         seq.block_table.push_block(blk);
@@ -323,8 +322,7 @@ impl Engine {
                         seq.block_table.advance_tokens(1);
 
                         let current_blocks = seq.block_table.blocks().len();
-                        let needed_blocks =
-                            (seq.block_table.num_tokens() + self.block_size - 1) / self.block_size;
+                        let needed_blocks = seq.block_table.required_blocks(self.block_size);
                         if needed_blocks > current_blocks {
                             if let Some(blk) = self.block_pool.allocate() {
                                 seq.block_table.push_block(blk);

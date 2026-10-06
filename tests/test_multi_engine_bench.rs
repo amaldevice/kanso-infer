@@ -125,6 +125,8 @@ fn test_batch_sweep_with_warmup_exclusion_and_metrics() {
     // Timing and parity metrics
     assert!(report.mean_ttft_ms >= 0.0);
     assert!(report.max_ttft_ms >= report.mean_ttft_ms);
+    assert!(report.itl_mean_ms >= 0.0);
+    assert!(report.itl_p99_ms >= report.itl_mean_ms);
     assert!(report.decode_ms_per_step > 0.0);
     assert_ne!(report.checksum, 0);
 
@@ -160,6 +162,8 @@ fn test_trace_benchmark_execution() {
     assert_eq!(report.total_tokens, 5);
     assert!(report.total_tokens_per_sec > 0.0);
     assert!(report.mean_ttft_ms >= 0.0);
+    assert!(report.itl_mean_ms >= 0.0);
+    assert!(report.itl_p99_ms >= report.itl_mean_ms);
     assert!(report.decode_ms_per_step > 0.0);
     assert_ne!(report.checksum, 0);
 }

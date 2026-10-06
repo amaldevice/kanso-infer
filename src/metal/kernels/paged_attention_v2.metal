@@ -1,9 +1,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-constant uint TILE_SIZE = 32;
-constant uint MAX_HEAD_DIM = 512;
-constant uint MAX_ITEMS_PER_THREAD = 16; // 16 * 32 = 512
+constant uint TILE_SIZE = 16;
+constant uint MAX_HEAD_DIM = 128;
+constant uint MAX_ITEMS_PER_THREAD = 4; // 4 * 32 = 128
 
 struct PagedAttentionParams {
     uint num_seqs;
@@ -38,25 +38,27 @@ kernel void paged_attention_v2_kernel(
     uint kv_group_size = params.num_heads / params.num_kv_heads;
     uint kv_head_idx = head_idx / kv_group_size;
 
-    // Threadgroup shared memory for query vector, online softmax statistics, and exponential weights
-    threadgroup float s_q[MAX_HEAD_DIM];
+    // Threadgroup shared memory for K and V tiles, online softmax statistics, and exponential weights
+    threadgroup float s_k[TILE_SIZE * MAX_HEAD_DIM];
+    threadgroup float s_v[TILE_SIZE * MAX_HEAD_DIM];
     threadgroup float s_scores[TILE_SIZE];
     threadgroup float s_exp[TILE_SIZE]; // exp(s - m)
     threadgroup float m_prev;
     threadgroup float d_prev;
     threadgroup float alpha;
 
+    // Store Q in local registers / variables
+    float q_local[MAX_HEAD_DIM];
+    uint q_offset = (seq_idx * params.num_heads + head_idx) * params.head_dim;
+    for (uint d = 0; d < params.head_dim && d < MAX_HEAD_DIM; d++) {
+        q_local[d] = q[q_offset + d];
+    }
+
     // Initialize online softmax state
     if (tid == 0) {
         m_prev = -1e30f;
         d_prev = 0.0f;
         alpha = 1.0f;
-    }
-
-    // Cooperatively load Q into threadgroup memory
-    uint q_offset = (seq_idx * params.num_heads + head_idx) * params.head_dim;
-    for (uint d = tid; d < params.head_dim && d < MAX_HEAD_DIM; d += 32) {
-        s_q[d] = q[q_offset + d];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -70,20 +72,33 @@ kernel void paged_attention_v2_kernel(
     for (uint tile_start = 0; tile_start < context_len; tile_start += TILE_SIZE) {
         uint tile_tokens = min(TILE_SIZE, context_len - tile_start);
 
-        // 1. Tiled matrix multiplication: S_t = (Q . K_t) * scale
-        if (tid < tile_tokens) {
-            uint token_idx = tile_start + tid;
+        // 1. Cooperatively gather K and V tiles into threadgroup memory
+        uint total_elements = tile_tokens * params.head_dim;
+        for (uint i = tid; i < total_elements; i += 32) {
+            uint t = i / params.head_dim;
+            uint d = i % params.head_dim;
+
+            uint token_idx = tile_start + t;
             uint b_idx = token_idx / params.block_size;
             uint b_offset = token_idx % params.block_size;
             uint phys_block = block_tables[seq_idx * params.max_num_blocks_per_seq + b_idx];
 
-            uint k_offset = phys_block * (params.block_size * params.num_kv_heads * params.head_dim)
-                          + b_offset * (params.num_kv_heads * params.head_dim)
-                          + kv_head_idx * params.head_dim;
+            uint kv_offset = phys_block * (params.block_size * params.num_kv_heads * params.head_dim)
+                           + b_offset * (params.num_kv_heads * params.head_dim)
+                           + kv_head_idx * params.head_dim
+                           + d;
 
+            s_k[t * params.head_dim + d] = k_cache[kv_offset];
+            s_v[t * params.head_dim + d] = v_cache[kv_offset];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2. Tiled matrix multiplication: S_t = (Q . K_t) * scale
+        if (tid < tile_tokens) {
             float dot = 0.0f;
+            uint k_base = tid * params.head_dim;
             for (uint d = 0; d < params.head_dim; d++) {
-                dot += s_q[d] * k_cache[k_offset + d];
+                dot += q_local[d] * s_k[k_base + d];
             }
             s_scores[tid] = dot * params.scale;
         }
@@ -119,17 +134,7 @@ kernel void paged_attention_v2_kernel(
             if (d < params.head_dim) {
                 float v_sum = 0.0f;
                 for (uint t = 0; t < tile_tokens; t++) {
-                    uint token_idx = tile_start + t;
-                    uint b_idx = token_idx / params.block_size;
-                    uint b_offset = token_idx % params.block_size;
-                    uint phys_block = block_tables[seq_idx * params.max_num_blocks_per_seq + b_idx];
-
-                    uint v_offset = phys_block * (params.block_size * params.num_kv_heads * params.head_dim)
-                                  + b_offset * (params.num_kv_heads * params.head_dim)
-                                  + kv_head_idx * params.head_dim
-                                  + d;
-
-                    v_sum += s_exp[t] * v_cache[v_offset];
+                    v_sum += s_exp[t] * s_v[t * params.head_dim + d];
                 }
                 acc[item] = acc[item] * cur_alpha + v_sum;
             }
