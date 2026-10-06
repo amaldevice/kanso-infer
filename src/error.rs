@@ -7,6 +7,7 @@ pub enum EngineError {
     Config(String),
     Scheduler(String),
     Model(String),
+    Metal(String),
 }
 
 impl fmt::Display for EngineError {
@@ -17,6 +18,7 @@ impl fmt::Display for EngineError {
             Self::Config(e) => write!(f, "Config error: {}", e),
             Self::Scheduler(e) => write!(f, "Scheduler error: {}", e),
             Self::Model(e) => write!(f, "Model error: {}", e),
+            Self::Metal(e) => write!(f, "Metal error: {}", e),
         }
     }
 }

@@ -15,6 +15,7 @@ pub struct Sequence {
     pub generated_tokens: Vec<u32>,
     pub block_table: BlockTable,
     pub status: SequenceStatus,
+    pub prefilled_tokens: usize,
     pub max_tokens: usize,
     pub last_active_step: usize,
 }
@@ -27,6 +28,7 @@ impl Sequence {
             generated_tokens: Vec::new(),
             block_table: BlockTable::new(),
             status: SequenceStatus::Waiting,
+            prefilled_tokens: 0,
             max_tokens,
             last_active_step: 0,
         }
