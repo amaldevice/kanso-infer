@@ -12,3 +12,4 @@ pub mod metal;
 pub mod bench;
 pub mod hybrid;
 pub mod quant;
+pub mod speculative;
