@@ -36,3 +36,9 @@ impl From<candle_core::Error> for EngineError {
         Self::Candle(e)
     }
 }
+
+impl From<serde_json::Error> for EngineError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Config(e.to_string())
+    }
+}
