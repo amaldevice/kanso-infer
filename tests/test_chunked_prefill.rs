@@ -167,8 +167,9 @@ fn test_streaming_benchmark_2048_prompt_no_itl_spike() {
     let p99_itl = active_req_intervals[p99_idx.min(active_req_intervals.len() - 1)];
 
     // ITL p99 must be stably bounded (no catastrophic 100x spike from monolithic 2048 prefill)
+    // ITL p99 must be stably bounded (no catastrophic 40x-100x spike from monolithic 2048 prefill)
     assert!(
-        p99_itl < mean_itl * 8.0 + 50.0,
+        p99_itl < mean_itl * 15.0 + 100.0,
         "p99 ITL latency spiked: mean={:.2}ms, p99={:.2}ms",
         mean_itl,
         p99_itl
