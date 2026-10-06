@@ -2,6 +2,11 @@ use metal::{Buffer, MTLSize};
 use crate::error::EngineError;
 use crate::metal::context::MetalContext;
 
+pub use crate::metal::paged_attention::{
+    cpu_paged_attention, gpu_paged_attention_v2, gpu_paged_attention_v2_buffer,
+    PagedAttentionParams,
+};
+
 pub fn cpu_rmsnorm(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let dim = input.len();
     let sum_sq: f32 = input.iter().map(|&x| x * x).sum();
