@@ -26,7 +26,7 @@ enum Commands {
         #[arg(long, default_value = "smollm2")]
         model_type: String,
 
-        /// Hardware backend: cpu, metal, neon
+        /// Hardware backend: cpu, metal, neon, amx
         #[arg(long, default_value = "cpu")]
         backend: String,
 
@@ -41,7 +41,7 @@ enum Commands {
         #[arg(long, default_value = "smollm2")]
         model_type: String,
 
-        /// Hardware backend: cpu, metal, neon
+        /// Hardware backend: cpu, metal, neon, amx
         #[arg(long, default_value = "cpu")]
         backend: String,
 
@@ -64,7 +64,7 @@ enum Commands {
         #[arg(long, default_value = "smollm2")]
         model_type: String,
 
-        /// Hardware backend: cpu, metal, neon
+        /// Hardware backend: cpu, metal, neon, amx
         #[arg(long, default_value = "cpu")]
         backend: String,
     },

@@ -25,7 +25,7 @@ pub struct Args {
     #[arg(long, default_value_t = 64)]
     pub gen_len: usize,
 
-    /// Execution backend: "cpu", "metal", or "neon"
+    /// Execution backend: "cpu", "metal", "neon", or "amx"
     #[arg(long, default_value = "cpu")]
     pub backend: String,
 
@@ -114,19 +114,22 @@ fn create_engine_for_workload(
     // Initialize model backend
     match backend.to_lowercase().as_str() {
         "cpu" => {
-            let model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+            let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+            model.set_backend("cpu");
             Ok(Engine::new(model, max_running, total_blocks, block_size))
         }
         "neon" => {
             #[cfg(target_arch = "aarch64")]
             {
-                let model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                model.set_backend("neon");
                 Ok(Engine::new(model, max_running, total_blocks, block_size))
             }
             #[cfg(not(target_arch = "aarch64"))]
             {
                 eprintln!("Warning: NEON backend requested on non-aarch64 architecture, falling back to CPU reference.");
-                let model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                model.set_backend("cpu");
                 Ok(Engine::new(model, max_running, total_blocks, block_size))
             }
         }
@@ -135,23 +138,41 @@ fn create_engine_for_workload(
             {
                 // Verify Metal context availability
                 if let Ok(_ctx) = kanso_infer::metal::context::MetalContext::new() {
-                    let model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                    let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                    model.set_backend("metal");
                     Ok(Engine::new(model, max_running, total_blocks, block_size))
                 } else {
                     eprintln!("Warning: Metal unavailable, falling back to CPU reference.");
-                    let model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                    let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                    model.set_backend("cpu");
                     Ok(Engine::new(model, max_running, total_blocks, block_size))
                 }
             }
             #[cfg(not(target_os = "macos"))]
             {
                 eprintln!("Warning: Metal backend only supported on macOS, falling back to CPU reference.");
-                let model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                model.set_backend("cpu");
+                Ok(Engine::new(model, max_running, total_blocks, block_size))
+            }
+        }
+        "amx" => {
+            #[cfg(target_os = "macos")]
+            {
+                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                model.set_backend("amx");
+                Ok(Engine::new(model, max_running, total_blocks, block_size))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                eprintln!("Warning: AMX backend only supported on macOS, falling back to CPU reference.");
+                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                model.set_backend("cpu");
                 Ok(Engine::new(model, max_running, total_blocks, block_size))
             }
         }
         other => Err(EngineError::Config(format!(
-            "Unsupported backend '{}'. Valid options: cpu, metal, neon",
+            "Unsupported backend '{}'. Valid options: cpu, metal, neon, amx",
             other
         ))),
     }

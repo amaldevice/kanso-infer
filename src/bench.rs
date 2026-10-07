@@ -326,7 +326,7 @@ pub fn run_synthetic_sweep(
 
 pub fn create_engine_for_model_profile(
     model_type: &str,
-    _backend: &str,
+    backend: &str,
     num_requests: usize,
     max_tokens_per_seq: usize,
     block_size: usize,
@@ -335,7 +335,8 @@ pub fn create_engine_for_model_profile(
     let config = crate::config::ModelConfig::from_model_type(model_type)?;
     let blocks_per_seq = (max_tokens_per_seq + block_size - 1) / block_size + 1;
     let total_blocks = (blocks_per_seq * num_requests.max(1)).max(128);
-    let model = crate::model::Model::create_mock_from_config(&config)?;
+    let mut model = crate::model::Model::create_mock_from_config(&config)?;
+    model.set_backend(backend);
     let engine = Engine::new(model, max_running, total_blocks, block_size);
     Ok(engine)
 }
