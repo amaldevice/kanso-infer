@@ -123,7 +123,7 @@ impl Model {
         Ok(Self::new(weights, cfg, dev))
     }
 
-    fn rmsnorm(&self, x: &Tensor, weight: &Tensor) -> Result<Tensor, EngineError> {
+    pub fn rmsnorm(&self, x: &Tensor, weight: &Tensor) -> Result<Tensor, EngineError> {
         let sq = x.sqr()?;
         let mean_sq = sq.mean_keepdim(candle_core::D::Minus1)?;
         let rms = (mean_sq + self.config.rms_norm_eps)?.sqrt()?;
@@ -131,7 +131,7 @@ impl Model {
         Ok(normalized.broadcast_mul(weight)?)
     }
 
-    pub fn forward_single_prompt(&self, tokens: &[u32]) -> Result<Tensor, EngineError> {
+    pub fn forward_tokens(&self, tokens: &[u32]) -> Result<Tensor, EngineError> {
         let seq_len = tokens.len();
         if seq_len == 0 {
             return Err(EngineError::Model("Empty input tokens".to_string()));
@@ -216,12 +216,15 @@ impl Model {
         // Final RMSNorm
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
 
-        // Only take the last token embedding for next-token prediction
-        let last_hidden = final_normed.i(seq_len - 1)?.unsqueeze(0)?;
-
-        // LM Head projection: [1, hidden_size] @ W_head^T -> [1, vocab_size]
-        let logits = self.matmul(&last_hidden, &self.weights.lm_head.t()?)?;
+        // LM Head projection for all tokens: [seq_len, hidden_size] @ W_head^T -> [seq_len, vocab_size]
+        let logits = self.matmul(&final_normed, &self.weights.lm_head.t()?)?;
         Ok(logits)
+    }
+
+    pub fn forward_single_prompt(&self, tokens: &[u32]) -> Result<Tensor, EngineError> {
+        let logits = self.forward_tokens(tokens)?;
+        let seq_len = tokens.len();
+        Ok(logits.i(seq_len - 1)?.unsqueeze(0)?)
     }
 
     pub fn forward_decode_step(

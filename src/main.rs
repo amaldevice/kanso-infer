@@ -68,6 +68,65 @@ enum Commands {
         #[arg(long, default_value = "cpu")]
         backend: String,
     },
+
+    /// Run performance benchmarks and quality evaluations
+    Bench {
+        /// Comma-separated list of batch sizes to sweep
+        #[arg(long, default_value = "1,4,8,16,32")]
+        batch_sizes: String,
+
+        /// Path to JSONL trace file
+        #[arg(long)]
+        trace_file: Option<String>,
+
+        /// Dataset format: "synthetic", "sharegpt", "lmsys"
+        #[arg(long, default_value = "synthetic")]
+        dataset: String,
+
+        /// Synthetic prompt token length
+        #[arg(long, default_value_t = 128)]
+        prompt_len: usize,
+
+        /// Synthetic generation token length
+        #[arg(long, default_value_t = 64)]
+        gen_len: usize,
+
+        /// Hardware backend: cpu, metal, neon, amx
+        #[arg(long, default_value = "cpu")]
+        backend: String,
+
+        /// KV cache block size
+        #[arg(long, default_value_t = 16)]
+        block_size: usize,
+
+        /// Maximum concurrent running sequences
+        #[arg(long, default_value_t = 64)]
+        max_running: usize,
+
+        /// Skip warmup run before measurement
+        #[arg(long, default_value_t = false)]
+        no_warmup: bool,
+
+        /// Path to model weights
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Model profile architecture: "mock", "smollm2", "granite-dense", "granite-h", "lfm"
+        #[arg(long, default_value = "mock")]
+        model_type: String,
+
+        /// Run perplexity evaluation on specified dataset (e.g. "wikitext2")
+        #[arg(long)]
+        eval_ppl: Option<String>,
+
+        /// Sliding window context stride for perplexity evaluation
+        #[arg(long, default_value_t = 512)]
+        ppl_stride: usize,
+
+        /// Path to export report in JSON format
+        #[arg(long)]
+        json_output: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -198,6 +257,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             println!("Listening on {}", addr);
             axum::serve(listener, app).await?;
+        }
+
+        Commands::Bench {
+            batch_sizes,
+            trace_file,
+            dataset,
+            prompt_len,
+            gen_len,
+            backend,
+            block_size,
+            max_running,
+            no_warmup,
+            model: _,
+            model_type,
+            eval_ppl,
+            ppl_stride,
+            json_output,
+        } => {
+            if let Some(ds) = eval_ppl {
+                println!("Evaluating perplexity on dataset: {}", ds);
+                let report = kanso_infer::bench::run_wikitext2_perplexity_eval(&model_type, ppl_stride)?;
+                let ascii_table = kanso_infer::bench::format_ascii_ppl_report(&report);
+                println!("{}", ascii_table);
+
+                if let Some(json_path) = json_output {
+                    let json_content = serde_json::to_string_pretty(&report)?;
+                    std::fs::write(&json_path, json_content)?;
+                    println!("Exported JSON perplexity report to {}", json_path);
+                }
+            } else if let Some(trace_path) = trace_file {
+                let trace = if dataset.to_lowercase() == "sharegpt" || dataset.to_lowercase() == "lmsys" {
+                    let content = std::fs::read_to_string(&trace_path)?;
+                    kanso_infer::bench::parse_sharegpt_dataset(&content)?
+                } else {
+                    kanso_infer::bench::parse_trace_file(&trace_path)?
+                };
+                let max_tokens = trace.iter().map(|t| t.prompt_len + t.gen_len).max().unwrap_or(prompt_len + gen_len);
+                let mut engine = create_engine_for_model_profile(&model_type, &backend, trace.len(), max_tokens, block_size, max_running)?;
+                let report = kanso_infer::bench::run_trace_benchmark(&mut engine, &trace, !no_warmup)?;
+                println!("{:#?}", report);
+            } else {
+                let batch_sizes_vec: Vec<usize> = batch_sizes
+                    .split(',')
+                    .map(|s| s.trim().parse::<usize>())
+                    .collect::<Result<_, _>>()?;
+                for &b in &batch_sizes_vec {
+                    let max_tokens = prompt_len + gen_len;
+                    let mut engine = create_engine_for_model_profile(&model_type, &backend, b, max_tokens, block_size, max_running)?;
+                    let report = kanso_infer::bench::run_synthetic_benchmark(&mut engine, b, prompt_len, gen_len, !no_warmup)?;
+                    println!("{:#?}", report);
+                }
+            }
         }
     }
 

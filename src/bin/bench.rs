@@ -52,6 +52,18 @@ pub struct Args {
     /// Model profile type: "mock", "smollm2", "granite-dense", "granite-h", "lfm"
     #[arg(long, default_value = "mock")]
     pub model_type: String,
+
+    /// Run perplexity evaluation on specified dataset (e.g. "wikitext2")
+    #[arg(long)]
+    pub eval_ppl: Option<String>,
+
+    /// Sliding window context stride for perplexity evaluation
+    #[arg(long, default_value_t = 512)]
+    pub ppl_stride: usize,
+
+    /// Path to export benchmark report in JSON format
+    #[arg(long)]
+    pub json_output: Option<String>,
 }
 
 fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
@@ -200,6 +212,19 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!(" Backend  : {}, Model Profile: {}, Warmup: {}", args.backend, args.model_type, warmup);
     println!("============================================================");
 
+    if let Some(dataset) = &args.eval_ppl {
+        println!("Evaluating perplexity on dataset: {}", dataset);
+        let report = kanso_infer::bench::run_wikitext2_perplexity_eval(&args.model_type, args.ppl_stride)?;
+        let ascii_table = kanso_infer::bench::format_ascii_ppl_report(&report);
+        println!("{}", ascii_table);
+
+        if let Some(json_path) = &args.json_output {
+            let json_content = serde_json::to_string_pretty(&report)?;
+            std::fs::write(json_path, json_content)?;
+            println!("Exported JSON perplexity report to {}", json_path);
+        }
+        return Ok(());
+    }
     if let Some(trace_path) = &args.trace_file {
         let trace = if args.dataset.to_lowercase() == "sharegpt"
             || args.dataset.to_lowercase() == "lmsys"
