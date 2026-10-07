@@ -992,6 +992,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "clap",
+ "float8",
  "futures-util",
  "http-body-util",
  "libc",
