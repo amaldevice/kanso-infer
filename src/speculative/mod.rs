@@ -1,7 +1,7 @@
 pub mod profiler;
 pub mod verifier;
 
-pub use profiler::{SpeculativeProfiler, SpeculativeReport, SpeedupTime};
+pub use profiler::{SpeculativeProfiler, SpeculativeReport};
 pub use verifier::{SpeculativeVerifier, VerificationResult};
 
 use crate::engine::{Engine, StepOutput};

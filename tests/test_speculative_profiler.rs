@@ -8,11 +8,13 @@ fn test_speculative_profiler_initial_state() {
     let profiler = SpeculativeProfiler::new();
     assert_eq!(profiler.total_proposed, 0);
     assert_eq!(profiler.total_accepted, 0);
+    assert_eq!(profiler.total_target_tokens, 0);
     assert_eq!(profiler.total_steps, 0);
     assert_eq!(profiler.rollback_events, 0);
     assert_eq!(profiler.total_duration, Duration::ZERO);
     assert_eq!(profiler.acceptance_rate(), 0.0);
     assert_eq!(profiler.alpha(), 0.0);
+    assert_eq!(profiler.average_accepted_tokens_per_step(), 0.0);
     assert_eq!(profiler.mean_accepted_per_step(), 0.0);
     assert_eq!(profiler.tau_bar(), 0.0);
     assert_eq!(profiler.speedup_ratio(Duration::from_millis(100)), 0.0);
@@ -31,6 +33,7 @@ fn test_speculative_profiler_step_recording_and_metrics() {
 
     assert_eq!(profiler.total_proposed, 12);
     assert_eq!(profiler.total_accepted, 6);
+    assert_eq!(profiler.total_target_tokens, 3);
     assert_eq!(profiler.total_steps, 3);
     assert_eq!(profiler.rollback_events, 2);
     assert_eq!(profiler.total_duration, Duration::from_millis(30));
@@ -40,8 +43,9 @@ fn test_speculative_profiler_step_recording_and_metrics() {
     assert!((profiler.acceptance_rate() - expected_alpha).abs() < 1e-6);
     assert!((profiler.alpha() - expected_alpha).abs() < 1e-6);
 
-    // tau_bar = 6 / 3 = 2.0
-    let expected_tau = 6.0 / 3.0;
+    // tau_bar = (6 + 3) / 3 = 3.0
+    let expected_tau = (6.0 + 3.0) / 3.0;
+    assert!((profiler.average_accepted_tokens_per_step() - expected_tau).abs() < 1e-6);
     assert!((profiler.mean_accepted_per_step() - expected_tau).abs() < 1e-6);
     assert!((profiler.tau_bar() - expected_tau).abs() < 1e-6);
 
@@ -51,7 +55,7 @@ fn test_speculative_profiler_step_recording_and_metrics() {
     assert!((speedup - 2.0).abs() < 1e-6);
 
     // Also support speedup with f64 seconds
-    let speedup_secs = profiler.speedup_ratio(0.060);
+    let speedup_secs = profiler.speedup_ratio_secs(0.060);
     assert!((speedup_secs - 2.0).abs() < 1e-6);
 }
 
@@ -87,10 +91,12 @@ fn test_speculative_profiler_record_verification_result() {
 
     assert_eq!(profiler.total_proposed, 6);
     assert_eq!(profiler.total_accepted, 4);
+    assert_eq!(profiler.total_target_tokens, 2);
     assert_eq!(profiler.rollback_events, 1);
     assert_eq!(profiler.total_steps, 2);
     assert!((profiler.acceptance_rate() - (4.0 / 6.0)).abs() < 1e-6);
-    assert!((profiler.mean_accepted_per_step() - 2.0).abs() < 1e-6);
+    assert!((profiler.average_accepted_tokens_per_step() - 3.0).abs() < 1e-6);
+    assert!((profiler.mean_accepted_per_step() - 3.0).abs() < 1e-6);
 }
 
 #[test]
@@ -102,27 +108,30 @@ fn test_speculative_profiler_json_export_and_report() {
     let report: SpeculativeReport = profiler.report();
     assert_eq!(report.total_proposed, 10);
     assert_eq!(report.total_accepted, 8);
+    assert_eq!(report.total_target_tokens, 2);
     assert_eq!(report.total_steps, 2);
     assert_eq!(report.rollback_events, 1);
     assert!((report.acceptance_rate - 0.8).abs() < 1e-6);
-    assert!((report.mean_accepted_per_step - 4.0).abs() < 1e-6);
+    assert!((report.mean_accepted_per_step - 5.0).abs() < 1e-6);
+    assert!((report.average_accepted_tokens_per_step() - 5.0).abs() < 1e-6);
     assert!((report.total_duration_secs - 0.050).abs() < 1e-6);
 
     // JSON export
     let json_str = profiler.to_json().expect("failed to serialize profiler to JSON");
     assert!(json_str.contains("\"total_proposed\":10"));
     assert!(json_str.contains("\"total_accepted\":8"));
+    assert!(json_str.contains("\"total_target_tokens\":2"));
     assert!(json_str.contains("\"rollback_events\":1"));
     assert!(json_str.contains("\"acceptance_rate\":0.8"));
-    assert!(json_str.contains("\"mean_accepted_per_step\":4.0"));
+    assert!(json_str.contains("\"mean_accepted_per_step\":5.0"));
 
     // Deserialization round-trip
     let deserialized: SpeculativeReport =
         serde_json::from_str(&json_str).expect("failed to deserialize SpeculativeReport");
     assert_eq!(deserialized.total_proposed, 10);
     assert_eq!(deserialized.total_accepted, 8);
+    assert_eq!(deserialized.total_target_tokens, 2);
     assert_eq!(deserialized.rollback_events, 1);
-
     // JSON with speedup
     let json_with_speedup = profiler
         .to_json_with_speedup(Duration::from_millis(100))
@@ -147,9 +156,11 @@ fn test_speculative_profiler_simulated_acceptance_rejection_sequences() {
     }
     assert_eq!(perfect_profiler.total_proposed, 40);
     assert_eq!(perfect_profiler.total_accepted, 40);
+    assert_eq!(perfect_profiler.total_target_tokens, 10);
     assert_eq!(perfect_profiler.rollback_events, 0);
     assert!((perfect_profiler.acceptance_rate() - 1.0).abs() < 1e-6);
-    assert!((perfect_profiler.mean_accepted_per_step() - 4.0).abs() < 1e-6);
+    assert!((perfect_profiler.average_accepted_tokens_per_step() - 5.0).abs() < 1e-6);
+    assert!((perfect_profiler.mean_accepted_per_step() - 5.0).abs() < 1e-6);
 
     // 2. Complete rejection sequence: K=4, 10 steps, 0 accepted
     let mut reject_profiler = SpeculativeProfiler::new();
@@ -158,13 +169,16 @@ fn test_speculative_profiler_simulated_acceptance_rejection_sequences() {
     }
     assert_eq!(reject_profiler.total_proposed, 40);
     assert_eq!(reject_profiler.total_accepted, 0);
+    assert_eq!(reject_profiler.total_target_tokens, 10);
     assert_eq!(reject_profiler.rollback_events, 10);
     assert_eq!(reject_profiler.acceptance_rate(), 0.0);
-    assert_eq!(reject_profiler.mean_accepted_per_step(), 0.0);
+    assert!((reject_profiler.average_accepted_tokens_per_step() - 1.0).abs() < 1e-6);
+    assert!((reject_profiler.mean_accepted_per_step() - 1.0).abs() < 1e-6);
 
     // 3. Reset functionality
     perfect_profiler.reset();
     assert_eq!(perfect_profiler.total_proposed, 0);
+    assert_eq!(perfect_profiler.total_target_tokens, 0);
     assert_eq!(perfect_profiler.total_steps, 0);
 }
 
@@ -184,7 +198,11 @@ fn test_benchmark_report_speculative_integration() {
         avg_ms_per_step: 5.0,
         mean_ttft_ms: 10.0,
         max_ttft_ms: 10.0,
+        ttft_p50_ms: 10.0,
+        ttft_p90_ms: 10.0,
         itl_mean_ms: 5.0,
+        itl_p50_ms: 5.0,
+        itl_p90_ms: 5.0,
         itl_p99_ms: 5.0,
         prefill_tokens_per_sec: 500.0,
         decode_ms_per_step: 4.0,

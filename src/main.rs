@@ -297,16 +297,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let mut engine = create_engine_for_model_profile(&model_type, &backend, trace.len(), max_tokens, block_size, max_running)?;
                 let report = kanso_infer::bench::run_trace_benchmark(&mut engine, &trace, !no_warmup)?;
                 println!("{:#?}", report);
+                if let Some(json_path) = json_output {
+                    let json_content = serde_json::to_string_pretty(&report)?;
+                    std::fs::write(&json_path, json_content)?;
+                    println!("Exported JSON trace benchmark report to {}", json_path);
+                }
             } else {
                 let batch_sizes_vec: Vec<usize> = batch_sizes
                     .split(',')
                     .map(|s| s.trim().parse::<usize>())
                     .collect::<Result<_, _>>()?;
+                let mut reports = Vec::new();
                 for &b in &batch_sizes_vec {
                     let max_tokens = prompt_len + gen_len;
                     let mut engine = create_engine_for_model_profile(&model_type, &backend, b, max_tokens, block_size, max_running)?;
                     let report = kanso_infer::bench::run_synthetic_benchmark(&mut engine, b, prompt_len, gen_len, !no_warmup)?;
                     println!("{:#?}", report);
+                    reports.push(report);
+                }
+                if let Some(json_path) = json_output {
+                    let json_content = if reports.len() == 1 {
+                        serde_json::to_string_pretty(&reports[0])?
+                    } else {
+                        serde_json::to_string_pretty(&reports)?
+                    };
+                    std::fs::write(&json_path, json_content)?;
+                    println!("Exported JSON benchmark sweep report to {}", json_path);
                 }
             }
         }

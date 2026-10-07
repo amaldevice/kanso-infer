@@ -63,6 +63,41 @@ fn test_amx_gemm_parity_against_cpu_reference() {
 }
 
 #[test]
+fn test_amx_gemm_single_token_m_equals_1_dispatch_sgemv() {
+    let m = 1;
+    let n = 32;
+    let k = 64;
+
+    let mut a = vec![0.0f32; m * k];
+    for (i, val) in a.iter_mut().enumerate() {
+        *val = ((i as f32 * 0.17).sin()) * 1.5;
+    }
+
+    let mut b = vec![0.0f32; k * n];
+    for (i, val) in b.iter_mut().enumerate() {
+        *val = ((i as f32 * 0.23).cos()) * 2.0;
+    }
+
+    let mut c_cpu = vec![0.0f32; m * n];
+    cpu_reference_gemm(m, n, k, &a, &b, &mut c_cpu);
+
+    let mut c_amx = vec![0.0f32; m * n];
+    amx_gemm(m, n, k, &a, &b, &mut c_amx);
+
+    for idx in 0..(m * n) {
+        let diff = (c_amx[idx] - c_cpu[idx]).abs();
+        assert!(
+            diff <= 1e-4,
+            "AMX GEMM M=1 mismatch at index {}: amx={}, cpu={}, diff={}",
+            idx,
+            c_amx[idx],
+            c_cpu[idx],
+            diff
+        );
+    }
+}
+
+#[test]
 fn test_amx_gemv_parity_against_cpu_reference() {
     let m = 64;
     let k = 128;

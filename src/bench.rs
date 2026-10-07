@@ -87,7 +87,11 @@ pub struct BenchmarkReport {
     pub avg_ms_per_step: f64,
     pub mean_ttft_ms: f64,
     pub max_ttft_ms: f64,
+    pub ttft_p50_ms: f64,
+    pub ttft_p90_ms: f64,
     pub itl_mean_ms: f64,
+    pub itl_p50_ms: f64,
+    pub itl_p90_ms: f64,
     pub itl_p99_ms: f64,
     pub prefill_tokens_per_sec: f64,
     pub decode_ms_per_step: f64,
@@ -189,21 +193,14 @@ pub fn evaluate_run_with_timings(
         0.0
     };
     let max_ttft_ms = ttft_ms_records.iter().copied().fold(0.0f64, f64::max);
+    let (ttft_p50_ms, ttft_p90_ms, _) = traffic::calculate_percentiles(ttft_ms_records);
 
     let itl_mean_ms = if !itl_ms_records.is_empty() {
         itl_ms_records.iter().sum::<f64>() / (itl_ms_records.len() as f64)
     } else {
         0.0
     };
-
-    let itl_p99_ms = if !itl_ms_records.is_empty() {
-        let mut sorted = itl_ms_records.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let rank = ((sorted.len() as f64 * 0.99).ceil() as usize).max(1).min(sorted.len());
-        sorted[rank - 1]
-    } else {
-        0.0
-    };
+    let (itl_p50_ms, itl_p90_ms, itl_p99_ms) = traffic::calculate_percentiles(itl_ms_records);
     let prefill_tokens_per_sec = if prefill_duration_secs > 0.0 {
         (prefill_tokens as f64) / prefill_duration_secs
     } else {
@@ -225,7 +222,11 @@ pub fn evaluate_run_with_timings(
         avg_ms_per_step: decode_ms_per_step,
         mean_ttft_ms,
         max_ttft_ms,
+        ttft_p50_ms,
+        ttft_p90_ms,
         itl_mean_ms,
+        itl_p50_ms,
+        itl_p90_ms,
         itl_p99_ms,
         prefill_tokens_per_sec,
         decode_ms_per_step,

@@ -2,34 +2,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use crate::speculative::verifier::VerificationResult;
 
-/// Trait abstracting over Duration and f64 seconds for speedup calculations.
-pub trait SpeedupTime {
-    fn to_duration(&self) -> Duration;
-}
-
-impl SpeedupTime for Duration {
-    fn to_duration(&self) -> Duration {
-        *self
-    }
-}
-
-impl SpeedupTime for &Duration {
-    fn to_duration(&self) -> Duration {
-        **self
-    }
-}
-
-impl SpeedupTime for f64 {
-    fn to_duration(&self) -> Duration {
-        Duration::from_secs_f64(*self)
-    }
-}
-
 /// Standalone metrics snapshot for speculative decoding performance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpeculativeReport {
     pub total_proposed: usize,
     pub total_accepted: usize,
+    pub total_target_tokens: usize,
     pub total_steps: usize,
     pub rollback_events: usize,
     pub acceptance_rate: f64,
@@ -40,6 +18,10 @@ pub struct SpeculativeReport {
 }
 
 impl SpeculativeReport {
+    pub fn average_accepted_tokens_per_step(&self) -> f64 {
+        self.mean_accepted_per_step
+    }
+
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
@@ -93,6 +75,7 @@ impl std::fmt::Display for SpeculativeReport {
 pub struct SpeculativeProfiler {
     pub total_proposed: usize,
     pub total_accepted: usize,
+    pub total_target_tokens: usize,
     pub total_steps: usize,
     pub rollback_events: usize,
     pub total_duration: Duration,
@@ -112,8 +95,21 @@ impl SpeculativeProfiler {
         duration: Duration,
         had_rollback: bool,
     ) {
+        self.record_step_with_target_tokens(proposed, accepted, 1, duration, had_rollback);
+    }
+
+    /// Records a step specifying the number of verified target tokens (minimum 1).
+    pub fn record_step_with_target_tokens(
+        &mut self,
+        proposed: usize,
+        accepted: usize,
+        target_tokens: usize,
+        duration: Duration,
+        had_rollback: bool,
+    ) {
         self.total_proposed += proposed;
         self.total_accepted += accepted;
+        self.total_target_tokens += target_tokens;
         self.total_steps += 1;
         self.total_duration += duration;
         if had_rollback {
@@ -146,33 +142,39 @@ impl SpeculativeProfiler {
         self.acceptance_rate()
     }
 
-    /// Average accepted draft tokens per target verification step: tau_bar = N_acc / total_steps.
-    pub fn mean_accepted_per_step(&self) -> f64 {
+    /// Average accepted tokens per step: tau_bar = (total_accepted + total_target_tokens) / total_steps.
+    /// Each target step contributes at least 1 verified token.
+    pub fn average_accepted_tokens_per_step(&self) -> f64 {
         if self.total_steps == 0 {
             0.0
         } else {
-            self.total_accepted as f64 / self.total_steps as f64
+            (self.total_accepted + self.total_target_tokens) as f64 / self.total_steps as f64
         }
     }
 
-    /// Alias for `mean_accepted_per_step()`.
+    /// Alias for `average_accepted_tokens_per_step()`.
+    pub fn mean_accepted_per_step(&self) -> f64 {
+        self.average_accepted_tokens_per_step()
+    }
+
+    /// Alias for `average_accepted_tokens_per_step()`.
     pub fn tau_bar(&self) -> f64 {
-        self.mean_accepted_per_step()
+        self.average_accepted_tokens_per_step()
     }
 
     /// Measures wall-clock empirical speedup ratio: S = T_autoregressive / T_speculative.
-    pub fn speedup_ratio<T: SpeedupTime>(&self, autoregressive_time: T) -> f64 {
+    pub fn speedup_ratio(&self, autoregressive_time: Duration) -> f64 {
         let spec_secs = self.total_duration.as_secs_f64();
         if spec_secs <= 0.0 {
             0.0
         } else {
-            autoregressive_time.to_duration().as_secs_f64() / spec_secs
+            autoregressive_time.as_secs_f64() / spec_secs
         }
     }
 
     /// Computes speedup ratio from autoregressive duration in seconds.
     pub fn speedup_ratio_secs(&self, autoregressive_secs: f64) -> f64 {
-        self.speedup_ratio(autoregressive_secs)
+        self.speedup_ratio(Duration::from_secs_f64(autoregressive_secs))
     }
 
     pub fn n_prop(&self) -> usize {
@@ -217,17 +219,18 @@ impl SpeculativeProfiler {
         SpeculativeReport {
             total_proposed: self.total_proposed,
             total_accepted: self.total_accepted,
+            total_target_tokens: self.total_target_tokens,
             total_steps: self.total_steps,
             rollback_events: self.rollback_events,
             acceptance_rate: self.acceptance_rate(),
-            mean_accepted_per_step: self.mean_accepted_per_step(),
+            mean_accepted_per_step: self.average_accepted_tokens_per_step(),
             total_duration_secs: self.total_duration.as_secs_f64(),
             speedup_ratio: None,
         }
     }
 
     /// Generates a `SpeculativeReport` with speedup ratio against autoregressive baseline.
-    pub fn report_with_speedup<T: SpeedupTime>(&self, autoregressive_time: T) -> SpeculativeReport {
+    pub fn report_with_speedup(&self, autoregressive_time: Duration) -> SpeculativeReport {
         let mut rep = self.report();
         rep.speedup_ratio = Some(self.speedup_ratio(autoregressive_time));
         rep
@@ -244,17 +247,17 @@ impl SpeculativeProfiler {
     }
 
     /// Serializes the report snapshot with speedup ratio to JSON.
-    pub fn to_json_with_speedup<T: SpeedupTime>(
+    pub fn to_json_with_speedup(
         &self,
-        autoregressive_time: T,
+        autoregressive_time: Duration,
     ) -> Result<String, serde_json::Error> {
         self.report_with_speedup(autoregressive_time).to_json()
     }
 
     /// Serializes the report snapshot with speedup ratio to pretty-printed JSON.
-    pub fn to_json_pretty_with_speedup<T: SpeedupTime>(
+    pub fn to_json_pretty_with_speedup(
         &self,
-        autoregressive_time: T,
+        autoregressive_time: Duration,
     ) -> Result<String, serde_json::Error> {
         self.report_with_speedup(autoregressive_time).to_json_pretty()
     }

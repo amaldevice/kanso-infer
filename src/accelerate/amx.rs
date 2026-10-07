@@ -56,22 +56,39 @@ pub fn amx_gemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32
 
     #[cfg(target_os = "macos")]
     unsafe {
-        cblas_sgemm(
-            CBLAS_ROW_MAJOR,
-            CBLAS_NO_TRANS,
-            CBLAS_NO_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
-            1.0,
-            a.as_ptr(),
-            k as i32,
-            b.as_ptr(),
-            n as i32,
-            0.0,
-            c.as_mut_ptr(),
-            n as i32,
-        );
+        if m == 1 {
+            cblas_sgemv(
+                CBLAS_ROW_MAJOR,
+                CBLAS_TRANS,
+                k as i32,
+                n as i32,
+                1.0,
+                b.as_ptr(),
+                n as i32,
+                a.as_ptr(),
+                1,
+                0.0,
+                c.as_mut_ptr(),
+                1,
+            );
+        } else {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0,
+                a.as_ptr(),
+                k as i32,
+                b.as_ptr(),
+                n as i32,
+                0.0,
+                c.as_mut_ptr(),
+                n as i32,
+            );
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -89,22 +106,39 @@ pub fn amx_gemm_b_trans(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &
 
     #[cfg(target_os = "macos")]
     unsafe {
-        cblas_sgemm(
-            CBLAS_ROW_MAJOR,
-            CBLAS_NO_TRANS,
-            CBLAS_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
-            1.0,
-            a.as_ptr(),
-            k as i32,
-            b.as_ptr(),
-            k as i32,
-            0.0,
-            c.as_mut_ptr(),
-            n as i32,
-        );
+        if m == 1 {
+            cblas_sgemv(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                n as i32,
+                k as i32,
+                1.0,
+                b.as_ptr(),
+                k as i32,
+                a.as_ptr(),
+                1,
+                0.0,
+                c.as_mut_ptr(),
+                1,
+            );
+        } else {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_TRANS,
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0,
+                a.as_ptr(),
+                k as i32,
+                b.as_ptr(),
+                k as i32,
+                0.0,
+                c.as_mut_ptr(),
+                n as i32,
+            );
+        }
     }
 
     #[cfg(not(target_os = "macos"))]

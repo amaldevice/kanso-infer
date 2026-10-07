@@ -30,7 +30,11 @@ fn test_bench_itl_metrics_calculation() {
     );
 
     assert_eq!(report.itl_mean_ms, 12.5);
+    assert_eq!(report.itl_p50_ms, 10.0);
+    assert_eq!(report.itl_p90_ms, 20.0);
     assert_eq!(report.itl_p99_ms, 20.0);
+    assert_eq!(report.ttft_p50_ms, 10.0);
+    assert_eq!(report.ttft_p90_ms, 15.0);
 }
 #[test]
 fn test_run_synthetic_sweep_execution() {
@@ -49,4 +53,32 @@ fn test_run_synthetic_sweep_execution() {
     assert!(report.total_tokens_per_sec > 0.0);
     assert!(report.itl_mean_ms >= 0.0);
     assert!(report.itl_p99_ms >= report.itl_mean_ms);
+}
+
+#[test]
+fn test_benchmark_report_json_serialization_percentiles() {
+    let ttfts = vec![12.0, 18.0, 24.0];
+    let itls = vec![4.0, 6.0, 8.0, 10.0];
+    let report = kanso_infer::bench::evaluate_run_with_timings(
+        50,
+        0.5,
+        3,
+        &ttfts,
+        &itls,
+        15,
+        0.1,
+        10,
+        0.4,
+        999,
+    );
+    let json_str = report.to_json().unwrap();
+    assert!(json_str.contains("\"ttft_p50_ms\":"));
+    assert!(json_str.contains("\"ttft_p90_ms\":"));
+    assert!(json_str.contains("\"itl_p50_ms\":"));
+    assert!(json_str.contains("\"itl_p90_ms\":"));
+    let deserialized: kanso_infer::bench::BenchmarkReport = serde_json::from_str(&json_str).unwrap();
+    assert_eq!(deserialized.ttft_p50_ms, report.ttft_p50_ms);
+    assert_eq!(deserialized.ttft_p90_ms, report.ttft_p90_ms);
+    assert_eq!(deserialized.itl_p50_ms, report.itl_p50_ms);
+    assert_eq!(deserialized.itl_p90_ms, report.itl_p90_ms);
 }

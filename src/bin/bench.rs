@@ -84,11 +84,14 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
         report.tokens_per_sec_per_request,
     );
     println!(
-        "{:<24} ttft_ms(mean/max)={:.1}/{:.1} itl_ms(mean/p99)={:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} prefix_hit={:.1}% checksum={:016x}",
+        "{:<24} ttft_ms(p50/p90/mean/max)={:.1}/{:.1}/{:.1}/{:.1} itl_ms(p50/p90/p99)={:.1}/{:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} prefix_hit={:.1}% checksum={:016x}",
         "",
+        report.ttft_p50_ms,
+        report.ttft_p90_ms,
         report.mean_ttft_ms,
         report.max_ttft_ms,
-        report.itl_mean_ms,
+        report.itl_p50_ms,
+        report.itl_p90_ms,
         report.itl_p99_ms,
         report.prefill_tokens_per_sec,
         report.decode_ms_per_step,
@@ -257,6 +260,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let report = run_trace_benchmark(&mut engine, &trace, warmup)?;
         print_report("trace_replay", &report, &args.backend);
+        if let Some(json_path) = &args.json_output {
+            let json_content = serde_json::to_string_pretty(&report)?;
+            std::fs::write(json_path, json_content)?;
+            println!("Exported JSON trace benchmark report to {}", json_path);
+        }
         return Ok(());
     }
 
@@ -271,6 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         args.prompt_len, args.gen_len, args.block_size
     );
 
+    let mut reports = Vec::new();
     for &batch_size in &batch_sizes {
         let max_tokens = args.prompt_len + args.gen_len;
         let mut engine = create_engine_for_workload(
@@ -292,6 +301,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let label = format!("batch_size={batch_size}");
         print_report(&label, &report, &args.backend);
+        reports.push(report);
+    }
+
+    if let Some(json_path) = &args.json_output {
+        let json_content = if reports.len() == 1 {
+            serde_json::to_string_pretty(&reports[0])?
+        } else {
+            serde_json::to_string_pretty(&reports)?
+        };
+        std::fs::write(json_path, json_content)?;
+        println!("Exported JSON benchmark sweep report to {}", json_path);
     }
 
     Ok(())
