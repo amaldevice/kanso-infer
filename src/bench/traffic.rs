@@ -89,6 +89,7 @@ pub fn schedule_to_trace(
             prompt_len,
             gen_len,
             arrival_step: (t / step_duration).floor() as usize,
+            prompt_tokens: None,
         })
         .collect()
 }
