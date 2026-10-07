@@ -16,6 +16,10 @@ pub struct Args {
     /// Path to JSONL trace file (e.g. ShareGPT trace with prompt_len, gen_len, arrival_step)
     #[arg(long)]
     pub trace_file: Option<String>,
+    /// Dataset format: "synthetic" (default), "sharegpt", or "lmsys"
+    #[arg(long, default_value = "synthetic")]
+    pub dataset: String,
+
 
     /// Synthetic prompt token length
     #[arg(long, default_value_t = 128)]
@@ -68,7 +72,7 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
         report.tokens_per_sec_per_request,
     );
     println!(
-        "{:<24} ttft_ms(mean/max)={:.1}/{:.1} itl_ms(mean/p99)={:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} checksum={:016x}",
+        "{:<24} ttft_ms(mean/max)={:.1}/{:.1} itl_ms(mean/p99)={:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} prefix_hit={:.1}% checksum={:016x}",
         "",
         report.mean_ttft_ms,
         report.max_ttft_ms,
@@ -76,6 +80,7 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
         report.itl_p99_ms,
         report.prefill_tokens_per_sec,
         report.decode_ms_per_step,
+        report.prefix_hit_rate * 100.0,
         report.checksum,
     );
     println!(
@@ -196,7 +201,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("============================================================");
 
     if let Some(trace_path) = &args.trace_file {
-        let trace = parse_trace_file(trace_path)?;
+        let trace = if args.dataset.to_lowercase() == "sharegpt"
+            || args.dataset.to_lowercase() == "lmsys"
+        {
+            let content = std::fs::read_to_string(trace_path)?;
+            kanso_infer::bench::parse_sharegpt_dataset(&content)?
+        } else {
+            parse_trace_file(trace_path)?
+        };
         println!(
             "Running trace replay from '{}' ({} requests)",
             trace_path,
