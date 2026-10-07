@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
+pub mod sharegpt;
+pub use sharegpt::*;
+
 
 /// Order-sensitive 64-bit FNV-1a hash over token sequence.
 /// Offset basis: 0xcbf29ce484222325, Prime: 0x100000001b3.
@@ -25,6 +28,33 @@ pub struct TraceEntry {
     pub gen_len: usize,
     #[serde(default)]
     pub arrival_step: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<Vec<u32>>,
+}
+
+impl TraceEntry {
+    pub fn new(prompt_len: usize, gen_len: usize, arrival_step: usize) -> Self {
+        Self {
+            prompt_len,
+            gen_len,
+            arrival_step,
+            prompt_tokens: None,
+        }
+    }
+
+    pub fn with_tokens(
+        prompt_len: usize,
+        gen_len: usize,
+        arrival_step: usize,
+        tokens: Vec<u32>,
+    ) -> Self {
+        Self {
+            prompt_len,
+            gen_len,
+            arrival_step,
+            prompt_tokens: Some(tokens),
+        }
+    }
 }
 
 /// Parses a JSONL trace file where each line is a `TraceEntry` JSON object.
@@ -59,6 +89,7 @@ pub struct BenchmarkReport {
     pub prefill_tokens_per_sec: f64,
     pub decode_ms_per_step: f64,
     pub checksum: u64,
+    pub prefix_hit_rate: f64,
 }
 
 pub fn evaluate_run(
@@ -177,6 +208,7 @@ pub fn evaluate_run_with_timings(
         prefill_tokens_per_sec,
         decode_ms_per_step,
         checksum,
+        prefix_hit_rate: 0.0,
     }
 }
 
@@ -187,6 +219,8 @@ fn execute_engine_run(
     let mut order: Vec<usize> = (0..requests.len()).collect();
     order.sort_by_key(|&i| requests[i].arrival_step);
 
+    let initial_matched = engine.prefix_matched_tokens;
+    let initial_total = engine.total_prompt_tokens_admitted;
     let mut next_pending = 0;
     let mut step_idx = 0;
 
@@ -212,9 +246,13 @@ fn execute_engine_run(
             let req_idx = order[next_pending];
             next_pending += 1;
             let entry = &requests[req_idx];
-            let prompt: Vec<u32> = (0..entry.prompt_len)
-                .map(|p| ((req_idx * 10 + p) % 30) as u32)
-                .collect();
+            let prompt: Vec<u32> = if let Some(tokens) = &entry.prompt_tokens {
+                tokens.clone()
+            } else {
+                (0..entry.prompt_len)
+                    .map(|p| ((req_idx * 10 + p) % 30) as u32)
+                    .collect()
+            };
             let req_id = engine.add_request(prompt, entry.gen_len);
             request_start_times.insert(req_id, Instant::now());
         }
@@ -263,7 +301,7 @@ fn execute_engine_run(
     let overall_elapsed = overall_start.elapsed().as_secs_f64();
     let checksum = fnv1a_64(&generated_tokens);
 
-    Ok(evaluate_run_with_timings(
+    let mut report = evaluate_run_with_timings(
         generated_tokens.len(),
         overall_elapsed,
         requests.len(),
@@ -274,9 +312,16 @@ fn execute_engine_run(
         decode_steps,
         decode_duration.as_secs_f64(),
         checksum,
-    ))
+    );
+    let delta_matched = engine.prefix_matched_tokens.saturating_sub(initial_matched);
+    let delta_total = engine.total_prompt_tokens_admitted.saturating_sub(initial_total);
+    report.prefix_hit_rate = if delta_total == 0 {
+        0.0
+    } else {
+        (delta_matched as f64 / delta_total as f64).min(1.0)
+    };
+    Ok(report)
 }
-
 pub fn run_benchmark_workload(
     engine: &mut Engine,
     requests: &[TraceEntry],
@@ -303,6 +348,7 @@ pub fn run_synthetic_benchmark(
             prompt_len,
             gen_len,
             arrival_step: 0,
+            prompt_tokens: None,
         })
         .collect();
     run_benchmark_workload(engine, &requests, warmup)
