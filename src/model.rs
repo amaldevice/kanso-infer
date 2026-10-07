@@ -9,11 +9,18 @@ pub struct Model {
     pub config: ModelConfig,
     pub device: Device,
     pub backend: String,
+    pub hybrid_pipeline: Option<crate::ane::HybridExecutionPipeline>,
 }
 
 impl Model {
     pub fn new(weights: ModelWeights, config: ModelConfig, device: Device) -> Self {
-        Self { weights, config, device, backend: "cpu".to_string() }
+        Self {
+            weights,
+            config,
+            device,
+            backend: "cpu".to_string(),
+            hybrid_pipeline: None,
+        }
     }
 
     pub fn backend(&self) -> &str {
@@ -22,6 +29,32 @@ impl Model {
 
     pub fn set_backend(&mut self, backend: impl Into<String>) {
         self.backend = backend.into();
+    }
+
+    pub fn set_hybrid_pipeline(&mut self, pipeline: crate::ane::HybridExecutionPipeline) {
+        self.hybrid_pipeline = Some(pipeline);
+    }
+
+    pub fn enable_ane_hybrid(&mut self) {
+        let pipeline = crate::ane::HybridExecutionPipeline::from_model(self);
+        self.hybrid_pipeline = Some(pipeline);
+    }
+
+    pub fn forward_mlp_block(
+        &self,
+        layer_idx: usize,
+        ffn_normed: &Tensor,
+        layer: &LayerWeights,
+    ) -> Result<Tensor, EngineError> {
+        if let Some(pipeline) = &self.hybrid_pipeline {
+            pipeline.forward_layer_mlp(layer_idx, ffn_normed)
+        } else {
+            let gate = self.matmul(ffn_normed, &layer.ffn_gate.t()?)?;
+            let up = self.matmul(ffn_normed, &layer.ffn_up.t()?)?;
+            let silu_gate = candle_nn::ops::silu(&gate)?;
+            let ffn_hidden = (silu_gate * up)?;
+            self.matmul(&ffn_hidden, &layer.ffn_down.t()?)
+        }
     }
 
     pub fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor, EngineError> {
@@ -159,7 +192,7 @@ impl Model {
             None
         };
 
-        for layer in &self.weights.layers {
+        for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             // Attention Norm
             let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
 
@@ -202,13 +235,7 @@ impl Model {
             // FFN Norm
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
 
-            // SwiGLU: silu(x @ W_gate^T) * (x @ W_up^T) @ W_down^T
-            let gate = self.matmul(&ffn_normed, &layer.ffn_gate.t()?)?;
-            let up = self.matmul(&ffn_normed, &layer.ffn_up.t()?)?;
-            let silu_gate = candle_nn::ops::silu(&gate)?;
-            let ffn_hidden = (silu_gate * up)?;
-            let ffn_out = self.matmul(&ffn_hidden, &layer.ffn_down.t()?)?;
-
+            let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
             // Residual connection
             hidden = (hidden + ffn_out)?;
         }
@@ -321,13 +348,7 @@ impl Model {
             // FFN Norm
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
 
-            // SwiGLU: silu(x @ W_gate^T) * (x @ W_up^T) @ W_down^T
-            let gate = self.matmul(&ffn_normed, &layer.ffn_gate.t()?)?;
-            let up = self.matmul(&ffn_normed, &layer.ffn_up.t()?)?;
-            let silu_gate = candle_nn::ops::silu(&gate)?;
-            let ffn_hidden = (silu_gate * up)?;
-            let ffn_out = self.matmul(&ffn_hidden, &layer.ffn_down.t()?)?;
-
+            let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
             // Residual connection
             hidden = (hidden + ffn_out)?;
         }
@@ -495,11 +516,7 @@ impl Model {
             hidden = (hidden + attn_proj)?;
 
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
-            let gate = self.matmul(&ffn_normed, &layer.ffn_gate.t()?)?;
-            let up = self.matmul(&ffn_normed, &layer.ffn_up.t()?)?;
-            let silu_gate = candle_nn::ops::silu(&gate)?;
-            let ffn_hidden = (silu_gate * up)?;
-            let ffn_out = self.matmul(&ffn_hidden, &layer.ffn_down.t()?)?;
+            let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
             hidden = (hidden + ffn_out)?;
         }
 

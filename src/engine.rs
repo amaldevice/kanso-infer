@@ -138,6 +138,14 @@ impl Engine {
             prefix_cache_lookups: 0,
         }
     }
+    pub fn enable_ane_hybrid(&mut self) {
+        self.model.enable_ane_hybrid();
+    }
+
+    pub fn set_hybrid_pipeline(&mut self, pipeline: crate::ane::HybridExecutionPipeline) {
+        self.model.set_hybrid_pipeline(pipeline);
+    }
+
     pub fn add_request(&mut self, prompt_tokens: Vec<u32>, max_tokens: usize) -> u64 {
         let id = self.next_request_id;
         self.next_request_id += 1;
