@@ -16,3 +16,4 @@ pub mod speculative;
 pub mod chat;
 pub mod hardware;
 pub mod accelerate;
+pub mod ane;
