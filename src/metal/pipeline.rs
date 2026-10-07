@@ -18,6 +18,9 @@ impl MetalPipelineCache {
             (shaders::SILU_GATE_SHADER, "silu_gate_kernel", "silu_gate"),
             (shaders::PAGED_KV_SHADER, "paged_kv_gather_kernel", "paged_kv"),
             (shaders::PAGED_ATTENTION_V2_SHADER, "paged_attention_v2_kernel", "paged_attention_v2"),
+            (shaders::FUSED_LLAMA_LAYER_SHADER, "fused_rmsnorm_rope_kernel", "fused_rmsnorm_rope"),
+            (shaders::FUSED_LLAMA_LAYER_SHADER, "fused_rmsnorm_qkv_rope_kernel", "fused_rmsnorm_qkv_rope"),
+            (shaders::FUSED_LLAMA_LAYER_SHADER, "linear_gemv_kernel", "linear_gemv"),
         ];
         for (source, kernel_name, key) in shader_defs {
             let library = device
