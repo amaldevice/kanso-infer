@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
+pub mod traffic;
+pub use traffic::*;
 
 /// Order-sensitive 64-bit FNV-1a hash over token sequence.
 /// Offset basis: 0xcbf29ce484222325, Prime: 0x100000001b3.
