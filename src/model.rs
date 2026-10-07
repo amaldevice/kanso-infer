@@ -66,6 +66,46 @@ impl Model {
         Ok(Self::new(weights, config, dev))
     }
 
+    pub fn create_mock_from_config(config: &ModelConfig) -> Result<Self, EngineError> {
+        let dev = Device::Cpu;
+        let hidden_size = config.hidden_size;
+        let num_attention_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let head_dim = config.head_dim();
+        let intermediate_size = config.intermediate_size;
+        let num_layers = config.num_hidden_layers.min(2);
+        let vocab_size = config.vocab_size.min(1000);
+
+        let mut layers = Vec::new();
+        for _ in 0..num_layers {
+            let layer = LayerWeights {
+                attn_q: Tensor::ones((num_attention_heads * head_dim, hidden_size), DType::F32, &dev)?,
+                attn_k: Tensor::ones((num_kv_heads * head_dim, hidden_size), DType::F32, &dev)?,
+                attn_v: Tensor::ones((num_kv_heads * head_dim, hidden_size), DType::F32, &dev)?,
+                attn_output: Tensor::ones((hidden_size, num_attention_heads * head_dim), DType::F32, &dev)?,
+                attn_norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
+                ffn_gate: Tensor::ones((intermediate_size, hidden_size), DType::F32, &dev)?,
+                ffn_up: Tensor::ones((intermediate_size, hidden_size), DType::F32, &dev)?,
+                ffn_down: Tensor::ones((hidden_size, intermediate_size), DType::F32, &dev)?,
+                ffn_norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
+            };
+            layers.push(layer);
+        }
+
+        let weights = ModelWeights {
+            embed_tokens: Tensor::ones((vocab_size, hidden_size), DType::F32, &dev)?,
+            layers,
+            norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
+            lm_head: Tensor::ones((vocab_size, hidden_size), DType::F32, &dev)?,
+        };
+
+        let mut cfg = config.clone();
+        cfg.num_hidden_layers = num_layers;
+        cfg.vocab_size = vocab_size;
+
+        Ok(Self::new(weights, cfg, dev))
+    }
+
     fn rmsnorm(&self, x: &Tensor, weight: &Tensor) -> Result<Tensor, EngineError> {
         let sq = x.sqr()?;
         let mean_sq = sq.mean_keepdim(candle_core::D::Minus1)?;

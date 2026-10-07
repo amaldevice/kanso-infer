@@ -8,6 +8,14 @@ description = "A minimalist LLM inference engine in Rust with Paged KV Cache, Co
 name = "kanso_infer"
 path = "src/lib.rs"
 
+[[bin]]
+name = "kanso"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [dependencies]
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
