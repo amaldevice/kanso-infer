@@ -189,6 +189,7 @@ fn test_benchmark_report_speculative_integration() {
         prefill_tokens_per_sec: 500.0,
         decode_ms_per_step: 4.0,
         checksum: 0x12345678,
+        prefix_hit_rate: 0.0,
         speculative: None,
     }
     .with_speculative(spec_report);
