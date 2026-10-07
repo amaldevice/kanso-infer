@@ -38,12 +38,16 @@ Supports dense Transformer decoders and next-generation hybrid linear-attention 
 - **Trace Replay**: Replays ShareGPT-style JSONL traces (`--trace-file`) with heterogeneous prompt lengths, generation lengths, and staggered arrival times.
 - **Multi-Model Profile Selection**: `--model-type <mock | smollm2 | granite-dense | granite-h | lfm>` for empirical architecture comparison.
 - **Deterministic 64-bit FNV-1a Checksums**: Order-sensitive token stream hashing to mathematically prove greedy output parity across CPU, NEON, and Metal backends.
+- **Hardware Telemetry & Resource Tracking (Zero-Sudo)**:
+  - **Hardware Profiling**: Reads CPU model, core counts, RAM, and model identifier via macOS `sysctl`.
+  - **Peak Memory (RSS)**: Tracks peak Resident Set Size in MB via POSIX `libc::getrusage`.
+  - **Thermal Pressure Monitoring**: Queries `NSProcessInfo.thermalState` directly from user space without root/sudo (`Nominal`, `Fair`, `Serious`, `Critical`).
+  - **Memory Bus Bandwidth Utilization**: Estimates effective GB/s and hardware bus utilization percentage using the Roofline formulation.
 - **Full SLO Metric Reporting**:
   - Total throughput (`tok/s`) and per-request throughput (`tok/s/req`)
   - Time-to-First-Token (`TTFT` mean and max in ms)
   - Inter-Token Latency (`ITL` mean and $p99$ in ms)
   - Decode duration (`ms/step`) and prefill rate (`tok/s`)
-
 ---
 
 ## Project Structure
@@ -62,9 +66,9 @@ kanso-infer/
 │   ├── sampler.rs        # Greedy argmax & top-p nucleus sampler
 │   ├── chat.rs           # ChatSession multi-turn REPL & ChatML formatting
 │   ├── bench.rs          # Benchmark workload runner & SLO metric calculations
+│   ├── hardware.rs       # User-space hardware profiler, peak RSS, thermal state & bus util
 │   ├── engine.rs         # Continuous batching & chunked prefill scheduler
 │   ├── error.rs          # Stdlib EngineError
-│   ├── server/           # Axum HTTP routes (/health, /v1/chat/completions) & DTOs
 │   ├── kv_cache/
 │   │   ├── block_pool.rs # Physical memory block pool & ref-counting
 │   │   ├── block_table.rs# Virtual-to-physical block table translation
@@ -94,7 +98,7 @@ kanso-infer/
 │   │   └── sparse_kv.rs       # Selective sparse KV cache allocation
 │   └── bin/
 │       └── bench.rs      # Standalone benchmark binary CLI
-└── tests/                # 20 integration test suites (57 tests)
+└── tests/                # 21 integration test suites (61 tests)
 ```
 
 ---
@@ -102,7 +106,7 @@ kanso-infer/
 ## Quickstart & CLI Usage
 
 ### 1. Run Tests
-Verify all 57 unit, parity, and integration test suites:
+Verify all 61 unit, parity, and integration test suites:
 
 ```bash
 cargo test
@@ -110,7 +114,7 @@ cargo test
 
 Expected output:
 ```text
-test result: ok. 57 passed; 0 failed; finished in ~11s
+test result: ok. 61 passed; 0 failed; finished in ~11s
 ```
 
 ### 2. Interactive Terminal Chat
@@ -193,6 +197,13 @@ cargo run --release --bin bench -- \
 
 Output format:
 ```text
-batch_size=1    backend=cpu    batch=1    tok/s(total)=34.5    tok/s/req=34.5
-                ttft_ms(mean/max)=28.4/28.4 itl_ms(mean/p99)=28.1/31.2 prefill_tok/s=4508.2 decode_ms/step=28.98 checksum=88201fb960ff6465
+============================================================
+ kanso-infer multi-engine benchmark suite
+ Hardware : Apple A18 Pro (6 cores, 8.0 GB RAM, Model: Mac17,5)
+ Thermal  : Fair (Elevated, fans active)
+ Backend  : cpu, Model Profile: mock, Warmup: false
+============================================================
+batch_size=1    backend=cpu    batch=1    tok/s(total)=245.2    tok/s/req=245.17
+                ttft_ms(mean/max)=22.3/22.3 itl_ms(mean/p99)=1.5/1.7 decode_ms/step=4.08 checksum=a8c7f832281a39c5
+                peak_rss=9.8MB thermal="Fair (Elevated, fans active)" bus_est=93.2GB/s (62.1% bus util)
 ```
