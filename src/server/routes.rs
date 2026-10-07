@@ -16,10 +16,21 @@ use crate::server::dto::{
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<Mutex<Engine>>,
+    pub max_queue_size: Option<usize>,
 }
 
 pub fn create_app(engine: Arc<Mutex<Engine>>) -> Router {
-    let state = AppState { engine };
+    create_app_with_queue_limit(engine, Some(64))
+}
+
+pub fn create_app_with_queue_limit(
+    engine: Arc<Mutex<Engine>>,
+    max_queue: Option<usize>,
+) -> Router {
+    let state = AppState {
+        engine,
+        max_queue_size: max_queue,
+    };
     Router::new()
         .route("/health", get(health_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
@@ -59,8 +70,25 @@ async fn chat_completions_handler(
 
     let request_id = {
         let mut engine = state.engine.lock();
+        if let Some(limit) = state.max_queue_size {
+            let waiting = engine.waiting_count();
+            let active = engine.sequences.iter().filter(|s| !s.is_finished()).count();
+            if waiting >= limit || active >= engine.max_running + limit {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Engine queue full: {} waiting / {} active requests exceeds capacity limit of {}",
+                        waiting,
+                        active,
+                        limit
+                    ),
+                ));
+            }
+        }
         engine.add_request(prompt_tokens, max_tokens)
     };
+
+    tokio::task::yield_now().await;
 
     // Run inference steps until request finishes
     let mut generated_token_ids = Vec::new();
@@ -88,8 +116,8 @@ async fn chat_completions_handler(
         if done {
             break;
         }
+        tokio::task::yield_now().await;
     }
-
     let response_text = format!("Response generated with {} tokens", generated_token_ids.len());
 
     let resp = ChatCompletionResponse {

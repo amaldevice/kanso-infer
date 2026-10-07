@@ -16,6 +16,10 @@ pub struct Args {
     /// Path to JSONL trace file (e.g. ShareGPT trace with prompt_len, gen_len, arrival_step)
     #[arg(long)]
     pub trace_file: Option<String>,
+    /// Dataset format: "synthetic" (default), "sharegpt", or "lmsys"
+    #[arg(long, default_value = "synthetic")]
+    pub dataset: String,
+
 
     /// Synthetic prompt token length
     #[arg(long, default_value_t = 128)]
@@ -25,7 +29,7 @@ pub struct Args {
     #[arg(long, default_value_t = 64)]
     pub gen_len: usize,
 
-    /// Execution backend: "cpu", "metal", or "neon"
+    /// Execution backend: "cpu", "metal", "neon", or "amx"
     #[arg(long, default_value = "cpu")]
     pub backend: String,
 
@@ -48,6 +52,18 @@ pub struct Args {
     /// Model profile type: "mock", "smollm2", "granite-dense", "granite-h", "lfm"
     #[arg(long, default_value = "mock")]
     pub model_type: String,
+
+    /// Run perplexity evaluation on specified dataset (e.g. "wikitext2")
+    #[arg(long)]
+    pub eval_ppl: Option<String>,
+
+    /// Sliding window context stride for perplexity evaluation
+    #[arg(long, default_value_t = 512)]
+    pub ppl_stride: usize,
+
+    /// Path to export benchmark report in JSON format
+    #[arg(long)]
+    pub json_output: Option<String>,
 }
 
 fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
@@ -68,14 +84,18 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
         report.tokens_per_sec_per_request,
     );
     println!(
-        "{:<24} ttft_ms(mean/max)={:.1}/{:.1} itl_ms(mean/p99)={:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} checksum={:016x}",
+        "{:<24} ttft_ms(p50/p90/mean/max)={:.1}/{:.1}/{:.1}/{:.1} itl_ms(p50/p90/p99)={:.1}/{:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} prefix_hit={:.1}% checksum={:016x}",
         "",
+        report.ttft_p50_ms,
+        report.ttft_p90_ms,
         report.mean_ttft_ms,
         report.max_ttft_ms,
-        report.itl_mean_ms,
+        report.itl_p50_ms,
+        report.itl_p90_ms,
         report.itl_p99_ms,
         report.prefill_tokens_per_sec,
         report.decode_ms_per_step,
+        report.prefix_hit_rate * 100.0,
         report.checksum,
     );
     println!(
@@ -86,6 +106,9 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
         effective_gb_s,
         util_pct,
     );
+    if let Some(spec) = &report.speculative {
+        println!("{}", spec.format_report());
+    }
 }
 
 fn create_engine_for_workload(
@@ -114,19 +137,22 @@ fn create_engine_for_workload(
     // Initialize model backend
     match backend.to_lowercase().as_str() {
         "cpu" => {
-            let model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+            let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+            model.set_backend("cpu");
             Ok(Engine::new(model, max_running, total_blocks, block_size))
         }
         "neon" => {
             #[cfg(target_arch = "aarch64")]
             {
-                let model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                model.set_backend("neon");
                 Ok(Engine::new(model, max_running, total_blocks, block_size))
             }
             #[cfg(not(target_arch = "aarch64"))]
             {
                 eprintln!("Warning: NEON backend requested on non-aarch64 architecture, falling back to CPU reference.");
-                let model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                model.set_backend("cpu");
                 Ok(Engine::new(model, max_running, total_blocks, block_size))
             }
         }
@@ -135,23 +161,41 @@ fn create_engine_for_workload(
             {
                 // Verify Metal context availability
                 if let Ok(_ctx) = kanso_infer::metal::context::MetalContext::new() {
-                    let model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                    let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                    model.set_backend("metal");
                     Ok(Engine::new(model, max_running, total_blocks, block_size))
                 } else {
                     eprintln!("Warning: Metal unavailable, falling back to CPU reference.");
-                    let model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                    let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                    model.set_backend("cpu");
                     Ok(Engine::new(model, max_running, total_blocks, block_size))
                 }
             }
             #[cfg(not(target_os = "macos"))]
             {
                 eprintln!("Warning: Metal backend only supported on macOS, falling back to CPU reference.");
-                let model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                model.set_backend("cpu");
+                Ok(Engine::new(model, max_running, total_blocks, block_size))
+            }
+        }
+        "amx" => {
+            #[cfg(target_os = "macos")]
+            {
+                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                model.set_backend("amx");
+                Ok(Engine::new(model, max_running, total_blocks, block_size))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                eprintln!("Warning: AMX backend only supported on macOS, falling back to CPU reference.");
+                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
+                model.set_backend("cpu");
                 Ok(Engine::new(model, max_running, total_blocks, block_size))
             }
         }
         other => Err(EngineError::Config(format!(
-            "Unsupported backend '{}'. Valid options: cpu, metal, neon",
+            "Unsupported backend '{}'. Valid options: cpu, metal, neon, amx",
             other
         ))),
     }
@@ -171,8 +215,28 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!(" Backend  : {}, Model Profile: {}, Warmup: {}", args.backend, args.model_type, warmup);
     println!("============================================================");
 
+    if let Some(dataset) = &args.eval_ppl {
+        println!("Evaluating perplexity on dataset: {}", dataset);
+        let report = kanso_infer::bench::run_wikitext2_perplexity_eval(&args.model_type, args.ppl_stride)?;
+        let ascii_table = kanso_infer::bench::format_ascii_ppl_report(&report);
+        println!("{}", ascii_table);
+
+        if let Some(json_path) = &args.json_output {
+            let json_content = serde_json::to_string_pretty(&report)?;
+            std::fs::write(json_path, json_content)?;
+            println!("Exported JSON perplexity report to {}", json_path);
+        }
+        return Ok(());
+    }
     if let Some(trace_path) = &args.trace_file {
-        let trace = parse_trace_file(trace_path)?;
+        let trace = if args.dataset.to_lowercase() == "sharegpt"
+            || args.dataset.to_lowercase() == "lmsys"
+        {
+            let content = std::fs::read_to_string(trace_path)?;
+            kanso_infer::bench::parse_sharegpt_dataset(&content)?
+        } else {
+            parse_trace_file(trace_path)?
+        };
         println!(
             "Running trace replay from '{}' ({} requests)",
             trace_path,
@@ -196,6 +260,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let report = run_trace_benchmark(&mut engine, &trace, warmup)?;
         print_report("trace_replay", &report, &args.backend);
+        if let Some(json_path) = &args.json_output {
+            let json_content = serde_json::to_string_pretty(&report)?;
+            std::fs::write(json_path, json_content)?;
+            println!("Exported JSON trace benchmark report to {}", json_path);
+        }
         return Ok(());
     }
 
@@ -210,6 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         args.prompt_len, args.gen_len, args.block_size
     );
 
+    let mut reports = Vec::new();
     for &batch_size in &batch_sizes {
         let max_tokens = args.prompt_len + args.gen_len;
         let mut engine = create_engine_for_workload(
@@ -231,6 +301,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let label = format!("batch_size={batch_size}");
         print_report(&label, &report, &args.backend);
+        reports.push(report);
+    }
+
+    if let Some(json_path) = &args.json_output {
+        let json_content = if reports.len() == 1 {
+            serde_json::to_string_pretty(&reports[0])?
+        } else {
+            serde_json::to_string_pretty(&reports)?
+        };
+        std::fs::write(json_path, json_content)?;
+        println!("Exported JSON benchmark sweep report to {}", json_path);
     }
 
     Ok(())

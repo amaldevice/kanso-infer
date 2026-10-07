@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
+pub mod traffic;
+pub use traffic::*;
+pub mod sharegpt;
+pub use sharegpt::*;
+pub mod perplexity;
+pub use perplexity::*;
 
 /// Order-sensitive 64-bit FNV-1a hash over token sequence.
 /// Offset basis: 0xcbf29ce484222325, Prime: 0x100000001b3.
@@ -25,6 +31,33 @@ pub struct TraceEntry {
     pub gen_len: usize,
     #[serde(default)]
     pub arrival_step: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<Vec<u32>>,
+}
+
+impl TraceEntry {
+    pub fn new(prompt_len: usize, gen_len: usize, arrival_step: usize) -> Self {
+        Self {
+            prompt_len,
+            gen_len,
+            arrival_step,
+            prompt_tokens: None,
+        }
+    }
+
+    pub fn with_tokens(
+        prompt_len: usize,
+        gen_len: usize,
+        arrival_step: usize,
+        tokens: Vec<u32>,
+    ) -> Self {
+        Self {
+            prompt_len,
+            gen_len,
+            arrival_step,
+            prompt_tokens: Some(tokens),
+        }
+    }
 }
 
 /// Parses a JSONL trace file where each line is a `TraceEntry` JSON object.
@@ -44,7 +77,7 @@ pub fn parse_trace_file(path: &str) -> Result<Vec<TraceEntry>, EngineError> {
     Ok(entries)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkReport {
     pub total_tokens: usize,
     pub total_duration_secs: f64,
@@ -54,13 +87,37 @@ pub struct BenchmarkReport {
     pub avg_ms_per_step: f64,
     pub mean_ttft_ms: f64,
     pub max_ttft_ms: f64,
+    pub ttft_p50_ms: f64,
+    pub ttft_p90_ms: f64,
     pub itl_mean_ms: f64,
+    pub itl_p50_ms: f64,
+    pub itl_p90_ms: f64,
     pub itl_p99_ms: f64,
     pub prefill_tokens_per_sec: f64,
     pub decode_ms_per_step: f64,
     pub checksum: u64,
+    pub prefix_hit_rate: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<crate::speculative::profiler::SpeculativeReport>,
 }
 
+impl BenchmarkReport {
+    pub fn with_speculative(
+        mut self,
+        speculative: crate::speculative::profiler::SpeculativeReport,
+    ) -> Self {
+        self.speculative = Some(speculative);
+        self
+    }
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
 pub fn evaluate_run(
     total_tokens: usize,
     total_duration_secs: f64,
@@ -136,21 +193,14 @@ pub fn evaluate_run_with_timings(
         0.0
     };
     let max_ttft_ms = ttft_ms_records.iter().copied().fold(0.0f64, f64::max);
+    let (ttft_p50_ms, ttft_p90_ms, _) = traffic::calculate_percentiles(ttft_ms_records);
 
     let itl_mean_ms = if !itl_ms_records.is_empty() {
         itl_ms_records.iter().sum::<f64>() / (itl_ms_records.len() as f64)
     } else {
         0.0
     };
-
-    let itl_p99_ms = if !itl_ms_records.is_empty() {
-        let mut sorted = itl_ms_records.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let rank = ((sorted.len() as f64 * 0.99).ceil() as usize).max(1).min(sorted.len());
-        sorted[rank - 1]
-    } else {
-        0.0
-    };
+    let (itl_p50_ms, itl_p90_ms, itl_p99_ms) = traffic::calculate_percentiles(itl_ms_records);
     let prefill_tokens_per_sec = if prefill_duration_secs > 0.0 {
         (prefill_tokens as f64) / prefill_duration_secs
     } else {
@@ -172,11 +222,17 @@ pub fn evaluate_run_with_timings(
         avg_ms_per_step: decode_ms_per_step,
         mean_ttft_ms,
         max_ttft_ms,
+        ttft_p50_ms,
+        ttft_p90_ms,
         itl_mean_ms,
+        itl_p50_ms,
+        itl_p90_ms,
         itl_p99_ms,
         prefill_tokens_per_sec,
         decode_ms_per_step,
         checksum,
+        prefix_hit_rate: 0.0,
+        speculative: None,
     }
 }
 
@@ -187,6 +243,8 @@ fn execute_engine_run(
     let mut order: Vec<usize> = (0..requests.len()).collect();
     order.sort_by_key(|&i| requests[i].arrival_step);
 
+    let initial_matched = engine.prefix_matched_tokens;
+    let initial_total = engine.total_prompt_tokens_admitted;
     let mut next_pending = 0;
     let mut step_idx = 0;
 
@@ -212,9 +270,13 @@ fn execute_engine_run(
             let req_idx = order[next_pending];
             next_pending += 1;
             let entry = &requests[req_idx];
-            let prompt: Vec<u32> = (0..entry.prompt_len)
-                .map(|p| ((req_idx * 10 + p) % 30) as u32)
-                .collect();
+            let prompt: Vec<u32> = if let Some(tokens) = &entry.prompt_tokens {
+                tokens.clone()
+            } else {
+                (0..entry.prompt_len)
+                    .map(|p| ((req_idx * 10 + p) % 30) as u32)
+                    .collect()
+            };
             let req_id = engine.add_request(prompt, entry.gen_len);
             request_start_times.insert(req_id, Instant::now());
         }
@@ -263,7 +325,7 @@ fn execute_engine_run(
     let overall_elapsed = overall_start.elapsed().as_secs_f64();
     let checksum = fnv1a_64(&generated_tokens);
 
-    Ok(evaluate_run_with_timings(
+    let mut report = evaluate_run_with_timings(
         generated_tokens.len(),
         overall_elapsed,
         requests.len(),
@@ -274,9 +336,16 @@ fn execute_engine_run(
         decode_steps,
         decode_duration.as_secs_f64(),
         checksum,
-    ))
+    );
+    let delta_matched = engine.prefix_matched_tokens.saturating_sub(initial_matched);
+    let delta_total = engine.total_prompt_tokens_admitted.saturating_sub(initial_total);
+    report.prefix_hit_rate = if delta_total == 0 {
+        0.0
+    } else {
+        (delta_matched as f64 / delta_total as f64).min(1.0)
+    };
+    Ok(report)
 }
-
 pub fn run_benchmark_workload(
     engine: &mut Engine,
     requests: &[TraceEntry],
@@ -303,6 +372,7 @@ pub fn run_synthetic_benchmark(
             prompt_len,
             gen_len,
             arrival_step: 0,
+            prompt_tokens: None,
         })
         .collect();
     run_benchmark_workload(engine, &requests, warmup)
@@ -326,7 +396,7 @@ pub fn run_synthetic_sweep(
 
 pub fn create_engine_for_model_profile(
     model_type: &str,
-    _backend: &str,
+    backend: &str,
     num_requests: usize,
     max_tokens_per_seq: usize,
     block_size: usize,
@@ -335,7 +405,8 @@ pub fn create_engine_for_model_profile(
     let config = crate::config::ModelConfig::from_model_type(model_type)?;
     let blocks_per_seq = (max_tokens_per_seq + block_size - 1) / block_size + 1;
     let total_blocks = (blocks_per_seq * num_requests.max(1)).max(128);
-    let model = crate::model::Model::create_mock_from_config(&config)?;
+    let mut model = crate::model::Model::create_mock_from_config(&config)?;
+    model.set_backend(backend);
     let engine = Engine::new(model, max_running, total_blocks, block_size);
     Ok(engine)
 }

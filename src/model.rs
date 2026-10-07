@@ -8,11 +8,61 @@ pub struct Model {
     pub weights: ModelWeights,
     pub config: ModelConfig,
     pub device: Device,
+    pub backend: String,
+    pub hybrid_pipeline: Option<crate::ane::HybridExecutionPipeline>,
 }
 
 impl Model {
     pub fn new(weights: ModelWeights, config: ModelConfig, device: Device) -> Self {
-        Self { weights, config, device }
+        Self {
+            weights,
+            config,
+            device,
+            backend: "cpu".to_string(),
+            hybrid_pipeline: None,
+        }
+    }
+
+    pub fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    pub fn set_backend(&mut self, backend: impl Into<String>) {
+        self.backend = backend.into();
+    }
+
+    pub fn set_hybrid_pipeline(&mut self, pipeline: crate::ane::HybridExecutionPipeline) {
+        self.hybrid_pipeline = Some(pipeline);
+    }
+
+    pub fn enable_ane_hybrid(&mut self) {
+        let pipeline = crate::ane::HybridExecutionPipeline::from_model(self);
+        self.hybrid_pipeline = Some(pipeline);
+    }
+
+    pub fn forward_mlp_block(
+        &self,
+        layer_idx: usize,
+        ffn_normed: &Tensor,
+        layer: &LayerWeights,
+    ) -> Result<Tensor, EngineError> {
+        if let Some(pipeline) = &self.hybrid_pipeline {
+            pipeline.forward_layer_mlp(layer_idx, ffn_normed)
+        } else {
+            let gate = self.matmul(ffn_normed, &layer.ffn_gate.t()?)?;
+            let up = self.matmul(ffn_normed, &layer.ffn_up.t()?)?;
+            let silu_gate = candle_nn::ops::silu(&gate)?;
+            let ffn_hidden = (silu_gate * up)?;
+            self.matmul(&ffn_hidden, &layer.ffn_down.t()?)
+        }
+    }
+
+    pub fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor, EngineError> {
+        if self.backend.eq_ignore_ascii_case("amx") {
+            crate::accelerate::amx::amx_matmul(a, b)
+        } else {
+            Ok(a.matmul(b)?)
+        }
     }
 
     pub fn create_mock_tiny(
@@ -106,7 +156,7 @@ impl Model {
         Ok(Self::new(weights, cfg, dev))
     }
 
-    fn rmsnorm(&self, x: &Tensor, weight: &Tensor) -> Result<Tensor, EngineError> {
+    pub fn rmsnorm(&self, x: &Tensor, weight: &Tensor) -> Result<Tensor, EngineError> {
         let sq = x.sqr()?;
         let mean_sq = sq.mean_keepdim(candle_core::D::Minus1)?;
         let rms = (mean_sq + self.config.rms_norm_eps)?.sqrt()?;
@@ -114,7 +164,7 @@ impl Model {
         Ok(normalized.broadcast_mul(weight)?)
     }
 
-    pub fn forward_single_prompt(&self, tokens: &[u32]) -> Result<Tensor, EngineError> {
+    pub fn forward_tokens(&self, tokens: &[u32]) -> Result<Tensor, EngineError> {
         let seq_len = tokens.len();
         if seq_len == 0 {
             return Err(EngineError::Model("Empty input tokens".to_string()));
@@ -142,14 +192,14 @@ impl Model {
             None
         };
 
-        for layer in &self.weights.layers {
+        for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             // Attention Norm
             let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
 
             // Linear Q, K, V: [seq_len, hidden_size] @ W^T -> [seq_len, out_features]
-            let q = normed.matmul(&layer.attn_q.t()?)?;
-            let k = normed.matmul(&layer.attn_k.t()?)?;
-            let v = normed.matmul(&layer.attn_v.t()?)?;
+            let q = self.matmul(&normed, &layer.attn_q.t()?)?;
+            let k = self.matmul(&normed, &layer.attn_k.t()?)?;
+            let v = self.matmul(&normed, &layer.attn_v.t()?)?;
 
             // Reshape for multi-head: [seq_len, num_heads, head_dim] -> [num_heads, seq_len, head_dim]
             let q = q.reshape((seq_len, num_q_heads, head_dim))?.transpose(0, 1)?;
@@ -168,16 +218,16 @@ impl Model {
 
             // Scaled dot-product attention
             let scale = 1.0 / (head_dim as f64).sqrt();
-            let mut scores = (q.matmul(&k.t()?)? * scale)?;
+            let mut scores = (self.matmul(&q, &k.t()?)? * scale)?;
             if let Some(mask) = &causal_mask {
                 scores = scores.broadcast_add(mask)?;
             }
             let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
-            let attn_out = attn_weights.matmul(&v)?;
+            let attn_out = self.matmul(&attn_weights, &v)?;
 
             // Merge heads back: [num_q_heads, seq_len, head_dim] -> [seq_len, hidden_size]
             let attn_out = attn_out.transpose(0, 1)?.reshape((seq_len, num_q_heads * head_dim))?;
-            let attn_proj = attn_out.matmul(&layer.attn_output.t()?)?;
+            let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
 
             // Residual connection
             hidden = (hidden + attn_proj)?;
@@ -185,13 +235,7 @@ impl Model {
             // FFN Norm
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
 
-            // SwiGLU: silu(x @ W_gate^T) * (x @ W_up^T) @ W_down^T
-            let gate = ffn_normed.matmul(&layer.ffn_gate.t()?)?;
-            let up = ffn_normed.matmul(&layer.ffn_up.t()?)?;
-            let silu_gate = candle_nn::ops::silu(&gate)?;
-            let ffn_hidden = (silu_gate * up)?;
-            let ffn_out = ffn_hidden.matmul(&layer.ffn_down.t()?)?;
-
+            let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
             // Residual connection
             hidden = (hidden + ffn_out)?;
         }
@@ -199,12 +243,15 @@ impl Model {
         // Final RMSNorm
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
 
-        // Only take the last token embedding for next-token prediction
-        let last_hidden = final_normed.i(seq_len - 1)?.unsqueeze(0)?;
-
-        // LM Head projection: [1, hidden_size] @ W_head^T -> [1, vocab_size]
-        let logits = last_hidden.matmul(&self.weights.lm_head.t()?)?;
+        // LM Head projection for all tokens: [seq_len, hidden_size] @ W_head^T -> [seq_len, vocab_size]
+        let logits = self.matmul(&final_normed, &self.weights.lm_head.t()?)?;
         Ok(logits)
+    }
+
+    pub fn forward_single_prompt(&self, tokens: &[u32]) -> Result<Tensor, EngineError> {
+        let logits = self.forward_tokens(tokens)?;
+        let seq_len = tokens.len();
+        Ok(logits.i(seq_len - 1)?.unsqueeze(0)?)
     }
 
     pub fn forward_decode_step(
@@ -252,9 +299,9 @@ impl Model {
             let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
 
             // Linear Q, K, V for single token
-            let q = normed.matmul(&layer.attn_q.t()?)?;
-            let k = normed.matmul(&layer.attn_k.t()?)?;
-            let v = normed.matmul(&layer.attn_v.t()?)?;
+            let q = self.matmul(&normed, &layer.attn_q.t()?)?;
+            let k = self.matmul(&normed, &layer.attn_k.t()?)?;
+            let v = self.matmul(&normed, &layer.attn_v.t()?)?;
 
             // Reshape Q: [num_q_heads, 1, head_dim]
             let q = q.reshape((1, num_q_heads, head_dim))?.transpose(0, 1)?;
@@ -287,13 +334,13 @@ impl Model {
 
             // Scaled dot-product attention against historical context
             let scale = 1.0 / (head_dim as f64).sqrt();
-            let scores = (q.matmul(&k_all.t()?)? * scale)?;
+            let scores = (self.matmul(&q, &k_all.t()?)? * scale)?;
             let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
-            let attn_out = attn_weights.matmul(&v_all)?;
+            let attn_out = self.matmul(&attn_weights, &v_all)?;
 
             // Merge heads back: [1, hidden_size]
             let attn_out = attn_out.transpose(0, 1)?.reshape((1, num_q_heads * head_dim))?;
-            let attn_proj = attn_out.matmul(&layer.attn_output.t()?)?;
+            let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
 
             // Residual connection
             hidden = (hidden + attn_proj)?;
@@ -301,13 +348,7 @@ impl Model {
             // FFN Norm
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
 
-            // SwiGLU: silu(x @ W_gate^T) * (x @ W_up^T) @ W_down^T
-            let gate = ffn_normed.matmul(&layer.ffn_gate.t()?)?;
-            let up = ffn_normed.matmul(&layer.ffn_up.t()?)?;
-            let silu_gate = candle_nn::ops::silu(&gate)?;
-            let ffn_hidden = (silu_gate * up)?;
-            let ffn_out = ffn_hidden.matmul(&layer.ffn_down.t()?)?;
-
+            let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
             // Residual connection
             hidden = (hidden + ffn_out)?;
         }
@@ -316,7 +357,7 @@ impl Model {
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
 
         // LM Head projection: [1, vocab_size]
-        let logits = final_normed.matmul(&self.weights.lm_head.t()?)?;
+        let logits = self.matmul(&final_normed, &self.weights.lm_head.t()?)?;
 
         if let Some(ws) = workspace {
             if let Ok(flat) = logits.flatten_all() {
@@ -417,9 +458,9 @@ impl Model {
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
 
-            let q = normed.matmul(&layer.attn_q.t()?)?;
-            let k = normed.matmul(&layer.attn_k.t()?)?;
-            let v = normed.matmul(&layer.attn_v.t()?)?;
+            let q = self.matmul(&normed, &layer.attn_q.t()?)?;
+            let k = self.matmul(&normed, &layer.attn_k.t()?)?;
+            let v = self.matmul(&normed, &layer.attn_v.t()?)?;
 
             let q = q.reshape((seq_len, num_q_heads, head_dim))?.transpose(0, 1)?;
             let k_reshaped = k.reshape((seq_len, num_kv_heads, head_dim))?;
@@ -461,30 +502,26 @@ impl Model {
             };
 
             let scale = 1.0 / (head_dim as f64).sqrt();
-            let mut scores = (q.matmul(&k_all.t()?)? * scale)?;
+            let mut scores = (self.matmul(&q, &k_all.t()?)? * scale)?;
             if let Some(mask) = &causal_mask {
                 scores = scores.broadcast_add(mask)?;
             }
             let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
-            let attn_out = attn_weights.matmul(&v_all)?;
+            let attn_out = self.matmul(&attn_weights, &v_all)?;
 
             let attn_out = attn_out
                 .transpose(0, 1)?
                 .reshape((seq_len, num_q_heads * head_dim))?;
-            let attn_proj = attn_out.matmul(&layer.attn_output.t()?)?;
+            let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
             hidden = (hidden + attn_proj)?;
 
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
-            let gate = ffn_normed.matmul(&layer.ffn_gate.t()?)?;
-            let up = ffn_normed.matmul(&layer.ffn_up.t()?)?;
-            let silu_gate = candle_nn::ops::silu(&gate)?;
-            let ffn_hidden = (silu_gate * up)?;
-            let ffn_out = ffn_hidden.matmul(&layer.ffn_down.t()?)?;
+            let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
             hidden = (hidden + ffn_out)?;
         }
 
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
-        let logits = final_normed.matmul(&self.weights.lm_head.t()?)?;
+        let logits = self.matmul(&final_normed, &self.weights.lm_head.t()?)?;
         Ok(logits)
     }
 }

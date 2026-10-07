@@ -80,6 +80,10 @@ pub struct Engine {
     pub next_request_id: u64,
     pub kv_storage: KvStorage,
     pub workspace: ScratchpadWorkspace,
+    pub prefix_matched_tokens: usize,
+    pub total_prompt_tokens_admitted: usize,
+    pub prefix_cache_hits: usize,
+    pub prefix_cache_lookups: usize,
 }
 
 impl Engine {
@@ -128,13 +132,40 @@ impl Engine {
             next_request_id: 1,
             kv_storage,
             workspace,
+            prefix_matched_tokens: 0,
+            total_prompt_tokens_admitted: 0,
+            prefix_cache_hits: 0,
+            prefix_cache_lookups: 0,
         }
     }
+    pub fn enable_ane_hybrid(&mut self) {
+        self.model.enable_ane_hybrid();
+    }
+
+    pub fn set_hybrid_pipeline(&mut self, pipeline: crate::ane::HybridExecutionPipeline) {
+        self.model.set_hybrid_pipeline(pipeline);
+    }
+
     pub fn add_request(&mut self, prompt_tokens: Vec<u32>, max_tokens: usize) -> u64 {
         let id = self.next_request_id;
         self.next_request_id += 1;
         self.sequences.push(Sequence::new(id, prompt_tokens, max_tokens));
         id
+    }
+
+    pub fn prefix_cache_hit_rate(&self) -> f64 {
+        if self.total_prompt_tokens_admitted == 0 {
+            0.0
+        } else {
+            (self.prefix_matched_tokens as f64 / self.total_prompt_tokens_admitted as f64).min(1.0)
+        }
+    }
+
+    pub fn reset_prefix_cache_stats(&mut self) {
+        self.prefix_matched_tokens = 0;
+        self.total_prompt_tokens_admitted = 0;
+        self.prefix_cache_hits = 0;
+        self.prefix_cache_lookups = 0;
     }
 
     pub fn waiting_count(&self) -> usize {
@@ -226,6 +257,8 @@ impl Engine {
             {
                 // Prefix cache lookup runs before the first chunk is scheduled
                 if seq.prefilled_tokens == 0 && seq.generated_tokens.is_empty() {
+                    self.prefix_cache_lookups += 1;
+                    self.total_prompt_tokens_admitted += seq.prompt_tokens.len();
                     let (matched_tokens, matched_blocks) =
                         self.prefix_cache.find_longest_prefix(&seq.prompt_tokens);
                     if matched_tokens > 0 {
@@ -250,6 +283,8 @@ impl Engine {
                             };
                             seq.block_table.set_num_tokens(effective_matched);
                             seq.prefilled_tokens = effective_matched;
+                            self.prefix_cache_hits += 1;
+                            self.prefix_matched_tokens += matched_tokens;
                         } else {
                             for blk in claimed {
                                 self.block_pool.free(blk);
