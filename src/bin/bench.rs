@@ -51,6 +51,16 @@ pub struct Args {
 }
 
 fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
+    let peak_rss_mb = kanso_infer::hardware::get_peak_rss_mb();
+    let thermal = kanso_infer::hardware::get_thermal_state();
+
+    // Compute effective bandwidth utilization (assuming ~380 MB weights on a 150 GB/s bus)
+    let (effective_gb_s, util_pct) = kanso_infer::hardware::calculate_bandwidth_utilization(
+        380_000_000,
+        report.decode_ms_per_step,
+        150.0,
+    );
+
     println!(
         "{label:<24} backend={backend:<6} batch={:<4} tok/s(total)={:<9.1} tok/s/req={:<8.2}",
         report.num_requests,
@@ -58,15 +68,22 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
         report.tokens_per_sec_per_request,
     );
     println!(
-        "{:<24} ttft_ms(mean/max)={:.1}/{:.1} itl_ms(mean/p99)={:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} checksum={:016x}",
+        "{:<24} ttft_ms(mean/max)={:.1}/{:.1} itl_ms(mean/p99)={:.1}/{:.1} decode_ms/step={:.2} checksum={:016x}",
         "",
         report.mean_ttft_ms,
         report.max_ttft_ms,
         report.itl_mean_ms,
         report.itl_p99_ms,
-        report.prefill_tokens_per_sec,
         report.decode_ms_per_step,
         report.checksum,
+    );
+    println!(
+        "{:<24} peak_rss={:.1}MB thermal=\"{}\" bus_est={:.1}GB/s ({:.1}% bus util)",
+        "",
+        peak_rss_mb,
+        thermal.as_str(),
+        effective_gb_s,
+        util_pct,
     );
 }
 
@@ -143,9 +160,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
     let warmup = !args.no_warmup;
 
+    let hw = kanso_infer::hardware::get_hardware_info();
+    let thermal = kanso_infer::hardware::get_thermal_state();
+
     println!("============================================================");
     println!(" kanso-infer multi-engine benchmark suite");
-    println!(" Backend: {}, Warmup: {}", args.backend, warmup);
+    println!(" Hardware : {} ({} cores, {:.1} GB RAM, Model: {})", hw.chip_name, hw.core_count, hw.total_ram_gb, hw.model_identifier);
+    println!(" Thermal  : {}", thermal.as_str());
+    println!(" Backend  : {}, Model Profile: {}, Warmup: {}", args.backend, args.model_type, warmup);
     println!("============================================================");
 
     if let Some(trace_path) = &args.trace_file {

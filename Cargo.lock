@@ -994,6 +994,7 @@ dependencies = [
  "clap",
  "futures-util",
  "http-body-util",
+ "libc",
  "metal",
  "parking_lot",
  "rand",
