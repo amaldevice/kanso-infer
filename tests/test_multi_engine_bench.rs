@@ -63,6 +63,7 @@ fn test_jsonl_trace_parsing() {
             prompt_len: 128,
             gen_len: 64,
             arrival_step: 0,
+            prompt_tokens: None,
         }
     );
     assert_eq!(
@@ -71,6 +72,7 @@ fn test_jsonl_trace_parsing() {
             prompt_len: 256,
             gen_len: 32,
             arrival_step: 5,
+            prompt_tokens: None,
         }
     );
     // Missing arrival_step must default to 0
@@ -80,6 +82,7 @@ fn test_jsonl_trace_parsing() {
             prompt_len: 64,
             gen_len: 16,
             arrival_step: 0,
+            prompt_tokens: None,
         }
     );
 }
@@ -147,11 +150,13 @@ fn test_trace_benchmark_execution() {
             prompt_len: 2,
             gen_len: 3,
             arrival_step: 0,
+            prompt_tokens: None,
         },
         TraceEntry {
             prompt_len: 2,
             gen_len: 2,
             arrival_step: 1,
+            prompt_tokens: None,
         },
     ];
 
