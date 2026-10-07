@@ -39,6 +39,21 @@ impl ModelConfig {
         2 * self.num_attention_layers() * self.num_key_value_heads * self.head_dim() * std::mem::size_of::<f32>()
     }
 
+    pub fn from_model_type(name: &str) -> Result<Self, crate::error::EngineError> {
+        match name.to_lowercase().as_str() {
+            "smollm2" | "smollm2-360m" | "smollm" => Ok(Self::smollm2_360m()),
+            "granite-dense" | "granite-4.0-dense" | "granite-350m" | "granite" => {
+                Ok(Self::granite_4_0_350m_dense())
+            }
+            "granite-h" | "granite-4.0-h" | "granite-hybrid" => Ok(Self::granite_4_0_h_350m()),
+            "lfm" | "lfm2.5" | "lfm-2.5" | "lfm2.5-350m" => Ok(Self::lfm_2_5_350m()),
+            other => Err(crate::error::EngineError::Config(format!(
+                "Unknown model type '{}'. Supported: smollm2, granite-dense, granite-h, lfm",
+                other
+            ))),
+        }
+    }
+
     pub fn smollm2_360m() -> Self {
         Self {
             hidden_size: 960,

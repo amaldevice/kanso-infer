@@ -13,3 +13,4 @@ pub mod bench;
 pub mod hybrid;
 pub mod quant;
 pub mod speculative;
+pub mod chat;

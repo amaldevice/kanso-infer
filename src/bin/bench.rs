@@ -44,6 +44,10 @@ pub struct Args {
     /// Path to model weights (optional; uses mock tiny model if not supplied)
     #[arg(long)]
     pub model: Option<String>,
+
+    /// Model profile type: "mock", "smollm2", "granite-dense", "granite-h", "lfm"
+    #[arg(long, default_value = "mock")]
+    pub model_type: String,
 }
 
 fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
@@ -67,12 +71,24 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
 }
 
 fn create_engine_for_workload(
+    model_type: &str,
     backend: &str,
     num_requests: usize,
     max_tokens_per_seq: usize,
     block_size: usize,
     max_running: usize,
 ) -> Result<Engine, EngineError> {
+    if model_type.to_lowercase() != "mock" {
+        return kanso_infer::bench::create_engine_for_model_profile(
+            model_type,
+            backend,
+            num_requests,
+            max_tokens_per_seq,
+            block_size,
+            max_running,
+        );
+    }
+
     // Sizing total blocks to fit all concurrent sequences without premature eviction
     let blocks_per_seq = (max_tokens_per_seq + block_size - 1) / block_size + 1;
     let total_blocks = (blocks_per_seq * num_requests.max(1)).max(128);
@@ -147,6 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .unwrap_or(args.prompt_len + args.gen_len);
 
         let mut engine = create_engine_for_workload(
+            &args.model_type,
             &args.backend,
             trace.len(),
             max_tokens,
@@ -173,6 +190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for &batch_size in &batch_sizes {
         let max_tokens = args.prompt_len + args.gen_len;
         let mut engine = create_engine_for_workload(
+            &args.model_type,
             &args.backend,
             batch_size,
             max_tokens,
