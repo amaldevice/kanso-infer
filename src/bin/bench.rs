@@ -91,6 +91,9 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
         effective_gb_s,
         util_pct,
     );
+    if let Some(spec) = &report.speculative {
+        println!("{}", spec.format_report());
+    }
 }
 
 fn create_engine_for_workload(

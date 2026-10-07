@@ -1,5 +1,7 @@
+pub mod profiler;
 pub mod verifier;
 
+pub use profiler::{SpeculativeProfiler, SpeculativeReport, SpeedupTime};
 pub use verifier::{SpeculativeVerifier, VerificationResult};
 
 use crate::engine::{Engine, StepOutput};
@@ -12,6 +14,7 @@ pub struct SpeculativeEngine {
     pub engine: Engine,
     pub draft_model: Option<Model>,
     pub gamma: usize,
+    pub profiler: SpeculativeProfiler,
 }
 
 impl SpeculativeEngine {
@@ -28,6 +31,7 @@ impl SpeculativeEngine {
             engine,
             draft_model,
             gamma,
+            profiler: SpeculativeProfiler::new(),
         }
     }
 
@@ -93,7 +97,15 @@ impl SpeculativeEngine {
                 draft_tokens.push(next_tok);
             }
 
+            let start = std::time::Instant::now();
             let verif = self.engine.speculative_step(req_id, &draft_tokens)?;
+            let duration = start.elapsed();
+            self.profiler.record_step(
+                draft_tokens.len(),
+                verif.num_accepted,
+                duration,
+                verif.num_rejected > 0,
+            );
             let seq_after = self
                 .engine
                 .sequences
