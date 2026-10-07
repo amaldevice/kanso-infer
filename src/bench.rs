@@ -44,7 +44,7 @@ pub fn parse_trace_file(path: &str) -> Result<Vec<TraceEntry>, EngineError> {
     Ok(entries)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkReport {
     pub total_tokens: usize,
     pub total_duration_secs: f64,
@@ -59,8 +59,27 @@ pub struct BenchmarkReport {
     pub prefill_tokens_per_sec: f64,
     pub decode_ms_per_step: f64,
     pub checksum: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<crate::speculative::profiler::SpeculativeReport>,
 }
 
+impl BenchmarkReport {
+    pub fn with_speculative(
+        mut self,
+        speculative: crate::speculative::profiler::SpeculativeReport,
+    ) -> Self {
+        self.speculative = Some(speculative);
+        self
+    }
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
 pub fn evaluate_run(
     total_tokens: usize,
     total_duration_secs: f64,
@@ -177,6 +196,7 @@ pub fn evaluate_run_with_timings(
         prefill_tokens_per_sec,
         decode_ms_per_step,
         checksum,
+        speculative: None,
     }
 }
 
