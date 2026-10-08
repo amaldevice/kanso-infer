@@ -331,19 +331,14 @@ impl Engine {
                     }
                 }
 
-                let mut last_logits = None;
-                for pos in start_pos..end_pos {
-                    let token = seq.prompt_tokens[pos];
-                    self.workspace.clear();
-                    let logits = self.model.forward_decode_step_with_workspace(
-                        token,
-                        pos,
-                        &seq.block_table,
-                        &mut self.kv_storage,
-                        Some(&mut self.workspace),
-                    )?;
-                    last_logits = Some(logits);
-                }
+                let chunk_tokens = &seq.prompt_tokens[start_pos..end_pos];
+                let logits = self.model.forward_prefill(
+                    chunk_tokens,
+                    start_pos,
+                    &seq.block_table,
+                    &mut self.kv_storage,
+                )?;
+                let last_logits = Some(logits);
 
                 seq.prefilled_tokens = end_pos;
                 seq.block_table.set_num_tokens(end_pos);
