@@ -5,6 +5,7 @@ use kanso_infer::bench::{
 use kanso_infer::engine::Engine;
 use kanso_infer::error::EngineError;
 use kanso_infer::model::Model;
+use kanso_infer::DEFAULT_BACKEND;
 
 #[derive(Parser, Debug)]
 #[command(name = "kanso-bench", about = "kanso-infer multi-engine benchmark suite")]
@@ -30,7 +31,7 @@ pub struct Args {
     pub gen_len: usize,
 
     /// Execution backend: "cpu", "metal", "neon", or "amx"
-    #[arg(long, default_value = "cpu")]
+    #[arg(long, default_value = DEFAULT_BACKEND)]
     pub backend: String,
 
     /// KV cache block size

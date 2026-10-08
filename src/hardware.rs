@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+/// Default execution backend for current platform:
+/// Defaults to "metal" on macOS (Apple Silicon GPU), and "cpu" on other operating systems.
+pub const DEFAULT_BACKEND: &str = if cfg!(target_os = "macos") { "metal" } else { "cpu" };
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareInfo {
     pub chip_name: String,

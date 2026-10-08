@@ -13,6 +13,22 @@ mod macos_tests {
     }
 
     #[test]
+    fn test_candle_metal_device_creation() {
+        let dev = candle_core::Device::new_metal(0).expect("Candle Metal device initialization should succeed on macOS");
+        let t = candle_core::Tensor::new(&[1.0f32, 2.0, 3.0], &dev).unwrap();
+        let sum = t.sum_all().unwrap().to_scalar::<f32>().unwrap();
+        assert_eq!(sum, 6.0);
+    }
+
+    #[test]
+    fn test_candle_metal_gguf_loading() {
+        let dev = candle_core::Device::new_metal(0).expect("Candle Metal device initialization should succeed on macOS");
+        if let Ok(model_path) = kanso_infer::weights::resolve_model_path("smollm2-360m-instruct-q8_0.gguf") {
+            let res = kanso_infer::model::Model::load_gguf(&model_path, dev);
+            assert!(res.is_ok(), "Model::load_gguf with Metal device failed: {:?}", res.err());
+        }
+    }
+    #[test]
     fn test_metal_buffer_shared_storage_mode() {
         let ctx = MetalContext::new().expect("MetalContext initialization failed");
         

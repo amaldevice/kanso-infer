@@ -18,3 +18,5 @@ pub mod tokenizer;
 pub mod hardware;
 pub mod accelerate;
 pub mod ane;
+
+pub use hardware::DEFAULT_BACKEND;
