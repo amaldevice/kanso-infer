@@ -22,9 +22,9 @@ enum Commands {
         #[arg(short, long)]
         prompt: Vec<String>,
 
-        /// Model profile architecture: smollm2, granite-dense, granite-h, lfm
-        #[arg(long, default_value = "smollm2")]
-        model_type: String,
+        /// Path to real GGUF model file (REQUIRED; shadow/mock models are disabled)
+        #[arg(short, long)]
+        model: String,
 
         /// Hardware backend: cpu, metal, neon, amx
         #[arg(long, default_value = "cpu")]
@@ -37,9 +37,9 @@ enum Commands {
 
     /// Start an interactive multi-turn terminal chat session (REPL)
     Chat {
-        /// Model profile architecture: smollm2, granite-dense, granite-h, lfm
-        #[arg(long, default_value = "smollm2")]
-        model_type: String,
+        /// Path to real GGUF model file (REQUIRED; shadow/mock models are disabled)
+        #[arg(short, long)]
+        model: String,
 
         /// Hardware backend: cpu, metal, neon, amx
         #[arg(long, default_value = "cpu")]
@@ -60,9 +60,9 @@ enum Commands {
         #[arg(short, long, default_value_t = 8000)]
         port: u16,
 
-        /// Model profile architecture: smollm2, granite-dense, granite-h, lfm
-        #[arg(long, default_value = "smollm2")]
-        model_type: String,
+        /// Path to real GGUF model file (REQUIRED; shadow/mock models are disabled)
+        #[arg(short, long)]
+        model: String,
 
         /// Hardware backend: cpu, metal, neon, amx
         #[arg(long, default_value = "cpu")]
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cli.command {
         Commands::Cli {
             prompt,
-            model_type,
+            model,
             backend,
             max_tokens,
         } => {
@@ -145,15 +145,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 return Ok(());
             }
 
-            println!("Loading model profile '{}' on backend '{}'...", model_type, backend);
-            let mut engine = create_engine_for_model_profile(
-                &model_type,
-                &backend,
-                prompt.len(),
-                128 + max_tokens,
-                16,
-                8,
-            )?;
+            let resolved_path = match kanso_infer::weights::resolve_model_path(&model) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            println!("Loading model from '{}' on backend '{}'...", resolved_path.display(), backend);
+            let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, candle_core::Device::Cpu)?;
+            model_instance.set_backend(&backend);
+            let total_blocks = ((128 + max_tokens + 15) / 16) * prompt.len().max(1);
+            let mut engine = kanso_infer::engine::Engine::new(model_instance, 8, total_blocks.max(32), 16);
 
             for p in &prompt {
                 // Mock tokenization for prompt
@@ -176,25 +179,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Chat {
-            model_type,
+            model,
             backend,
             system,
             max_tokens,
         } => {
             println!("============================================================");
-            println!(" kanso-infer interactive chat session (Model: {}, Backend: {})", model_type, backend);
+            println!(" kanso-infer interactive chat session (Model: {}, Backend: {})", model, backend);
             println!(" Type 'exit', 'quit' or Ctrl-D to quit. Type '/reset' to clear history.");
             println!("============================================================");
-
-            let engine = create_engine_for_model_profile(
-                &model_type,
-                &backend,
-                1,
-                256 + max_tokens,
-                16,
-                4,
-            )?;
-
+            let resolved_path = match kanso_infer::weights::resolve_model_path(&model) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            println!("Loading model from '{}' on backend '{}'...", resolved_path.display(), backend);
+            let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, candle_core::Device::Cpu)?;
+            model_instance.set_backend(&backend);
+            let total_blocks = ((256 + max_tokens + 15) / 16) * 4;
+            let engine = kanso_infer::engine::Engine::new(model_instance, 4, total_blocks.max(64), 16);
             let mut session = ChatSession::new(engine, Some(system));
             let stdin = io::stdin();
 
@@ -235,20 +240,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         Commands::Serve {
             port,
-            model_type,
+            model,
             backend,
         } => {
             println!("Starting OpenAI-compatible server on http://localhost:{}...", port);
-            println!("Model: {}, Backend: {}", model_type, backend);
+            println!("Model: {}, Backend: {}", model, backend);
 
-            let engine = create_engine_for_model_profile(
-                &model_type,
-                &backend,
-                16,
-                512,
-                16,
-                8,
-            )?;
+            let resolved_path = match kanso_infer::weights::resolve_model_path(&model) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            println!("Loading model from '{}' on backend '{}'...", resolved_path.display(), backend);
+            let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, candle_core::Device::Cpu)?;
+            model_instance.set_backend(&backend);
+            let engine = kanso_infer::engine::Engine::new(model_instance, 8, 128, 16);
 
             let shared_engine = Arc::new(Mutex::new(engine));
             let app = create_app(shared_engine);
