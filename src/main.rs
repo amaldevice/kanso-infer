@@ -256,9 +256,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let stdin = io::stdin();
 
             loop {
+                #[cfg(target_family = "unix")]
+                unsafe {
+                    libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+                }
+
                 print!("\nUser > ");
                 io::stdout().flush()?;
-
                 let mut line = String::new();
                 if stdin.read_line(&mut line)? == 0 {
                     println!("\nGoodbye!");

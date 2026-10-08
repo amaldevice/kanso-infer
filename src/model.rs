@@ -309,6 +309,96 @@ impl Model {
         Ok(logits.i(seq_len - 1)?.unsqueeze(0)?)
     }
 
+    /// Batched prefill pass over a prompt token chunk.
+    /// Computes full-chunk embeddings and linear projections in a single GEMM pass,
+    /// stores Key and Value tokens into physical blocks in `kv_storage`,
+    /// and returns logits for the final token in O(1) step time.
+    pub fn forward_prefill(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        block_table: &BlockTable,
+        kv_storage: &mut KvStorage,
+    ) -> Result<Tensor, EngineError> {
+        let chunk_len = tokens.len();
+        if chunk_len == 0 {
+            return Err(EngineError::Model("Empty prefill chunk tokens".to_string()));
+        }
+
+        let token_ids = Tensor::from_slice(tokens, (chunk_len,), &self.device)?;
+        let mut hidden = self.weights.embed_tokens.index_select(&token_ids, 0)?;
+
+        let head_dim = self.config.head_dim();
+        let num_q_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let block_size = kv_storage.block_size;
+
+        let positions: Vec<usize> = (start_pos..start_pos + chunk_len).collect();
+        let (cos, sin) = self.rope_cos_sin(&positions)?;
+        let cos = cos.reshape((chunk_len, 1, head_dim / 2))?;
+        let sin = sin.reshape((chunk_len, 1, head_dim / 2))?;
+
+        let causal_mask = if chunk_len > 1 {
+            let mut mask_data = vec![0.0f32; chunk_len * chunk_len];
+            for i in 0..chunk_len {
+                for j in 0..chunk_len {
+                    if j > i {
+                        mask_data[i * chunk_len + j] = -1e9f32;
+                    }
+                }
+            }
+            Some(Tensor::from_vec(mask_data, (1, 1, chunk_len, chunk_len), &self.device)?)
+        } else {
+            None
+        };
+
+        for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
+
+            let q = self.matmul(&normed, &layer.attn_q.t()?)?;
+            let k = self.matmul(&normed, &layer.attn_k.t()?)?;
+            let v = self.matmul(&normed, &layer.attn_v.t()?)?;
+
+            let q = q.reshape((chunk_len, num_q_heads, head_dim))?;
+            let k = k.reshape((chunk_len, num_kv_heads, head_dim))?;
+            let v = v.reshape((chunk_len, num_kv_heads, head_dim))?;
+
+            let q = self.rope_apply(&q, &cos, &sin)?.transpose(0, 1)?;
+            let k = self.rope_apply(&k, &cos, &sin)?;
+
+            // Write chunk tokens into physical blocks
+            for i in 0..chunk_len {
+                let pos = start_pos + i;
+                let b_idx = pos / block_size;
+                let offset = pos % block_size;
+                if b_idx < block_table.blocks().len() {
+                    let physical_block = block_table.blocks()[b_idx];
+                    let k_i = k.i(i)?.reshape((num_kv_heads, head_dim))?;
+                    let v_i = v.i(i)?.reshape((num_kv_heads, head_dim))?;
+                    kv_storage.write_kv_token(layer_idx, physical_block, offset, &k_i, &v_i)?;
+                }
+            }
+
+            let k_attn = k.transpose(0, 1)?;
+            let v_attn = v.transpose(0, 1)?;
+
+            let attn_out = self.gqa_attention(&q, &k_attn, &v_attn, causal_mask.as_ref())?;
+            let attn_out = attn_out.transpose(0, 1)?.reshape((chunk_len, num_q_heads * head_dim))?;
+            let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
+
+            hidden = (hidden + attn_proj)?;
+
+            let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
+            let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
+            hidden = (hidden + ffn_out)?;
+        }
+
+        let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
+        let last_hidden = final_normed.i(chunk_len - 1)?.unsqueeze(0)?;
+        let logits = self.matmul(&last_hidden, &self.weights.lm_head.t()?)?;
+        Ok(logits)
+    }
+
     pub fn forward_decode_step(
         &self,
         token: u32,
