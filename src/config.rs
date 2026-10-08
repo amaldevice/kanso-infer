@@ -20,6 +20,7 @@ pub struct ModelConfig {
     pub max_seq_len: usize,
     pub architecture: ModelArchitecture,
     pub attention_layers: Option<Vec<usize>>,
+    pub rope_theta: f32,
 }
 
 impl ModelConfig {
@@ -67,6 +68,7 @@ impl ModelConfig {
             max_seq_len: 2048,
             architecture: ModelArchitecture::DenseLlama,
             attention_layers: None,
+            rope_theta: 10000.0,
         }
     }
 
@@ -83,6 +85,7 @@ impl ModelConfig {
             max_seq_len: 8192,
             architecture: ModelArchitecture::DenseLlama,
             attention_layers: None,
+            rope_theta: 10000.0,
         }
     }
 
@@ -99,6 +102,7 @@ impl ModelConfig {
             max_seq_len: 32768,
             architecture: ModelArchitecture::HybridMamba2,
             attention_layers: Some(vec![7, 15, 23, 31]), // 4 attention layers mixed with 28 Mamba-2 layers
+            rope_theta: 10000.0,
         }
     }
 
@@ -115,6 +119,7 @@ impl ModelConfig {
             max_seq_len: 32768,
             architecture: ModelArchitecture::HybridLfm,
             attention_layers: Some(vec![2, 5, 8, 11, 14, 15]), // 6 attention layers interleaved with 10 LIV conv
+            rope_theta: 10000.0,
         }
     }
 }

@@ -7,14 +7,24 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
 }
+use crate::tokenizer::{StreamDecoder, TokenizerWrapper};
 
 pub struct ChatSession {
     pub engine: Engine,
     pub history: Vec<ChatMessage>,
+    pub tokenizer: Option<TokenizerWrapper>,
 }
 
 impl ChatSession {
     pub fn new(engine: Engine, system_prompt: Option<String>) -> Self {
+        Self::new_with_tokenizer(engine, system_prompt, None)
+    }
+
+    pub fn new_with_tokenizer(
+        engine: Engine,
+        system_prompt: Option<String>,
+        tokenizer: Option<TokenizerWrapper>,
+    ) -> Self {
         let mut history = Vec::new();
         if let Some(sys) = system_prompt {
             history.push(ChatMessage {
@@ -22,7 +32,11 @@ impl ChatSession {
                 content: sys,
             });
         }
-        Self { engine, history }
+        Self {
+            engine,
+            history,
+            tokenizer,
+        }
     }
 
     pub fn history(&self) -> &[ChatMessage] {
@@ -44,23 +58,35 @@ impl ChatSession {
         }
         prompt_text.push_str("<|im_start|>assistant\n");
 
-        // Mock tokenization based on character bytes modulo vocab range
-        let tokens: Vec<u32> = prompt_text
-            .as_bytes()
-            .iter()
-            .map(|&b| (b % 40) as u32)
-            .collect();
+        let tokens: Vec<u32> = if let Some(tok) = &self.tokenizer {
+            tok.encode(&prompt_text).unwrap_or_else(|_| {
+                prompt_text.as_bytes().iter().map(|&b| (b % 40) as u32).collect()
+            })
+        } else {
+            prompt_text.as_bytes().iter().map(|&b| (b % 40) as u32).collect()
+        };
 
         (prompt_text, tokens)
     }
 
-    /// Executes step generation for the current conversation state and appends assistant reply
-    pub fn step_reply(&mut self, max_tokens: usize) -> Result<String, EngineError> {
+    /// Executes streaming step generation for the current conversation state,
+    /// invoking `on_token(&delta)` for each newly generated text chunk in real time.
+    pub fn stream_step_reply<F>(
+        &mut self,
+        max_tokens: usize,
+        mut on_token: F,
+    ) -> Result<String, EngineError>
+    where
+        F: FnMut(&str),
+    {
         let (_, tokens) = self.format_prompt();
         let request_id = self.engine.add_request(tokens, max_tokens);
 
         let mut generated_tokens = Vec::new();
         let mut done = false;
+        let mut accumulated_reply = String::new();
+        let mut decoder = StreamDecoder::new();
+        let eos_id = self.tokenizer.as_ref().map(|t| t.eos_token_id).unwrap_or(2);
 
         while !done && self.engine.has_unfinished_requests() {
             let outputs = self.engine.step()?;
@@ -72,20 +98,59 @@ impl ChatSession {
             for out in outputs {
                 if out.request_id == request_id {
                     generated_tokens.push(out.token_id);
-                    if out.is_finished {
+
+                    // Incremental decoding delta
+                    if let Some(tok) = &self.tokenizer {
+                        let delta = decoder.push(tok, out.token_id)?;
+                        if !delta.is_empty() {
+                            let clean_delta = delta.replace("<|im_end|>", "");
+                            if !clean_delta.is_empty() {
+                                on_token(&clean_delta);
+                            }
+                            accumulated_reply.push_str(&delta);
+                        }
+                    } else {
+                        let delta = format!("tok_{} ", out.token_id);
+                        on_token(&delta);
+                        accumulated_reply.push_str(&delta);
+                    }
+
+                    if out.token_id == eos_id
+                        || accumulated_reply.contains("<|im_end|>")
+                        || out.is_finished
+                    {
                         done = true;
                     }
                 }
             }
         }
 
-        let reply_text = format!("Response generated with {} tokens", generated_tokens.len());
+        if let Some(tok) = &self.tokenizer {
+            let remaining = decoder.flush(tok)?;
+            if !remaining.is_empty() {
+                let clean_rem = remaining.replace("<|im_end|>", "");
+                if !clean_rem.is_empty() {
+                    on_token(&clean_rem);
+                }
+                accumulated_reply.push_str(&remaining);
+            }
+        }
+
+        let cleaned_reply = accumulated_reply
+            .trim_end_matches("<|im_end|>")
+            .trim()
+            .to_string();
+
         self.history.push(ChatMessage {
             role: "assistant".to_string(),
-            content: reply_text.clone(),
+            content: cleaned_reply.clone(),
         });
 
-        Ok(reply_text)
+        Ok(cleaned_reply)
+    }
+
+    pub fn step_reply(&mut self, max_tokens: usize) -> Result<String, EngineError> {
+        self.stream_step_reply(max_tokens, |_| {})
     }
 
     pub fn reset(&mut self) {

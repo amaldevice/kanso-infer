@@ -33,6 +33,10 @@ enum Commands {
         /// Maximum tokens to generate
         #[arg(long, default_value_t = 32)]
         max_tokens: usize,
+
+        /// Path to tokenizer.json (optional, auto-resolved from working directory or HF cache)
+        #[arg(long)]
+        tokenizer: Option<String>,
     },
 
     /// Start an interactive multi-turn terminal chat session (REPL)
@@ -52,6 +56,10 @@ enum Commands {
         /// Maximum tokens per response
         #[arg(long, default_value_t = 64)]
         max_tokens: usize,
+
+        /// Path to tokenizer.json (optional, auto-resolved from working directory or HF cache)
+        #[arg(long)]
+        tokenizer: Option<String>,
     },
 
     /// Launch the OpenAI-compatible HTTP server
@@ -67,8 +75,11 @@ enum Commands {
         /// Hardware backend: cpu, metal, neon, amx
         #[arg(long, default_value = "cpu")]
         backend: String,
-    },
 
+        /// Path to tokenizer.json (optional, auto-resolved from working directory or HF cache)
+        #[arg(long)]
+        tokenizer: Option<String>,
+    },
     /// Run performance benchmarks and quality evaluations
     Bench {
         /// Comma-separated list of batch sizes to sweep
@@ -139,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             model,
             backend,
             max_tokens,
+            tokenizer,
         } => {
             if prompt.is_empty() {
                 eprintln!("Error: Please provide at least one prompt with --prompt \"...\"");
@@ -158,23 +170,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let total_blocks = ((128 + max_tokens + 15) / 16) * prompt.len().max(1);
             let mut engine = kanso_infer::engine::Engine::new(model_instance, 8, total_blocks.max(32), 16);
 
+            let tok_wrapper = kanso_infer::tokenizer::TokenizerWrapper::resolve(
+                tokenizer.as_deref(),
+                Some(&resolved_path),
+            ).ok();
+
             for p in &prompt {
-                // Mock tokenization for prompt
-                let tokens: Vec<u32> = p.as_bytes().iter().map(|&b| (b % 40) as u32).collect();
+                let tokens = if let Some(tok) = &tok_wrapper {
+                    tok.encode(p).unwrap_or_else(|_| p.as_bytes().iter().map(|&b| (b % 40) as u32).collect())
+                } else {
+                    p.as_bytes().iter().map(|&b| (b % 40) as u32).collect()
+                };
                 let req_id = engine.add_request(tokens, max_tokens);
 
-                let mut gen_tokens = Vec::new();
-                while engine.has_unfinished_requests() {
+                println!("\nPrompt: \"{}\"", p);
+                print!("Assistant > ");
+                io::stdout().flush()?;
+
+                let mut decoder = kanso_infer::tokenizer::StreamDecoder::new();
+                let eos_id = tok_wrapper.as_ref().map(|t| t.eos_token_id).unwrap_or(2);
+                let mut done = false;
+
+                while !done && engine.has_unfinished_requests() {
                     let outputs = engine.step()?;
                     for out in outputs {
                         if out.request_id == req_id {
-                            gen_tokens.push(out.token_id);
+                            if let Some(tok) = &tok_wrapper {
+                                let delta = decoder.push(tok, out.token_id)?;
+                                let clean = delta.replace("<|im_end|>", "");
+                                print!("{}", clean);
+                                io::stdout().flush()?;
+                                if delta.contains("<|im_end|>") {
+                                    done = true;
+                                }
+                            } else {
+                                print!("tok_{} ", out.token_id);
+                                io::stdout().flush()?;
+                            }
+
+                            if out.token_id == eos_id || out.is_finished {
+                                done = true;
+                            }
                         }
                     }
                 }
 
-                println!("\nPrompt: \"{}\"", p);
-                println!("Output: Generated {} tokens successfully", gen_tokens.len());
+                if let Some(tok) = &tok_wrapper {
+                    let rem = decoder.flush(tok)?;
+                    let clean = rem.replace("<|im_end|>", "");
+                    print!("{}", clean);
+                    io::stdout().flush()?;
+                }
+                println!();
             }
         }
 
@@ -183,6 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             backend,
             system,
             max_tokens,
+            tokenizer,
         } => {
             println!("============================================================");
             println!(" kanso-infer interactive chat session (Model: {}, Backend: {})", model, backend);
@@ -200,7 +248,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             model_instance.set_backend(&backend);
             let total_blocks = ((256 + max_tokens + 15) / 16) * 4;
             let engine = kanso_infer::engine::Engine::new(model_instance, 4, total_blocks.max(64), 16);
-            let mut session = ChatSession::new(engine, Some(system));
+            let tok_wrapper = kanso_infer::tokenizer::TokenizerWrapper::resolve(
+                tokenizer.as_deref(),
+                Some(&resolved_path),
+            ).ok();
+            let mut session = ChatSession::new_with_tokenizer(engine, Some(system), tok_wrapper);
             let stdin = io::stdin();
 
             loop {
@@ -231,9 +283,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 print!("Assistant > ");
                 io::stdout().flush()?;
 
-                match session.step_reply(max_tokens) {
-                    Ok(reply) => println!("{}", reply),
-                    Err(e) => eprintln!("Error generating reply: {}", e),
+                match session.stream_step_reply(max_tokens, |delta| {
+                    print!("{}", delta);
+                    let _ = io::stdout().flush();
+                }) {
+                    Ok(_) => println!(),
+                    Err(e) => eprintln!("\nError generating reply: {}", e),
                 }
             }
         }
@@ -242,10 +297,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             port,
             model,
             backend,
+            tokenizer: _,
         } => {
             println!("Starting OpenAI-compatible server on http://localhost:{}...", port);
             println!("Model: {}, Backend: {}", model, backend);
-
             let resolved_path = match kanso_infer::weights::resolve_model_path(&model) {
                 Ok(p) => p,
                 Err(e) => {

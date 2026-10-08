@@ -14,6 +14,7 @@ pub mod hybrid;
 pub mod quant;
 pub mod speculative;
 pub mod chat;
+pub mod tokenizer;
 pub mod hardware;
 pub mod accelerate;
 pub mod ane;
