@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use kanso_infer::bench::create_engine_for_model_profile;
 use kanso_infer::chat::ChatSession;
 use kanso_infer::server::create_app;
-
+use kanso_infer::DEFAULT_BACKEND;
 #[derive(Parser, Debug)]
 #[command(name = "kanso", about = "kanso-infer: A minimalist, high-performance LLM inference engine")]
 struct Cli {
@@ -27,7 +27,7 @@ enum Commands {
         model: String,
 
         /// Hardware backend: cpu, metal, neon, amx
-        #[arg(long, default_value = "cpu")]
+        #[arg(long, default_value = DEFAULT_BACKEND)]
         backend: String,
 
         /// Maximum tokens to generate
@@ -46,7 +46,7 @@ enum Commands {
         model: String,
 
         /// Hardware backend: cpu, metal, neon, amx
-        #[arg(long, default_value = "cpu")]
+        #[arg(long, default_value = DEFAULT_BACKEND)]
         backend: String,
 
         /// Optional custom system prompt
@@ -73,7 +73,7 @@ enum Commands {
         model: String,
 
         /// Hardware backend: cpu, metal, neon, amx
-        #[arg(long, default_value = "cpu")]
+        #[arg(long, default_value = DEFAULT_BACKEND)]
         backend: String,
 
         /// Path to tokenizer.json (optional, auto-resolved from working directory or HF cache)
@@ -103,7 +103,7 @@ enum Commands {
         gen_len: usize,
 
         /// Hardware backend: cpu, metal, neon, amx
-        #[arg(long, default_value = "cpu")]
+        #[arg(long, default_value = DEFAULT_BACKEND)]
         backend: String,
 
         /// KV cache block size

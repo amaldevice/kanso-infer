@@ -18,7 +18,7 @@ impl Model {
             weights,
             config,
             device,
-            backend: "cpu".to_string(),
+            backend: crate::hardware::DEFAULT_BACKEND.to_string(),
             hybrid_pipeline: None,
         }
     }
