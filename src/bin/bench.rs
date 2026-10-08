@@ -45,14 +45,9 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub no_warmup: bool,
 
-    /// Path to model weights (optional; uses mock tiny model if not supplied)
-    #[arg(long)]
+    /// Path to real GGUF model file (REQUIRED; shadow/mock models are disabled)
+    #[arg(short, long)]
     pub model: Option<String>,
-
-    /// Model profile type: "mock", "smollm2", "granite-dense", "granite-h", "lfm"
-    #[arg(long, default_value = "mock")]
-    pub model_type: String,
-
     /// Run perplexity evaluation on specified dataset (e.g. "wikitext2")
     #[arg(long)]
     pub eval_ppl: Option<String>,
@@ -112,112 +107,59 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
 }
 
 fn create_engine_for_workload(
-    model_type: &str,
+    model_path: &std::path::Path,
     backend: &str,
     num_requests: usize,
     max_tokens_per_seq: usize,
     block_size: usize,
     max_running: usize,
 ) -> Result<Engine, EngineError> {
-    if model_type.to_lowercase() != "mock" {
-        return kanso_infer::bench::create_engine_for_model_profile(
-            model_type,
-            backend,
-            num_requests,
-            max_tokens_per_seq,
-            block_size,
-            max_running,
-        );
-    }
+    let device = candle_core::Device::Cpu;
+    let mut model = Model::load_gguf(model_path, device)?;
+    model.set_backend(backend);
 
-    // Sizing total blocks to fit all concurrent sequences without premature eviction
     let blocks_per_seq = (max_tokens_per_seq + block_size - 1) / block_size + 1;
     let total_blocks = (blocks_per_seq * num_requests.max(1)).max(128);
 
-    // Initialize model backend
-    match backend.to_lowercase().as_str() {
-        "cpu" => {
-            let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
-            model.set_backend("cpu");
-            Ok(Engine::new(model, max_running, total_blocks, block_size))
-        }
-        "neon" => {
-            #[cfg(target_arch = "aarch64")]
-            {
-                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
-                model.set_backend("neon");
-                Ok(Engine::new(model, max_running, total_blocks, block_size))
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                eprintln!("Warning: NEON backend requested on non-aarch64 architecture, falling back to CPU reference.");
-                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
-                model.set_backend("cpu");
-                Ok(Engine::new(model, max_running, total_blocks, block_size))
-            }
-        }
-        "metal" => {
-            #[cfg(target_os = "macos")]
-            {
-                // Verify Metal context availability
-                if let Ok(_ctx) = kanso_infer::metal::context::MetalContext::new() {
-                    let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
-                    model.set_backend("metal");
-                    Ok(Engine::new(model, max_running, total_blocks, block_size))
-                } else {
-                    eprintln!("Warning: Metal unavailable, falling back to CPU reference.");
-                    let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
-                    model.set_backend("cpu");
-                    Ok(Engine::new(model, max_running, total_blocks, block_size))
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                eprintln!("Warning: Metal backend only supported on macOS, falling back to CPU reference.");
-                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
-                model.set_backend("cpu");
-                Ok(Engine::new(model, max_running, total_blocks, block_size))
-            }
-        }
-        "amx" => {
-            #[cfg(target_os = "macos")]
-            {
-                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
-                model.set_backend("amx");
-                Ok(Engine::new(model, max_running, total_blocks, block_size))
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                eprintln!("Warning: AMX backend only supported on macOS, falling back to CPU reference.");
-                let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256)?;
-                model.set_backend("cpu");
-                Ok(Engine::new(model, max_running, total_blocks, block_size))
-            }
-        }
-        other => Err(EngineError::Config(format!(
-            "Unsupported backend '{}'. Valid options: cpu, metal, neon, amx",
-            other
-        ))),
-    }
+    Ok(Engine::new(model, max_running, total_blocks, block_size))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
     let warmup = !args.no_warmup;
 
+    let model_path = match &args.model {
+        Some(m) => match kanso_infer::weights::resolve_model_path(m) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        },
+        None => {
+            eprintln!(
+                "Error: --model <path> is required. Shadow/mock model execution has been removed.\n\
+                 Please provide a path to a real GGUF model file, for example:\n  \
+                 bench --model ./models/smollm2-360m.gguf\n\
+                 Or download one using:\n  \
+                 huggingface-cli download HuggingFaceTB/SmolLM2-360M-Instruct-GGUF smollm2-360m-instruct-q8_0.gguf"
+            );
+            std::process::exit(1);
+        }
+    };
     let hw = kanso_infer::hardware::get_hardware_info();
     let thermal = kanso_infer::hardware::get_thermal_state();
 
     println!("============================================================");
     println!(" kanso-infer multi-engine benchmark suite");
+    println!(" Model    : {}", model_path.display());
     println!(" Hardware : {} ({} cores, {:.1} GB RAM, Model: {})", hw.chip_name, hw.core_count, hw.total_ram_gb, hw.model_identifier);
     println!(" Thermal  : {}", thermal.as_str());
-    println!(" Backend  : {}, Model Profile: {}, Warmup: {}", args.backend, args.model_type, warmup);
+    println!(" Backend  : {}, Warmup: {}", args.backend, warmup);
     println!("============================================================");
-
     if let Some(dataset) = &args.eval_ppl {
         println!("Evaluating perplexity on dataset: {}", dataset);
-        let report = kanso_infer::bench::run_wikitext2_perplexity_eval(&args.model_type, args.ppl_stride)?;
+        let report = kanso_infer::bench::run_wikitext2_perplexity_eval(model_path.to_str().unwrap_or("model"), args.ppl_stride)?;
         let ascii_table = kanso_infer::bench::format_ascii_ppl_report(&report);
         println!("{}", ascii_table);
 
@@ -250,7 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .unwrap_or(args.prompt_len + args.gen_len);
 
         let mut engine = create_engine_for_workload(
-            &args.model_type,
+            &model_path,
             &args.backend,
             trace.len(),
             max_tokens,
@@ -283,7 +225,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for &batch_size in &batch_sizes {
         let max_tokens = args.prompt_len + args.gen_len;
         let mut engine = create_engine_for_workload(
-            &args.model_type,
+            &model_path,
             &args.backend,
             batch_size,
             max_tokens,

@@ -23,6 +23,15 @@ impl Model {
         }
     }
 
+    /// Loads a model directly from a real GGUF file.
+    /// Fails fast if the file does not exist. Shadow/mock models are disabled.
+    pub fn load_gguf<P: AsRef<std::path::Path>>(path: P, device: Device) -> Result<Self, EngineError> {
+        let path_ref = path.as_ref();
+        let resolved = crate::weights::resolve_model_path(path_ref.to_str().unwrap_or(""))?;
+        let (weights, config) = ModelWeights::load_from_gguf(&resolved, &device)?;
+        Ok(Self::new(weights, config, device))
+    }
+
     pub fn backend(&self) -> &str {
         &self.backend
     }
