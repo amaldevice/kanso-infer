@@ -154,7 +154,9 @@ impl ModelWeights {
         let rms_norm_eps = metadata(&format!("{}.attention.layer_norm_rms_epsilon", prefix))
             .map(|v| v.to_f32().unwrap_or(1e-5) as f64)
             .unwrap_or(1e-5);
-
+        let rope_theta = metadata(&format!("{}.rope.freq_base", prefix))
+            .and_then(|v| v.to_f32().map_err(|e| EngineError::Config(e.to_string())))
+            .unwrap_or(10000.0);
         let token_embd = load_tensor("token_embd.weight")?;
         let vocab_size = token_embd.dim(0)?;
 
@@ -208,8 +210,8 @@ impl ModelWeights {
             max_seq_len: 2048,
             architecture: ModelArchitecture::DenseLlama,
             attention_layers: None,
+            rope_theta,
         };
-
         let weights = Self {
             embed_tokens: token_embd,
             layers,

@@ -120,6 +120,7 @@ impl Model {
             max_seq_len: 128,
             architecture: ModelArchitecture::DenseLlama,
             attention_layers: None,
+            rope_theta: 10000.0,
         };
 
         Ok(Self::new(weights, config, dev))
@@ -173,6 +174,63 @@ impl Model {
         Ok(normalized.broadcast_mul(weight)?)
     }
 
+    pub fn rope_cos_sin(&self, positions: &[usize]) -> Result<(Tensor, Tensor), EngineError> {
+        let head_dim = self.config.head_dim();
+        let half = head_dim / 2;
+        let theta: Vec<f32> = (0..half)
+            .map(|j| self.config.rope_theta.powf(-2.0 * j as f32 / head_dim as f32))
+            .collect();
+        let theta = Tensor::from_vec(theta, (1, half), &self.device)?;
+
+        let positions_f: Vec<f32> = positions.iter().map(|&p| p as f32).collect();
+        let positions = Tensor::from_vec(positions_f, (positions.len(), 1), &self.device)?;
+
+        let angles = positions.matmul(&theta)?;
+        Ok((angles.cos()?, angles.sin()?))
+    }
+
+    pub fn rope_apply(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor, EngineError> {
+        let half = x.dim(candle_core::D::Minus1)? / 2;
+        let first = x.narrow(candle_core::D::Minus1, 0, half)?;
+        let second = x.narrow(candle_core::D::Minus1, half, half)?;
+
+        let first_rot = (first.broadcast_mul(cos)? - second.broadcast_mul(sin)?)?;
+        let second_rot = (first.broadcast_mul(sin)? + second.broadcast_mul(cos)?)?;
+
+        Ok(Tensor::cat(&[&first_rot, &second_rot], candle_core::D::Minus1)?)
+    }
+
+    pub fn gqa_attention(
+        &self,
+        q: &Tensor,            // [n_heads, q_len, head_dim]
+        k: &Tensor,            // [n_kv_heads, ctx_len, head_dim]
+        v: &Tensor,            // [n_kv_heads, ctx_len, head_dim]
+        mask: Option<&Tensor>, // optional [q_len, ctx_len]
+    ) -> Result<Tensor, EngineError> {
+        let (n_heads, q_len, head_dim) = q.dims3()?;
+        let (n_kv_heads, ctx_len, _) = k.dims3()?;
+        let group_size = n_heads / n_kv_heads;
+
+        // Fold Q heads into groups: [n_kv_heads, group_size * q_len, head_dim]
+        let q_folded = q.contiguous()?.reshape((n_kv_heads, group_size * q_len, head_dim))?;
+
+        // Attention scores: [n_kv_heads, group_size * q_len, ctx_len]
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let mut scores = (self.matmul(&q_folded, &k.t()?)? * scale)?;
+
+        if let Some(m) = mask {
+            let scores_unfolded = scores.reshape((n_kv_heads, group_size, q_len, ctx_len))?;
+            let masked = scores_unfolded.broadcast_add(m)?;
+            scores = masked.reshape((n_kv_heads, group_size * q_len, ctx_len))?;
+        }
+
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let attn_out = self.matmul(&probs, v)?; // [n_kv_heads, group_size * q_len, head_dim]
+
+        // Reshape back to [n_heads, q_len, head_dim]
+        Ok(attn_out.reshape((n_heads, q_len, head_dim))?)
+    }
+
     pub fn forward_tokens(&self, tokens: &[u32]) -> Result<Tensor, EngineError> {
         let seq_len = tokens.len();
         if seq_len == 0 {
@@ -186,6 +244,10 @@ impl Model {
         let head_dim = self.config.head_dim();
         let num_q_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
+        let positions: Vec<usize> = (0..seq_len).collect();
+        let (cos, sin) = self.rope_cos_sin(&positions)?;
+        let cos = cos.reshape((seq_len, 1, head_dim / 2))?;
+        let sin = sin.reshape((seq_len, 1, head_dim / 2))?;
 
         let causal_mask = if seq_len > 1 {
             let mut mask_data = vec![0.0f32; seq_len * seq_len];
@@ -196,7 +258,7 @@ impl Model {
                     }
                 }
             }
-            Some(Tensor::from_vec(mask_data, (1, seq_len, seq_len), &self.device)?)
+            Some(Tensor::from_vec(mask_data, (1, 1, seq_len, seq_len), &self.device)?)
         } else {
             None
         };
@@ -210,30 +272,14 @@ impl Model {
             let k = self.matmul(&normed, &layer.attn_k.t()?)?;
             let v = self.matmul(&normed, &layer.attn_v.t()?)?;
 
-            // Reshape for multi-head: [seq_len, num_heads, head_dim] -> [num_heads, seq_len, head_dim]
-            let q = q.reshape((seq_len, num_q_heads, head_dim))?.transpose(0, 1)?;
-            let k = k.reshape((seq_len, num_kv_heads, head_dim))?.transpose(0, 1)?;
-            let v = v.reshape((seq_len, num_kv_heads, head_dim))?.transpose(0, 1)?;
+            let q = q.reshape((seq_len, num_q_heads, head_dim))?;
+            let k = k.reshape((seq_len, num_kv_heads, head_dim))?;
+            let v = v.reshape((seq_len, num_kv_heads, head_dim))?;
 
-            // Repeat KV heads if GQA (Grouped-Query Attention)
-            let (k, v) = if num_q_heads > num_kv_heads {
-                let factor = num_q_heads / num_kv_heads;
-                let k_rep = k.repeat((factor, 1, 1))?;
-                let v_rep = v.repeat((factor, 1, 1))?;
-                (k_rep, v_rep)
-            } else {
-                (k, v)
-            };
-
-            // Scaled dot-product attention
-            let scale = 1.0 / (head_dim as f64).sqrt();
-            let mut scores = (self.matmul(&q, &k.t()?)? * scale)?;
-            if let Some(mask) = &causal_mask {
-                scores = scores.broadcast_add(mask)?;
-            }
-            let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
-            let attn_out = self.matmul(&attn_weights, &v)?;
-
+            let q = self.rope_apply(&q, &cos, &sin)?.transpose(0, 1)?;
+            let k = self.rope_apply(&k, &cos, &sin)?.transpose(0, 1)?;
+            let v = v.transpose(0, 1)?;
+            let attn_out = self.gqa_attention(&q, &k, &v, causal_mask.as_ref())?;
             // Merge heads back: [num_q_heads, seq_len, head_dim] -> [seq_len, hidden_size]
             let attn_out = attn_out.transpose(0, 1)?.reshape((seq_len, num_q_heads * head_dim))?;
             let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
@@ -303,6 +349,10 @@ impl Model {
         }
         let physical_block = block_table.blocks()[block_idx];
 
+        let (cos, sin) = self.rope_cos_sin(&[pos])?;
+        let cos = cos.reshape((1, 1, head_dim / 2))?;
+        let sin = sin.reshape((1, 1, head_dim / 2))?;
+
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             // Attention Norm
             let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
@@ -312,14 +362,17 @@ impl Model {
             let k = self.matmul(&normed, &layer.attn_k.t()?)?;
             let v = self.matmul(&normed, &layer.attn_v.t()?)?;
 
-            // Reshape Q: [num_q_heads, 1, head_dim]
-            let q = q.reshape((1, num_q_heads, head_dim))?.transpose(0, 1)?;
+            let q = q.reshape((1, num_q_heads, head_dim))?;
+            let k = k.reshape((1, num_kv_heads, head_dim))?;
+            let v = v.reshape((1, num_kv_heads, head_dim))?;
 
-            // Reshape K, V to store: [num_kv_heads, head_dim]
+            let q = self.rope_apply(&q, &cos, &sin)?.transpose(0, 1)?;
+            let k = self.rope_apply(&k, &cos, &sin)?;
+
             let k_token = k.reshape((num_kv_heads, head_dim))?;
             let v_token = v.reshape((num_kv_heads, head_dim))?;
 
-            // Write token K, V directly into physical block in KvStorage
+            // Write roped token K, V directly into physical block in KvStorage
             kv_storage.write_kv_token(layer_idx, physical_block, offset, &k_token, &v_token)?;
 
             // Gather context directly from physical memory blocks mapped in block table
@@ -333,20 +386,7 @@ impl Model {
             let k_all = k_all.transpose(0, 1)?;
             let v_all = v_all.transpose(0, 1)?;
 
-            // Repeat KV heads if GQA
-            let (k_all, v_all) = if num_q_heads > num_kv_heads {
-                let factor = num_q_heads / num_kv_heads;
-                (k_all.repeat((factor, 1, 1))?, v_all.repeat((factor, 1, 1))?)
-            } else {
-                (k_all, v_all)
-            };
-
-            // Scaled dot-product attention against historical context
-            let scale = 1.0 / (head_dim as f64).sqrt();
-            let scores = (self.matmul(&q, &k_all.t()?)? * scale)?;
-            let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
-            let attn_out = self.matmul(&attn_weights, &v_all)?;
-
+            let attn_out = self.gqa_attention(&q, &k_all, &v_all, None)?;
             // Merge heads back: [1, hidden_size]
             let attn_out = attn_out.transpose(0, 1)?.reshape((1, num_q_heads * head_dim))?;
             let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
