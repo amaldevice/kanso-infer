@@ -219,7 +219,9 @@ impl Engine {
 
                 let current_blocks = seq.block_table.blocks().len();
                 let needed_blocks = seq.block_table.required_blocks(self.block_size);
-                if needed_blocks > current_blocks && let Some(blk) = self.block_pool.allocate() {
+                if needed_blocks > current_blocks
+                    && let Some(blk) = self.block_pool.allocate()
+                {
                     // #44: block is about to be overwritten — drop stale prefix entries.
                     self.prefix_cache.invalidate_block(blk);
                     seq.block_table.push_block(blk);
@@ -352,7 +354,8 @@ impl Engine {
 
                     let current_blocks = seq.block_table.blocks().len();
                     let needed_blocks = seq.block_table.required_blocks(self.block_size);
-                    if needed_blocks > current_blocks && let Some(blk) = self.block_pool.allocate()
+                    if needed_blocks > current_blocks
+                        && let Some(blk) = self.block_pool.allocate()
                     {
                         // #44: block is about to be overwritten — drop stale prefix entries.
                         self.prefix_cache.invalidate_block(blk);
