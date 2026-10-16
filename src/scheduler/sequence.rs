@@ -8,6 +8,25 @@ pub enum SequenceStatus {
     Finished,
 }
 
+/// Per-request sampling knobs (#56). The defaults reproduce the engine's historical
+/// greedy behaviour; callers override the fields they care about on the sequence.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub seed: u64,
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: 42,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Sequence {
     pub id: u64,
@@ -20,6 +39,7 @@ pub struct Sequence {
     pub last_active_step: usize,
     /// Token ids that terminate generation (EOS and friends); empty = run to `max_tokens`.
     pub stop_token_ids: Vec<u32>,
+    pub sampling: SamplingParams,
 }
 
 impl Sequence {
@@ -34,6 +54,7 @@ impl Sequence {
             max_tokens,
             last_active_step: 0,
             stop_token_ids: Vec::new(),
+            sampling: SamplingParams::default(),
         }
     }
 

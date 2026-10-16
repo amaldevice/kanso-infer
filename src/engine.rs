@@ -1,5 +1,5 @@
 use crate::error::EngineError;
-use crate::kv_cache::{BlockPool, KvStorage, PrefixCache};
+use crate::kv_cache::{BlockPool, BlockTable, KvStorage, PrefixCache};
 use crate::model::Model;
 use crate::sampler::sample_token;
 use crate::scheduler::{Sequence, SequenceStatus};
@@ -204,54 +204,63 @@ impl Engine {
         let mut remaining_budget = self.token_budget;
 
         // 1. Priority: Active decode requests execute without stalling
-        for (idx, seq) in self.sequences.iter_mut().enumerate() {
-            if seq.status == SequenceStatus::Running
-                && !seq.is_finished()
-                && seq.prefilled_tokens >= seq.prompt_tokens.len()
+        for idx in 0..self.sequences.len() {
+            let seq = &self.sequences[idx];
+            if seq.status != SequenceStatus::Running
+                || seq.is_finished()
+                || seq.prefilled_tokens < seq.prompt_tokens.len()
             {
-                if remaining_budget == 0 {
-                    break;
-                }
-
-                let last_token = *seq.generated_tokens.last().unwrap();
-                let pos = seq.prompt_tokens.len() + seq.generated_tokens.len() - 1;
-                self.workspace.clear();
-                let logits = self.model.forward_decode_step_with_workspace(
-                    last_token,
-                    pos,
-                    &seq.block_table,
-                    &mut self.kv_storage,
-                    Some(&mut self.workspace),
-                )?;
-
-                let next_token = sample_token(&logits, 0.0, 1.0, 42)?;
-                seq.generated_tokens.push(next_token);
-                seq.block_table.advance_tokens(1);
-
-                let current_blocks = seq.block_table.blocks().len();
-                let needed_blocks = seq.block_table.required_blocks(self.block_size);
-                if needed_blocks > current_blocks
-                    && let Some(blk) = self.block_pool.allocate()
-                {
-                    // #44: block is about to be overwritten — drop stale prefix entries.
-                    self.prefix_cache.invalidate_block(blk);
-                    seq.block_table.push_block(blk);
-                }
-
-                let is_finished = seq.generated_tokens.len() >= seq.max_tokens;
-                if is_finished {
-                    seq.status = SequenceStatus::Finished;
-                    finished_indices.push(idx);
-                }
-
-                outputs.push(StepOutput {
-                    request_id: seq.id,
-                    token_id: next_token,
-                    is_finished,
-                });
-
-                remaining_budget = remaining_budget.saturating_sub(1);
+                continue;
             }
+            if remaining_budget == 0 {
+                break;
+            }
+
+            // #56: the block need is settled before the forward runs. If the pool is
+            // short, blocks are taken from the lowest-priority (newest) sequence, which
+            // then recomputes; if there is nothing left to take, this sequence waits a
+            // step instead of decoding past the end of its block table.
+            if self.decode_needs_block(idx) && !self.ensure_blocks(idx, 1) {
+                continue;
+            }
+
+            let seq = &mut self.sequences[idx];
+            let last_token = *seq.generated_tokens.last().unwrap();
+            let pos = seq.prompt_tokens.len() + seq.generated_tokens.len() - 1;
+            self.workspace.clear();
+            let logits = self.model.forward_decode_step_with_workspace(
+                last_token,
+                pos,
+                &seq.block_table,
+                &mut self.kv_storage,
+                Some(&mut self.workspace),
+            )?;
+
+            let next_token = sample_token(
+                &logits,
+                seq.sampling.temperature,
+                seq.sampling.top_p,
+                seq.sampling.seed,
+            )?;
+            seq.generated_tokens.push(next_token);
+            seq.block_table.advance_tokens(1);
+
+            // #56: EOS (any configured stop id) retires the sequence exactly like
+            // max_tokens, so its blocks return to the pool in this same step.
+            let is_finished = seq.generated_tokens.len() >= seq.max_tokens
+                || seq.stop_token_ids.contains(&next_token);
+            if is_finished {
+                seq.status = SequenceStatus::Finished;
+                finished_indices.push(idx);
+            }
+
+            outputs.push(StepOutput {
+                request_id: seq.id,
+                token_id: next_token,
+                is_finished,
+            });
+
+            remaining_budget = remaining_budget.saturating_sub(1);
         }
 
         // 2. Admission stage: Check waiting requests & prefix cache lookup before first chunk
@@ -308,87 +317,79 @@ impl Engine {
         }
 
         // 3. Prefill chunks stage: Process partial prefill chunks with remaining budget
-        for (idx, seq) in self.sequences.iter_mut().enumerate() {
-            if seq.status == SequenceStatus::Running
-                && !seq.is_finished()
-                && seq.prefilled_tokens < seq.prompt_tokens.len()
+        for idx in 0..self.sequences.len() {
+            let seq = &self.sequences[idx];
+            if seq.status != SequenceStatus::Running
+                || seq.is_finished()
+                || seq.prefilled_tokens >= seq.prompt_tokens.len()
             {
-                if remaining_budget == 0 {
-                    continue;
-                }
+                continue;
+            }
+            if remaining_budget == 0 {
+                continue;
+            }
 
-                let needed = seq.prompt_tokens.len() - seq.prefilled_tokens;
-                let chunk_len = needed.min(remaining_budget);
-                if chunk_len == 0 {
-                    continue;
-                }
+            let needed = seq.prompt_tokens.len() - seq.prefilled_tokens;
+            let chunk_len = needed.min(remaining_budget);
+            if chunk_len == 0 {
+                continue;
+            }
 
-                let start_pos = seq.prefilled_tokens;
-                let end_pos = start_pos + chunk_len;
-                let needed_blocks = end_pos.div_ceil(self.block_size);
-                let current_blocks = seq.block_table.blocks().len();
+            let start_pos = seq.prefilled_tokens;
+            let end_pos = start_pos + chunk_len;
+            // The chunk that completes the prompt also samples its first token, so
+            // reserve a slot for that token before any forward runs (#56).
+            let needed_blocks = (end_pos + usize::from(end_pos == seq.prompt_tokens.len()))
+                .div_ceil(self.block_size);
+            let current_blocks = seq.block_table.blocks().len();
+            if needed_blocks > current_blocks
+                && !self.ensure_blocks(idx, needed_blocks - current_blocks)
+            {
+                continue;
+            }
 
-                if needed_blocks > current_blocks {
-                    let blocks_to_alloc = needed_blocks - current_blocks;
-                    if self.block_pool.free_blocks_count() < blocks_to_alloc {
-                        continue;
-                    }
-                    for _ in 0..blocks_to_alloc {
-                        if let Some(blk) = self.block_pool.allocate() {
-                            // #44: block is about to be overwritten — drop stale prefix entries.
-                            self.prefix_cache.invalidate_block(blk);
-                            seq.block_table.push_block(blk);
-                        }
-                    }
-                }
+            let seq = &self.sequences[idx];
+            let chunk_tokens = &seq.prompt_tokens[start_pos..end_pos];
+            let logits = self.model.forward_prefill(
+                chunk_tokens,
+                start_pos,
+                &seq.block_table,
+                &mut self.kv_storage,
+            )?;
 
-                let chunk_tokens = &seq.prompt_tokens[start_pos..end_pos];
-                let logits = self.model.forward_prefill(
-                    chunk_tokens,
-                    start_pos,
-                    &seq.block_table,
-                    &mut self.kv_storage,
+            let seq = &mut self.sequences[idx];
+            seq.prefilled_tokens = end_pos;
+            seq.block_table.set_num_tokens(end_pos);
+            remaining_budget = remaining_budget.saturating_sub(chunk_len);
+
+            // If prefill completed, sample the first generated token
+            if seq.prefilled_tokens == seq.prompt_tokens.len() {
+                let next_token = sample_token(
+                    &logits,
+                    seq.sampling.temperature,
+                    seq.sampling.top_p,
+                    seq.sampling.seed,
                 )?;
-                let last_logits = Some(logits);
+                seq.generated_tokens.push(next_token);
+                seq.block_table.advance_tokens(1);
 
-                seq.prefilled_tokens = end_pos;
-                seq.block_table.set_num_tokens(end_pos);
-                remaining_budget = remaining_budget.saturating_sub(chunk_len);
-
-                // If prefill completed, sample the first generated token
-                if seq.prefilled_tokens == seq.prompt_tokens.len()
-                    && let Some(logits) = last_logits
-                {
-                    let next_token = sample_token(&logits, 0.0, 1.0, 42)?;
-                    seq.generated_tokens.push(next_token);
-                    seq.block_table.advance_tokens(1);
-
-                    let current_blocks = seq.block_table.blocks().len();
-                    let needed_blocks = seq.block_table.required_blocks(self.block_size);
-                    if needed_blocks > current_blocks
-                        && let Some(blk) = self.block_pool.allocate()
-                    {
-                        // #44: block is about to be overwritten — drop stale prefix entries.
-                        self.prefix_cache.invalidate_block(blk);
-                        seq.block_table.push_block(blk);
-                    }
-
-                    let is_finished = seq.generated_tokens.len() >= seq.max_tokens;
-                    if is_finished {
-                        seq.status = SequenceStatus::Finished;
-                        finished_indices.push(idx);
-                    }
-
-                    outputs.push(StepOutput {
-                        request_id: seq.id,
-                        token_id: next_token,
-                        is_finished,
-                    });
-
-                    // Insert prompt prefix into prefix cache
-                    self.prefix_cache
-                        .insert_prefix(&seq.prompt_tokens, seq.block_table.blocks());
+                // #56: EOS retires the sequence in this same step.
+                let is_finished = seq.generated_tokens.len() >= seq.max_tokens
+                    || seq.stop_token_ids.contains(&next_token);
+                if is_finished {
+                    seq.status = SequenceStatus::Finished;
+                    finished_indices.push(idx);
                 }
+
+                outputs.push(StepOutput {
+                    request_id: seq.id,
+                    token_id: next_token,
+                    is_finished,
+                });
+
+                // Insert prompt prefix into prefix cache
+                self.prefix_cache
+                    .insert_prefix(&seq.prompt_tokens, seq.block_table.blocks());
             }
         }
 
@@ -401,6 +402,75 @@ impl Engine {
         }
 
         Ok(outputs)
+    }
+
+    /// #56: drops finished requests from the active vector so a long-lived engine
+    /// (server, CLI) does not rescan unbounded history every step. Returns how many
+    /// were dropped. Finished sequences stay visible until the embedder drains them.
+    pub fn drain_finished(&mut self) -> usize {
+        let before = self.sequences.len();
+        self.sequences.retain(|s| !s.is_finished());
+        before - self.sequences.len()
+    }
+
+    /// Would the next decoded token spill past the sequence's allocated blocks?
+    fn decode_needs_block(&self, idx: usize) -> bool {
+        let table = &self.sequences[idx].block_table;
+        table.num_tokens() + 1 > table.blocks().len() * self.block_size
+    }
+
+    /// #56: grows sequence `idx`'s block table by `want` blocks, taking them from the
+    /// lowest-priority (newest) running sequence when the pool is short — that victim is
+    /// preempted and recomputes later. `false` = there was nothing left to take, so the
+    /// caller must defer the sequence instead of running it outside its block table.
+    fn ensure_blocks(&mut self, idx: usize, want: usize) -> bool {
+        while self.block_pool.free_blocks_count() < want {
+            if !self.preempt_lowest_priority_after(idx) {
+                return false;
+            }
+        }
+        let seq = &mut self.sequences[idx];
+        for _ in 0..want {
+            let Some(blk) = self.block_pool.allocate() else {
+                // Unreachable: the loop above just secured `want` free blocks.
+                return false;
+            };
+            // #44: block is about to be overwritten — drop stale prefix entries.
+            self.prefix_cache.invalidate_block(blk);
+            seq.block_table.push_block(blk);
+        }
+        true
+    }
+
+    /// Picks the newest running sequence after `idx` (lowest priority) and preempts it.
+    fn preempt_lowest_priority_after(&mut self, idx: usize) -> bool {
+        let victim = (idx + 1..self.sequences.len()).rev().find(|&j| {
+            self.sequences[j].status == SequenceStatus::Running && !self.sequences[j].is_finished()
+        });
+        match victim {
+            Some(v) => {
+                self.preempt(v);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Recompute preemption (#56): release the sequence's KV blocks and fold the tokens it
+    /// already emitted back into its prompt, so it re-prefills from a clean block table when
+    /// rescheduled. Already-reported tokens are not replayed — `max_tokens` shrinks by the
+    /// folded count, so the caller still observes exactly `max_tokens` outputs.
+    fn preempt(&mut self, idx: usize) {
+        let seq = &mut self.sequences[idx];
+        for &blk in seq.block_table.blocks() {
+            self.block_pool.free(blk);
+        }
+        let emitted = seq.generated_tokens.len();
+        seq.prompt_tokens.append(&mut seq.generated_tokens);
+        seq.max_tokens = seq.max_tokens.saturating_sub(emitted);
+        seq.block_table = BlockTable::new();
+        seq.prefilled_tokens = 0;
+        seq.status = SequenceStatus::Waiting;
     }
 
     pub fn speculative_step(
@@ -449,6 +519,9 @@ impl Engine {
             if seq_mut.generated_tokens.len() < seq_mut.max_tokens {
                 seq_mut.generated_tokens.push(tok);
                 committed.push(tok);
+                if seq_mut.stop_token_ids.contains(&tok) {
+                    break; // #56: EOS — never commit draft tokens past the stop token
+                }
             }
         }
 
@@ -459,7 +532,10 @@ impl Engine {
             &mut self.block_pool,
         );
 
-        if seq_mut.generated_tokens.len() >= seq_mut.max_tokens {
+        let stopped = committed
+            .last()
+            .is_some_and(|tok| seq_mut.stop_token_ids.contains(tok));
+        if seq_mut.generated_tokens.len() >= seq_mut.max_tokens || stopped {
             seq_mut.status = SequenceStatus::Finished;
         }
 

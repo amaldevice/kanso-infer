@@ -192,14 +192,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 } else {
                     p.as_bytes().iter().map(|&b| (b % 40) as u32).collect()
                 };
-                let req_id = engine.add_request(tokens, max_tokens);
+                let mut decoder = kanso_infer::tokenizer::StreamDecoder::new();
+                let eos_id = tok_wrapper.as_ref().map(|t| t.eos_token_id).unwrap_or(2);
+                // #56: EOS retires the sequence in the engine (blocks freed) instead of
+                // generating up to max_tokens after the client already stopped reading.
+                let req_id = engine.add_request_with_stops(tokens, max_tokens, vec![eos_id]);
 
                 println!("\nPrompt: \"{}\"", p);
                 print!("Assistant > ");
                 io::stdout().flush()?;
 
-                let mut decoder = kanso_infer::tokenizer::StreamDecoder::new();
-                let eos_id = tok_wrapper.as_ref().map(|t| t.eos_token_id).unwrap_or(2);
                 let mut done = false;
 
                 while !done && engine.has_unfinished_requests() {
@@ -225,6 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
                     }
                 }
+
+                // #56: retire this prompt's sequence before the next one.
+                engine.drain_finished();
 
                 if let Some(tok) = &tok_wrapper {
                     let rem = decoder.flush(tok)?;

@@ -20,10 +20,16 @@ fn run_to_completion(engine: &mut Engine, step_cap: usize) -> HashMap<u64, Vec<u
             .step()
             .expect("#56: KV pressure must preempt, not error out the whole batch");
         for out in outputs {
-            emitted.entry(out.request_id).or_default().push(out.token_id);
+            emitted
+                .entry(out.request_id)
+                .or_default()
+                .push(out.token_id);
         }
         steps += 1;
-        assert!(steps < step_cap, "#56: engine livelocked under block pressure");
+        assert!(
+            steps < step_cap,
+            "#56: engine livelocked under block pressure"
+        );
     }
     emitted
 }
