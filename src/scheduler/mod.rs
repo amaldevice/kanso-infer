@@ -1,3 +1,3 @@
 pub mod sequence;
 
-pub use sequence::{Sequence, SequenceStatus};
+pub use sequence::{SamplingParams, Sequence, SequenceStatus};

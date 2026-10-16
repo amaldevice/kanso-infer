@@ -109,6 +109,9 @@ async fn chat_completions_handler(
         }
 
         if done {
+            // #56: this request is retired — drop it (and any other finished sequence)
+            // from the engine so the active vector does not grow without bound.
+            state.engine.lock().drain_finished();
             break;
         }
         tokio::task::yield_now().await;

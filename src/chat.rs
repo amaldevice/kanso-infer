@@ -91,13 +91,17 @@ impl ChatSession {
         F: FnMut(&str),
     {
         let (_, tokens) = self.format_prompt();
-        let request_id = self.engine.add_request(tokens, max_tokens);
+        let eos_id = self.tokenizer.as_ref().map(|t| t.eos_token_id).unwrap_or(2);
+        // #56: hand the engine the stop token, so EOS retires the sequence and releases
+        // its KV blocks instead of generating up to max_tokens holding them.
+        let request_id = self
+            .engine
+            .add_request_with_stops(tokens, max_tokens, vec![eos_id]);
 
         let mut generated_tokens = Vec::new();
         let mut done = false;
         let mut accumulated_reply = String::new();
         let mut decoder = StreamDecoder::new();
-        let eos_id = self.tokenizer.as_ref().map(|t| t.eos_token_id).unwrap_or(2);
 
         while !done && self.engine.has_unfinished_requests() {
             let outputs = self.engine.step()?;
@@ -135,6 +139,10 @@ impl ChatSession {
                 }
             }
         }
+
+        // #56: drop this turn's retired sequence so a long-lived session does not grow
+        // the engine's active vector forever.
+        self.engine.drain_finished();
 
         if let Some(tok) = &self.tokenizer {
             let remaining = decoder.flush(tok)?;
