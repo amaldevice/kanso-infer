@@ -222,6 +222,8 @@ impl Engine {
                 if needed_blocks > current_blocks
                     && let Some(blk) = self.block_pool.allocate()
                 {
+                    // #44: block is about to be overwritten — drop stale prefix entries.
+                    self.prefix_cache.invalidate_block(blk);
                     seq.block_table.push_block(blk);
                 }
 
@@ -322,6 +324,8 @@ impl Engine {
                     }
                     for _ in 0..blocks_to_alloc {
                         if let Some(blk) = self.block_pool.allocate() {
+                            // #44: block is about to be overwritten — drop stale prefix entries.
+                            self.prefix_cache.invalidate_block(blk);
                             seq.block_table.push_block(blk);
                         }
                     }
@@ -353,6 +357,8 @@ impl Engine {
                     if needed_blocks > current_blocks
                         && let Some(blk) = self.block_pool.allocate()
                     {
+                        // #44: block is about to be overwritten — drop stale prefix entries.
+                        self.prefix_cache.invalidate_block(blk);
                         seq.block_table.push_block(blk);
                     }
 
