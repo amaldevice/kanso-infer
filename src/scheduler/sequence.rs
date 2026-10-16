@@ -18,6 +18,8 @@ pub struct Sequence {
     pub prefilled_tokens: usize,
     pub max_tokens: usize,
     pub last_active_step: usize,
+    /// Token ids that terminate generation (EOS and friends); empty = run to `max_tokens`.
+    pub stop_token_ids: Vec<u32>,
 }
 
 impl Sequence {
@@ -31,6 +33,7 @@ impl Sequence {
             prefilled_tokens: 0,
             max_tokens,
             last_active_step: 0,
+            stop_token_ids: Vec::new(),
         }
     }
 

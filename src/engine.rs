@@ -142,10 +142,21 @@ impl Engine {
     }
 
     pub fn add_request(&mut self, prompt_tokens: Vec<u32>, max_tokens: usize) -> u64 {
+        self.add_request_with_stops(prompt_tokens, max_tokens, Vec::new())
+    }
+
+    /// Same as [`Engine::add_request`], but generation also stops on any id in `stop_token_ids`.
+    pub fn add_request_with_stops(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        stop_token_ids: Vec<u32>,
+    ) -> u64 {
         let id = self.next_request_id;
         self.next_request_id += 1;
-        self.sequences
-            .push(Sequence::new(id, prompt_tokens, max_tokens));
+        let mut seq = Sequence::new(id, prompt_tokens, max_tokens);
+        seq.stop_token_ids = stop_token_ids;
+        self.sequences.push(seq);
         id
     }
 
