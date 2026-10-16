@@ -7,6 +7,9 @@ pub struct SparseBlockTable {
 }
 
 impl SparseBlockTable {
+    /// #44/F3: allocating here bypasses `PrefixCache` invalidation, so a sparse table's
+    /// blocks must not feed prefix-cache hits until this takes a `&mut PrefixCache` and
+    /// invalidates each block (as `Engine::ensure_blocks` does). No production caller yet.
     pub fn allocate_initial(config: &ModelConfig, pool: &mut BlockPool, num_tokens: usize) -> Self {
         let attention_layers = match &config.attention_layers {
             Some(layers) => layers.clone(),

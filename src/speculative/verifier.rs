@@ -1,5 +1,5 @@
 use crate::error::EngineError;
-use crate::kv_cache::{BlockPool, BlockTable, KvStorage};
+use crate::kv_cache::{BlockPool, BlockTable, KvStorage, PrefixCache};
 use crate::model::Model;
 use crate::sampler::sample_token;
 use candle_core::IndexOp;
@@ -25,6 +25,7 @@ impl SpeculativeVerifier {
         start_pos: usize,
         block_table: &mut BlockTable,
         block_pool: &mut BlockPool,
+        prefix_cache: &mut PrefixCache,
         kv_storage: &mut KvStorage,
         block_size: usize,
     ) -> Result<VerificationResult, EngineError> {
@@ -34,6 +35,8 @@ impl SpeculativeVerifier {
                 let blk = block_pool.allocate().ok_or_else(|| {
                     EngineError::Model("Out of memory: cannot allocate KV block".to_string())
                 })?;
+                // #44/F3: block is about to be overwritten — drop stale prefix entries.
+                prefix_cache.invalidate_block(blk);
                 block_table.push_block(blk);
             }
             let logits =
@@ -61,6 +64,8 @@ impl SpeculativeVerifier {
             let blk = block_pool.allocate().ok_or_else(|| {
                 EngineError::Model("Out of memory: cannot allocate KV block".to_string())
             })?;
+            // #44/F3: block is about to be overwritten — drop stale prefix entries.
+            prefix_cache.invalidate_block(blk);
             block_table.push_block(blk);
         }
 
