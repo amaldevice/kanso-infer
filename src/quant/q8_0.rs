@@ -33,8 +33,8 @@ impl BlockQ8_0 {
 
     /// Dequantize block into 32 32-bit floats.
     pub fn dequantize(&self, out: &mut [f32; QK8_0]) {
-        for i in 0..QK8_0 {
-            out[i] = self.d * (self.qs[i] as f32);
+        for (o, &q) in out.iter_mut().zip(self.qs.iter()) {
+            *o = self.d * (q as f32);
         }
     }
 }
@@ -42,7 +42,7 @@ impl BlockQ8_0 {
 /// Quantizes a row of floats into a slice of Q8_0 blocks.
 pub fn quantize_row_q8_0(xs: &[f32], blocks: &mut [BlockQ8_0]) {
     debug_assert_eq!(xs.len(), blocks.len() * QK8_0);
-    for (chunk, b) in xs.chunks_exact(QK8_0).zip(blocks.iter_mut()) {
+    for (chunk, b) in xs.as_chunks::<QK8_0>().0.iter().zip(blocks.iter_mut()) {
         *b = BlockQ8_0::from_f32_slice(chunk);
     }
 }
@@ -50,8 +50,8 @@ pub fn quantize_row_q8_0(xs: &[f32], blocks: &mut [BlockQ8_0]) {
 /// Scalar reference dot product between a Q8_0 block and an unquantized f32 slice.
 pub fn scalar_dot_q8_0(w: &BlockQ8_0, x: &[f32; QK8_0]) -> f32 {
     let mut sum = 0.0f32;
-    for i in 0..QK8_0 {
-        sum += (w.qs[i] as f32) * x[i];
+    for (&q, &v) in w.qs.iter().zip(x.iter()) {
+        sum += (q as f32) * v;
     }
     w.d * sum
 }

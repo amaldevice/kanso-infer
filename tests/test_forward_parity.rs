@@ -3,16 +3,16 @@ use candle_core::{Device, Tensor};
 #[test]
 fn test_mock_model_forward_single_token() {
     let model = kanso_infer::model::Model::create_mock_tiny(
-        /* hidden_size */ 16,
-        /* num_attention_heads */ 4,
-        /* num_kv_heads */ 2,
-        /* num_layers */ 2,
-        /* vocab_size */ 100,
-    ).expect("failed to create mock model");
+        /* hidden_size */ 16, /* num_attention_heads */ 4, /* num_kv_heads */ 2,
+        /* num_layers */ 2, /* vocab_size */ 100,
+    )
+    .expect("failed to create mock model");
 
     let prompt = vec![42u32];
-    let logits = model.forward_single_prompt(&prompt).expect("forward failed");
-    
+    let logits = model
+        .forward_single_prompt(&prompt)
+        .expect("forward failed");
+
     // Logits should be [1, vocab_size]
     assert_eq!(logits.dims(), &[1, 100]);
 

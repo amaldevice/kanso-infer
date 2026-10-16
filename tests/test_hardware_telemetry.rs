@@ -4,13 +4,20 @@ fn test_get_hardware_specs() {
     assert!(!hw.chip_name.is_empty(), "Chip name should not be empty");
     assert!(hw.core_count > 0, "Core count should be positive");
     assert!(hw.total_ram_gb > 0.0, "Total RAM should be positive");
-    assert!(!hw.model_identifier.is_empty(), "Model identifier should not be empty");
+    assert!(
+        !hw.model_identifier.is_empty(),
+        "Model identifier should not be empty"
+    );
 }
 
 #[test]
 fn test_get_peak_rss_mb() {
     let rss_mb = kanso_infer::hardware::get_peak_rss_mb();
-    assert!(rss_mb > 0.0, "Peak RSS memory should be positive, got {}", rss_mb);
+    assert!(
+        rss_mb > 0.0,
+        "Peak RSS memory should be positive, got {}",
+        rss_mb
+    );
 }
 
 #[test]
@@ -35,7 +42,15 @@ fn test_calculate_bandwidth_utilization() {
     );
 
     // 0.38 GB / 0.0025 s = 152 GB/s
-    assert!((effective_gb_s - 152.0).abs() < 1.0, "Expected ~152 GB/s, got {}", effective_gb_s);
+    assert!(
+        (effective_gb_s - 152.0).abs() < 1.0,
+        "Expected ~152 GB/s, got {}",
+        effective_gb_s
+    );
     // 152 / 150 * 100 = 101.33%
-    assert!((util_pct - 101.33).abs() < 1.0, "Expected ~101.33%, got {}", util_pct);
+    assert!(
+        (util_pct - 101.33).abs() < 1.0,
+        "Expected ~101.33%, got {}",
+        util_pct
+    );
 }

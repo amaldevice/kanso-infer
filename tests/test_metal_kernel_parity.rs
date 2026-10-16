@@ -9,7 +9,7 @@ fn test_rmsnorm_numerical_parity() {
 
     // Mean sq = (1 + 4 + 9 + 16)/4 = 7.5
     // rms = sqrt(7.5 + 1e-5) = 2.7386127
-    let expected = vec![
+    let expected = [
         1.0 / 2.7386127,
         2.0 / 2.7386127,
         3.0 / 2.7386127,
@@ -46,6 +46,10 @@ fn test_metal_shader_sources_embedded() {
 
     for (name, source) in shaders {
         assert!(!source.trim().is_empty(), "Shader {} is empty", name);
-        assert!(source.contains("kernel void"), "Shader {} missing kernel definition", name);
+        assert!(
+            source.contains("kernel void"),
+            "Shader {} missing kernel definition",
+            name
+        );
     }
 }

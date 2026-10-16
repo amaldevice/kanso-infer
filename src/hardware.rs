@@ -2,7 +2,11 @@ use serde::{Deserialize, Serialize};
 
 /// Default execution backend for current platform:
 /// Defaults to "metal" on macOS (Apple Silicon GPU), and "cpu" on other operating systems.
-pub const DEFAULT_BACKEND: &str = if cfg!(target_os = "macos") { "metal" } else { "cpu" };
+pub const DEFAULT_BACKEND: &str = if cfg!(target_os = "macos") {
+    "metal"
+} else {
+    "cpu"
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareInfo {
@@ -59,13 +63,19 @@ pub fn get_thermal_state() -> ThermalState {
     #[cfg(target_os = "macos")]
     {
         unsafe {
-            let cls = libc::dlsym(libc::RTLD_DEFAULT, b"OBJC_CLASS_$_NSProcessInfo\0".as_ptr() as *const _);
+            let cls = libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"OBJC_CLASS_$_NSProcessInfo".as_ptr() as *const _,
+            );
             let cls = if !cls.is_null() {
                 cls
             } else {
                 let get_class: extern "C" fn(*const libc::c_char) -> *mut libc::c_void =
-                    std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, b"objc_getClass\0".as_ptr() as *const _));
-                get_class(b"NSProcessInfo\0".as_ptr() as *const _)
+                    std::mem::transmute(libc::dlsym(
+                        libc::RTLD_DEFAULT,
+                        c"objc_getClass".as_ptr() as *const _,
+                    ));
+                get_class(c"NSProcessInfo".as_ptr() as *const _)
             };
 
             if cls.is_null() {
@@ -73,20 +83,27 @@ pub fn get_thermal_state() -> ThermalState {
             }
 
             let sel_register: extern "C" fn(*const libc::c_char) -> *mut libc::c_void =
-                std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, b"sel_registerName\0".as_ptr() as *const _));
-            let msg_send: extern "C" fn() =
-                std::mem::transmute(libc::dlsym(libc::RTLD_DEFAULT, b"objc_msgSend\0".as_ptr() as *const _));
+                std::mem::transmute(libc::dlsym(
+                    libc::RTLD_DEFAULT,
+                    c"sel_registerName".as_ptr() as *const _,
+                ));
+            let msg_send: extern "C" fn() = std::mem::transmute(libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"objc_msgSend".as_ptr() as *const _,
+            ));
 
-            let sel_pi = sel_register(b"processInfo\0".as_ptr() as *const _);
-            let msg_send_obj: extern "C" fn(*mut libc::c_void, *mut libc::c_void) -> *mut libc::c_void =
-                std::mem::transmute(msg_send);
+            let sel_pi = sel_register(c"processInfo".as_ptr() as *const _);
+            let msg_send_obj: extern "C" fn(
+                *mut libc::c_void,
+                *mut libc::c_void,
+            ) -> *mut libc::c_void = std::mem::transmute(msg_send);
             let pi = msg_send_obj(cls, sel_pi);
 
             if pi.is_null() {
                 return ThermalState::Unknown;
             }
 
-            let sel_ts = sel_register(b"thermalState\0".as_ptr() as *const _);
+            let sel_ts = sel_register(c"thermalState".as_ptr() as *const _);
             let msg_send_long: extern "C" fn(*mut libc::c_void, *mut libc::c_void) -> libc::c_long =
                 std::mem::transmute(msg_send);
             let state_code = msg_send_long(pi, sel_ts);
@@ -114,7 +131,7 @@ pub fn get_hardware_info() -> HardwareInfo {
         let mut model_len = model_buf.len();
         let model_id = unsafe {
             if libc::sysctlbyname(
-                b"hw.model\0".as_ptr() as *const _,
+                c"hw.model".as_ptr() as *const _,
                 model_buf.as_mut_ptr() as *mut _,
                 &mut model_len,
                 std::ptr::null_mut(),
@@ -131,7 +148,7 @@ pub fn get_hardware_info() -> HardwareInfo {
         let mut cpu_len = cpu_buf.len();
         let chip_name = unsafe {
             if libc::sysctlbyname(
-                b"machdep.cpu.brand_string\0".as_ptr() as *const _,
+                c"machdep.cpu.brand_string".as_ptr() as *const _,
                 cpu_buf.as_mut_ptr() as *mut _,
                 &mut cpu_len,
                 std::ptr::null_mut(),
@@ -148,7 +165,7 @@ pub fn get_hardware_info() -> HardwareInfo {
         let mut ncpu_len = std::mem::size_of::<libc::c_int>();
         unsafe {
             libc::sysctlbyname(
-                b"hw.ncpu\0".as_ptr() as *const _,
+                c"hw.ncpu".as_ptr() as *const _,
                 &mut ncpu as *mut _ as *mut _,
                 &mut ncpu_len,
                 std::ptr::null_mut(),
@@ -160,7 +177,7 @@ pub fn get_hardware_info() -> HardwareInfo {
         let mut memsize_len = std::mem::size_of::<u64>();
         unsafe {
             libc::sysctlbyname(
-                b"hw.memsize\0".as_ptr() as *const _,
+                c"hw.memsize".as_ptr() as *const _,
                 &mut memsize as *mut _ as *mut _,
                 &mut memsize_len,
                 std::ptr::null_mut(),
@@ -181,7 +198,9 @@ pub fn get_hardware_info() -> HardwareInfo {
     {
         HardwareInfo {
             chip_name: "Generic CPU".to_string(),
-            core_count: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+            core_count: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
             total_ram_gb: 16.0,
             model_identifier: "Generic System".to_string(),
         }

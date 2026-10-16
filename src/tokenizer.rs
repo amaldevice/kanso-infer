@@ -1,6 +1,6 @@
+use crate::error::EngineError;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
-use crate::error::EngineError;
 
 #[derive(Clone)]
 pub struct TokenizerWrapper {
@@ -13,7 +13,11 @@ impl TokenizerWrapper {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, EngineError> {
         let path_ref = path.as_ref();
         let inner = Tokenizer::from_file(path_ref).map_err(|e| {
-            EngineError::Config(format!("Failed to load tokenizer from {}: {}", path_ref.display(), e))
+            EngineError::Config(format!(
+                "Failed to load tokenizer from {}: {}",
+                path_ref.display(),
+                e
+            ))
         })?;
 
         // Extract or default special tokens
@@ -63,30 +67,30 @@ impl TokenizerWrapper {
         }
 
         // Check model parent directory
-        if let Some(mp) = model_path {
-            if let Some(parent) = mp.parent() {
-                let candidate = parent.join("tokenizer.json");
-                if candidate.is_file() {
-                    return Self::from_file(&candidate);
-                }
+        if let Some(mp) = model_path
+            && let Some(parent) = mp.parent()
+        {
+            let candidate = parent.join("tokenizer.json");
+            if candidate.is_file() {
+                return Self::from_file(&candidate);
             }
         }
 
         // Check in ~/.cache/huggingface/hub
         if let Ok(home) = std::env::var("HOME") {
             let hf_hub = PathBuf::from(home).join(".cache/huggingface/hub");
-            if hf_hub.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&hf_hub) {
-                    for entry in entries.flatten() {
-                        let candidate = entry.path().join("snapshots");
-                        if candidate.is_dir() {
-                            if let Ok(snaps) = std::fs::read_dir(candidate) {
-                                for snap in snaps.flatten() {
-                                    let t = snap.path().join("tokenizer.json");
-                                    if t.is_file() {
-                                        return Self::from_file(&t);
-                                    }
-                                }
+            if hf_hub.is_dir()
+                && let Ok(entries) = std::fs::read_dir(&hf_hub)
+            {
+                for entry in entries.flatten() {
+                    let candidate = entry.path().join("snapshots");
+                    if candidate.is_dir()
+                        && let Ok(snaps) = std::fs::read_dir(candidate)
+                    {
+                        for snap in snaps.flatten() {
+                            let t = snap.path().join("tokenizer.json");
+                            if t.is_file() {
+                                return Self::from_file(&t);
                             }
                         }
                     }
@@ -137,11 +141,7 @@ impl StreamDecoder {
     }
 
     /// Pushes a single token ID and returns any completed UTF-8 text delta
-    pub fn push(
-        &mut self,
-        tokenizer: &TokenizerWrapper,
-        id: u32,
-    ) -> Result<String, EngineError> {
+    pub fn push(&mut self, tokenizer: &TokenizerWrapper, id: u32) -> Result<String, EngineError> {
         self.ids.push(id);
         let prefix = tokenizer.decode(&self.ids[self.prefix_offset..self.read_offset])?;
         let text = tokenizer.decode(&self.ids[self.prefix_offset..])?;

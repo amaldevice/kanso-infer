@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
-use serde::{Deserialize, Serialize};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -70,7 +70,12 @@ pub fn parse_trace_file(path: &str) -> Result<Vec<TraceEntry>, EngineError> {
             continue;
         }
         let entry: TraceEntry = serde_json::from_str(line).map_err(|e| {
-            EngineError::Config(format!("Invalid JSONL trace at {}:{}: {}", path, line_idx + 1, e))
+            EngineError::Config(format!(
+                "Invalid JSONL trace at {}:{}: {}",
+                path,
+                line_idx + 1,
+                e
+            ))
         })?;
         entries.push(entry);
     }
@@ -137,6 +142,7 @@ pub fn evaluate_run(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn evaluate_run_with_metrics(
     total_tokens: usize,
     total_duration_secs: f64,
@@ -162,6 +168,7 @@ pub fn evaluate_run_with_metrics(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn evaluate_run_with_timings(
     total_tokens: usize,
     total_duration_secs: f64,
@@ -306,7 +313,9 @@ fn execute_engine_run(
         for out in outputs {
             generated_tokens.push(out.token_id);
             let now = Instant::now();
-            if let std::collections::hash_map::Entry::Vacant(e) = first_token_times.entry(out.request_id) {
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                first_token_times.entry(out.request_id)
+            {
                 e.insert(now);
                 if let Some(start_t) = request_start_times.get(&out.request_id) {
                     let ttft_ms = now.duration_since(*start_t).as_secs_f64() * 1000.0;
@@ -338,7 +347,9 @@ fn execute_engine_run(
         checksum,
     );
     let delta_matched = engine.prefix_matched_tokens.saturating_sub(initial_matched);
-    let delta_total = engine.total_prompt_tokens_admitted.saturating_sub(initial_total);
+    let delta_total = engine
+        .total_prompt_tokens_admitted
+        .saturating_sub(initial_total);
     report.prefix_hit_rate = if delta_total == 0 {
         0.0
     } else {
@@ -403,7 +414,7 @@ pub fn create_engine_for_model_profile(
     max_running: usize,
 ) -> Result<Engine, EngineError> {
     let config = crate::config::ModelConfig::from_model_type(model_type)?;
-    let blocks_per_seq = (max_tokens_per_seq + block_size - 1) / block_size + 1;
+    let blocks_per_seq = max_tokens_per_seq.div_ceil(block_size) + 1;
     let total_blocks = (blocks_per_seq * num_requests.max(1)).max(128);
     let mut model = crate::model::Model::create_mock_from_config(&config)?;
     model.set_backend(backend);

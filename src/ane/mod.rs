@@ -1,10 +1,6 @@
 pub mod adapter;
 
 pub use adapter::{
-    has_ane_support,
-    AneLayerAdapter,
-    CoreMlAneAdapter,
-    CpuFallbackAneAdapter,
-    HybridExecutionPipeline,
-    HybridSyncStats,
+    AneLayerAdapter, CoreMlAneAdapter, CpuFallbackAneAdapter, HybridExecutionPipeline,
+    HybridSyncStats, has_ane_support,
 };

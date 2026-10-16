@@ -52,10 +52,11 @@ pub fn quantize_tensor_q8_0(tensor: &Tensor) -> Result<Tensor, EngineError> {
         return Ok(tensor.clone());
     }
     let mut dequant = vec![0.0f32; len];
-    for (i, chunk) in flat.chunks_exact(QK8_0).enumerate() {
+    for (i, chunk) in flat.as_chunks::<QK8_0>().0.iter().enumerate() {
         let block = BlockQ8_0::from_f32_slice(chunk);
-        let out_chunk: &mut [f32; QK8_0] =
-            (&mut dequant[i * QK8_0..(i + 1) * QK8_0]).try_into().unwrap();
+        let out_chunk: &mut [f32; QK8_0] = (&mut dequant[i * QK8_0..(i + 1) * QK8_0])
+            .try_into()
+            .unwrap();
         block.dequantize(out_chunk);
     }
     Ok(Tensor::from_vec(dequant, shape, tensor.device())?)
@@ -70,7 +71,7 @@ pub fn quantize_tensor_q4_k(tensor: &Tensor) -> Result<Tensor, EngineError> {
     let mut dequant = vec![0.0f32; len];
 
     if len % QK_K == 0 {
-        for (b_idx, chunk) in flat.chunks_exact(QK_K).enumerate() {
+        for (b_idx, chunk) in flat.as_chunks::<QK_K>().0.iter().enumerate() {
             let mut amax = 0.0f32;
             for &x in chunk {
                 let ax = x.abs();
@@ -79,7 +80,11 @@ pub fn quantize_tensor_q4_k(tensor: &Tensor) -> Result<Tensor, EngineError> {
                 }
             }
 
-            let d = if amax > 0.0 { amax / (15.0 * 63.0) } else { 0.0 };
+            let d = if amax > 0.0 {
+                amax / (15.0 * 63.0)
+            } else {
+                0.0
+            };
             let scales = [15u8, 15, 15, 15, 0, 0, 0, 0, 15, 15, 15, 15];
             let mut qs = [0u8; QK_K / 2];
 
@@ -98,8 +103,9 @@ pub fn quantize_tensor_q4_k(tensor: &Tensor) -> Result<Tensor, EngineError> {
                 scales,
                 qs,
             };
-            let out_chunk: &mut [f32; QK_K] =
-                (&mut dequant[b_idx * QK_K..(b_idx + 1) * QK_K]).try_into().unwrap();
+            let out_chunk: &mut [f32; QK_K] = (&mut dequant[b_idx * QK_K..(b_idx + 1) * QK_K])
+                .try_into()
+                .unwrap();
             block.dequantize(out_chunk);
         }
     } else {
@@ -158,7 +164,11 @@ pub fn forward_tokens_with_quant(
     match quant {
         QuantKernel::Fp32 => model.forward_tokens(tokens),
         QuantKernel::NeonQ8_0 => {
-            let mut q_model = Model::new(model.weights.clone(), model.config.clone(), model.device.clone());
+            let mut q_model = Model::new(
+                model.weights.clone(),
+                model.config.clone(),
+                model.device.clone(),
+            );
             q_model.set_backend(model.backend());
             for layer in &mut q_model.weights.layers {
                 layer.attn_q = quantize_tensor_q8_0(&layer.attn_q)?;
@@ -172,7 +182,11 @@ pub fn forward_tokens_with_quant(
             q_model.forward_tokens(tokens)
         }
         QuantKernel::NeonQ4_K => {
-            let mut q_model = Model::new(model.weights.clone(), model.config.clone(), model.device.clone());
+            let mut q_model = Model::new(
+                model.weights.clone(),
+                model.config.clone(),
+                model.device.clone(),
+            );
             q_model.set_backend(model.backend());
             for layer in &mut q_model.weights.layers {
                 layer.attn_q = quantize_tensor_q4_k(&layer.attn_q)?;
@@ -208,7 +222,11 @@ pub fn forward_tokens_with_quant(
                         }
                     }
                 }
-                Some(Tensor::from_vec(mask_data, (1, seq_len, seq_len), &model.device)?)
+                Some(Tensor::from_vec(
+                    mask_data,
+                    (1, seq_len, seq_len),
+                    &model.device,
+                )?)
             } else {
                 None
             };
@@ -223,9 +241,15 @@ pub fn forward_tokens_with_quant(
                 let k = quantize_int8_kv_tensor(&k_fp32)?;
                 let v = quantize_int8_kv_tensor(&v_fp32)?;
 
-                let q = q.reshape((seq_len, num_q_heads, head_dim))?.transpose(0, 1)?;
-                let k = k.reshape((seq_len, num_kv_heads, head_dim))?.transpose(0, 1)?;
-                let v = v.reshape((seq_len, num_kv_heads, head_dim))?.transpose(0, 1)?;
+                let q = q
+                    .reshape((seq_len, num_q_heads, head_dim))?
+                    .transpose(0, 1)?;
+                let k = k
+                    .reshape((seq_len, num_kv_heads, head_dim))?
+                    .transpose(0, 1)?;
+                let v = v
+                    .reshape((seq_len, num_kv_heads, head_dim))?
+                    .transpose(0, 1)?;
 
                 let (k, v) = if num_q_heads > num_kv_heads {
                     let factor = num_q_heads / num_kv_heads;
@@ -244,7 +268,9 @@ pub fn forward_tokens_with_quant(
                 let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
                 let attn_out = model.matmul(&attn_weights, &v)?;
 
-                let attn_out = attn_out.transpose(0, 1)?.reshape((seq_len, num_q_heads * head_dim))?;
+                let attn_out = attn_out
+                    .transpose(0, 1)?
+                    .reshape((seq_len, num_q_heads * head_dim))?;
                 let attn_proj = model.matmul(&attn_out, &layer.attn_output.t()?)?;
                 hidden = (hidden + attn_proj)?;
 
@@ -269,7 +295,11 @@ pub fn forward_tokens_with_quant(
 /// In standard fixed-length LM evaluation:
 /// Context length $W = \text{max\_seq\_len}$, stride $S = \text{stride}$.
 /// Loss is accumulated over the non-overlapping stride of each window to preserve preceding context.
-pub fn calculate_perplexity(model: &Model, tokens: &[u32], stride: usize) -> Result<f64, EngineError> {
+pub fn calculate_perplexity(
+    model: &Model,
+    tokens: &[u32],
+    stride: usize,
+) -> Result<f64, EngineError> {
     calculate_perplexity_quantized(model, tokens, stride, QuantKernel::Fp32)
 }
 
@@ -307,11 +337,9 @@ pub fn calculate_perplexity_quantized(
         let window_tokens = &tokens[begin_loc..end_loc];
 
         let logits = forward_tokens_with_quant(model, window_tokens, quant)?;
-        let window_len = window_tokens.len();
         let start_j = prev_end_loc.saturating_sub(begin_loc).max(1);
 
-        for j in start_j..window_len {
-            let target_token = window_tokens[j];
+        for (j, &target_token) in window_tokens.iter().enumerate().skip(start_j) {
             let logit_row = logits.i(j - 1)?;
             let nll = cross_entropy_loss(&logit_row, target_token);
             total_nll += nll;
@@ -445,22 +473,37 @@ pub fn run_wikitext2_perplexity_eval(
 /// Renders a structured ASCII table summarizing the perplexity report.
 pub fn format_ascii_ppl_report(report: &PerplexityReport) -> String {
     let mut out = String::new();
-    out.push_str("================================================================================\n");
+    out.push_str(
+        "================================================================================\n",
+    );
     out.push_str(" kanso-infer WikiText-2 Perplexity Quality Evaluation Report\n");
-    out.push_str("================================================================================\n");
-    out.push_str(&format!(" Dataset:        WikiText-2 (bundled validation slice)\n"));
+    out.push_str(
+        "================================================================================\n",
+    );
+    out.push_str(" Dataset:        WikiText-2 (bundled validation slice)\n");
     out.push_str(&format!(" Tokens:         {}\n", report.num_tokens));
     out.push_str(&format!(" Context Stride: {}\n", report.stride));
-    out.push_str(&format!(" Baseline PPL:   {:.4} (FP32 CPU)\n", report.baseline_ppl));
-    out.push_str("--------------------------------------------------------------------------------\n");
+    out.push_str(&format!(
+        " Baseline PPL:   {:.4} (FP32 CPU)\n",
+        report.baseline_ppl
+    ));
+    out.push_str(
+        "--------------------------------------------------------------------------------\n",
+    );
     out.push_str(&format!(
         "{:<25} {:<16} {:<24} {:<8}\n",
         "Backend / Kernel", "Perplexity", "Delta PPL vs Baseline", "Status"
     ));
-    out.push_str("--------------------------------------------------------------------------------\n");
+    out.push_str(
+        "--------------------------------------------------------------------------------\n",
+    );
 
     for b in &report.backends {
-        let status = if b.delta_vs_fp32.abs() < 0.05 { "PASS" } else { "FAIL" };
+        let status = if b.delta_vs_fp32.abs() < 0.05 {
+            "PASS"
+        } else {
+            "FAIL"
+        };
         let sign = if b.delta_vs_fp32 >= 0.0 { "+" } else { "" };
         out.push_str(&format!(
             "{:<25} {:<16.4} {:>1}{:<23.4} {:<8}\n",
@@ -477,13 +520,19 @@ pub fn format_ascii_ppl_report(report: &PerplexityReport) -> String {
         ));
     }
 
-    out.push_str("================================================================================\n");
+    out.push_str(
+        "================================================================================\n",
+    );
     if report.all_passed {
-        out.push_str(" Quality Guarantee: ALL backends and quantized kernels satisfy Delta PPL < 0.15!\n");
+        out.push_str(
+            " Quality Guarantee: ALL backends and quantized kernels satisfy Delta PPL < 0.15!\n",
+        );
     } else {
         out.push_str(" Quality Warning: Some kernels exceeded Delta PPL threshold of 0.15.\n");
     }
-    out.push_str("================================================================================\n");
+    out.push_str(
+        "================================================================================\n",
+    );
     out
 }
 

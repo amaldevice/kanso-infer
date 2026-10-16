@@ -1,7 +1,5 @@
 use candle_core::{DType, Device, Tensor};
-use kanso_infer::kv_cache::{
-    BlockPool, BlockTable, KvStorage, QuantMode, QuantizedKvBlock, QuantizedKvStorage,
-};
+use kanso_infer::kv_cache::{BlockPool, BlockTable, KvStorage, QuantMode, QuantizedKvStorage};
 use std::time::Instant;
 
 #[test]
@@ -116,10 +114,7 @@ fn test_quantized_kv_fp8_reconstruction_accuracy() {
         })
         .collect();
     let v_raw: Vec<f32> = (0..total_elements)
-        .map(|i| {
-            let val = ((i % 8) as f32) * 1.0 + 0.5;
-            val
-        })
+        .map(|i| ((i % 8) as f32) * 1.0 + 0.5)
         .collect();
 
     let k_tensor = Tensor::from_vec(k_raw.clone(), (n_kv_heads, head_dim), &device).unwrap();
@@ -180,22 +175,12 @@ fn test_physical_block_memory_reduction() {
     let num_layers = 12;
 
     let storage_int8 = QuantizedKvStorage::new_int8(
-        num_layers,
-        num_blocks,
-        block_size,
-        n_kv_heads,
-        head_dim,
-        &device,
+        num_layers, num_blocks, block_size, n_kv_heads, head_dim, &device,
     )
     .unwrap();
 
     let storage_fp8 = QuantizedKvStorage::new_fp8(
-        num_layers,
-        num_blocks,
-        block_size,
-        n_kv_heads,
-        head_dim,
-        &device,
+        num_layers, num_blocks, block_size, n_kv_heads, head_dim, &device,
     )
     .unwrap();
 
@@ -242,12 +227,7 @@ fn test_block_pool_allocation_recycling_zero_leakage() {
     assert_eq!(pool.free_blocks_count(), num_blocks);
 
     let mut storage = QuantizedKvStorage::new_int8(
-        num_layers,
-        num_blocks,
-        block_size,
-        n_kv_heads,
-        head_dim,
-        &device,
+        num_layers, num_blocks, block_size, n_kv_heads, head_dim, &device,
     )
     .unwrap();
 
@@ -261,9 +241,15 @@ fn test_block_pool_allocation_recycling_zero_leakage() {
     let v_dummy = Tensor::ones((n_kv_heads, head_dim), DType::F32, &device).unwrap();
 
     // Write to allocated blocks
-    storage.write_quantized_kv_token(0, b0, 0, &k_dummy, &v_dummy).unwrap();
-    storage.write_quantized_kv_token(0, b1, 0, &k_dummy, &v_dummy).unwrap();
-    storage.write_quantized_kv_token(0, b2, 0, &k_dummy, &v_dummy).unwrap();
+    storage
+        .write_quantized_kv_token(0, b0, 0, &k_dummy, &v_dummy)
+        .unwrap();
+    storage
+        .write_quantized_kv_token(0, b1, 0, &k_dummy, &v_dummy)
+        .unwrap();
+    storage
+        .write_quantized_kv_token(0, b2, 0, &k_dummy, &v_dummy)
+        .unwrap();
 
     // Reset and recycle all allocated blocks
     storage.reset_block(b0);
@@ -304,22 +290,12 @@ fn test_long_sequence_gather_and_decode_step() {
     let num_layers = 1;
 
     let mut q_storage = QuantizedKvStorage::new_int8(
-        num_layers,
-        num_blocks,
-        block_size,
-        n_kv_heads,
-        head_dim,
-        &device,
+        num_layers, num_blocks, block_size, n_kv_heads, head_dim, &device,
     )
     .unwrap();
 
     let mut fp32_storage = KvStorage::new(
-        num_layers,
-        num_blocks,
-        block_size,
-        n_kv_heads,
-        head_dim,
-        &device,
+        num_layers, num_blocks, block_size, n_kv_heads, head_dim, &device,
     )
     .unwrap();
 
@@ -336,8 +312,12 @@ fn test_long_sequence_gather_and_decode_step() {
     for t in 0..seq_len {
         let block = t / block_size;
         let offset = t % block_size;
-        q_storage.write_quantized_kv_token(0, block, offset, &k, &v).unwrap();
-        fp32_storage.write_kv_token(0, block, offset, &k, &v).unwrap();
+        q_storage
+            .write_quantized_kv_token(0, block, offset, &k, &v)
+            .unwrap();
+        fp32_storage
+            .write_kv_token(0, block, offset, &k, &v)
+            .unwrap();
     }
 
     // Measure decode gather steps

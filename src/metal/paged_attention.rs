@@ -1,6 +1,6 @@
-use metal::{Buffer, MTLSize};
 use crate::error::EngineError;
 use crate::metal::context::MetalContext;
+use metal::{Buffer, MTLSize};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,8 +91,8 @@ pub fn cpu_paged_attention(
 
             // 3. Weighted sum of V
             let out_start = (s * num_heads + h) * head_dim;
-            for t in 0..ctx_len {
-                let weight = exp_scores[t] * inv_sum;
+            for (t, &ex) in exp_scores.iter().enumerate().take(ctx_len) {
+                let weight = ex * inv_sum;
                 let b_idx = t / block_size;
                 let b_offset = t % block_size;
                 let phys_block = block_tables[s * max_num_blocks + b_idx] as usize;
@@ -112,6 +112,7 @@ pub fn cpu_paged_attention(
 }
 
 /// Dispatches fused PagedAttention v2 Metal kernel with online softmax in threadgroup memory.
+#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_paged_attention_v2_buffer(
     ctx: &MetalContext,
     q_buf: &Buffer,

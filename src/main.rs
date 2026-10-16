@@ -1,14 +1,17 @@
-use std::io::{self, Write};
-use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use parking_lot::Mutex;
+use std::io::{self, Write};
+use std::sync::Arc;
 
+use kanso_infer::DEFAULT_BACKEND;
 use kanso_infer::bench::create_engine_for_model_profile;
 use kanso_infer::chat::ChatSession;
 use kanso_infer::server::create_app;
-use kanso_infer::DEFAULT_BACKEND;
 #[derive(Parser, Debug)]
-#[command(name = "kanso", about = "kanso-infer: A minimalist, high-performance LLM inference engine")]
+#[command(
+    name = "kanso",
+    about = "kanso-infer: A minimalist, high-performance LLM inference engine"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -164,20 +167,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     std::process::exit(1);
                 }
             };
-            println!("Loading model from '{}' on backend '{}'...", resolved_path.display(), backend);
-            let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, candle_core::Device::Cpu)?;
+            println!(
+                "Loading model from '{}' on backend '{}'...",
+                resolved_path.display(),
+                backend
+            );
+            let mut model_instance =
+                kanso_infer::model::Model::load_gguf(&resolved_path, candle_core::Device::Cpu)?;
             model_instance.set_backend(&backend);
-            let total_blocks = ((128 + max_tokens + 15) / 16) * prompt.len().max(1);
-            let mut engine = kanso_infer::engine::Engine::new(model_instance, 8, total_blocks.max(32), 16);
+            let total_blocks = (128 + max_tokens).div_ceil(16) * prompt.len().max(1);
+            let mut engine =
+                kanso_infer::engine::Engine::new(model_instance, 8, total_blocks.max(32), 16);
 
             let tok_wrapper = kanso_infer::tokenizer::TokenizerWrapper::resolve(
                 tokenizer.as_deref(),
                 Some(&resolved_path),
-            ).ok();
+            )
+            .ok();
 
             for p in &prompt {
                 let tokens = if let Some(tok) = &tok_wrapper {
-                    tok.encode(p).unwrap_or_else(|_| p.as_bytes().iter().map(|&b| (b % 40) as u32).collect())
+                    tok.encode(p)
+                        .unwrap_or_else(|_| p.as_bytes().iter().map(|&b| (b % 40) as u32).collect())
                 } else {
                     p.as_bytes().iter().map(|&b| (b % 40) as u32).collect()
                 };
@@ -233,7 +244,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tokenizer,
         } => {
             println!("============================================================");
-            println!(" kanso-infer interactive chat session (Model: {}, Backend: {})", model, backend);
+            println!(
+                " kanso-infer interactive chat session (Model: {}, Backend: {})",
+                model, backend
+            );
             println!(" Type 'exit', 'quit' or Ctrl-D to quit. Type '/reset' to clear history.");
             println!("============================================================");
             let resolved_path = match kanso_infer::weights::resolve_model_path(&model) {
@@ -243,15 +257,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     std::process::exit(1);
                 }
             };
-            println!("Loading model from '{}' on backend '{}'...", resolved_path.display(), backend);
-            let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, candle_core::Device::Cpu)?;
+            println!(
+                "Loading model from '{}' on backend '{}'...",
+                resolved_path.display(),
+                backend
+            );
+            let mut model_instance =
+                kanso_infer::model::Model::load_gguf(&resolved_path, candle_core::Device::Cpu)?;
             model_instance.set_backend(&backend);
-            let total_blocks = ((256 + max_tokens + 15) / 16) * 4;
-            let engine = kanso_infer::engine::Engine::new(model_instance, 4, total_blocks.max(64), 16);
+            let total_blocks = (256 + max_tokens).div_ceil(16) * 4;
+            let engine =
+                kanso_infer::engine::Engine::new(model_instance, 4, total_blocks.max(64), 16);
             let tok_wrapper = kanso_infer::tokenizer::TokenizerWrapper::resolve(
                 tokenizer.as_deref(),
                 Some(&resolved_path),
-            ).ok();
+            )
+            .ok();
             let mut session = ChatSession::new_with_tokenizer(engine, Some(system), tok_wrapper);
             let stdin = io::stdin();
 
@@ -303,7 +324,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             backend,
             tokenizer: _,
         } => {
-            println!("Starting OpenAI-compatible server on http://localhost:{}...", port);
+            println!(
+                "Starting OpenAI-compatible server on http://localhost:{}...",
+                port
+            );
             println!("Model: {}, Backend: {}", model, backend);
             let resolved_path = match kanso_infer::weights::resolve_model_path(&model) {
                 Ok(p) => p,
@@ -312,8 +336,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     std::process::exit(1);
                 }
             };
-            println!("Loading model from '{}' on backend '{}'...", resolved_path.display(), backend);
-            let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, candle_core::Device::Cpu)?;
+            println!(
+                "Loading model from '{}' on backend '{}'...",
+                resolved_path.display(),
+                backend
+            );
+            let mut model_instance =
+                kanso_infer::model::Model::load_gguf(&resolved_path, candle_core::Device::Cpu)?;
             model_instance.set_backend(&backend);
             let engine = kanso_infer::engine::Engine::new(model_instance, 8, 128, 16);
 
@@ -344,7 +373,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } => {
             if let Some(ds) = eval_ppl {
                 println!("Evaluating perplexity on dataset: {}", ds);
-                let report = kanso_infer::bench::run_wikitext2_perplexity_eval(&model_type, ppl_stride)?;
+                let report =
+                    kanso_infer::bench::run_wikitext2_perplexity_eval(&model_type, ppl_stride)?;
                 let ascii_table = kanso_infer::bench::format_ascii_ppl_report(&report);
                 println!("{}", ascii_table);
 
@@ -354,15 +384,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     println!("Exported JSON perplexity report to {}", json_path);
                 }
             } else if let Some(trace_path) = trace_file {
-                let trace = if dataset.to_lowercase() == "sharegpt" || dataset.to_lowercase() == "lmsys" {
-                    let content = std::fs::read_to_string(&trace_path)?;
-                    kanso_infer::bench::parse_sharegpt_dataset(&content)?
-                } else {
-                    kanso_infer::bench::parse_trace_file(&trace_path)?
-                };
-                let max_tokens = trace.iter().map(|t| t.prompt_len + t.gen_len).max().unwrap_or(prompt_len + gen_len);
-                let mut engine = create_engine_for_model_profile(&model_type, &backend, trace.len(), max_tokens, block_size, max_running)?;
-                let report = kanso_infer::bench::run_trace_benchmark(&mut engine, &trace, !no_warmup)?;
+                let trace =
+                    if dataset.to_lowercase() == "sharegpt" || dataset.to_lowercase() == "lmsys" {
+                        let content = std::fs::read_to_string(&trace_path)?;
+                        kanso_infer::bench::parse_sharegpt_dataset(&content)?
+                    } else {
+                        kanso_infer::bench::parse_trace_file(&trace_path)?
+                    };
+                let max_tokens = trace
+                    .iter()
+                    .map(|t| t.prompt_len + t.gen_len)
+                    .max()
+                    .unwrap_or(prompt_len + gen_len);
+                let mut engine = create_engine_for_model_profile(
+                    &model_type,
+                    &backend,
+                    trace.len(),
+                    max_tokens,
+                    block_size,
+                    max_running,
+                )?;
+                let report =
+                    kanso_infer::bench::run_trace_benchmark(&mut engine, &trace, !no_warmup)?;
                 println!("{:#?}", report);
                 if let Some(json_path) = json_output {
                     let json_content = serde_json::to_string_pretty(&report)?;
@@ -377,8 +420,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let mut reports = Vec::new();
                 for &b in &batch_sizes_vec {
                     let max_tokens = prompt_len + gen_len;
-                    let mut engine = create_engine_for_model_profile(&model_type, &backend, b, max_tokens, block_size, max_running)?;
-                    let report = kanso_infer::bench::run_synthetic_benchmark(&mut engine, b, prompt_len, gen_len, !no_warmup)?;
+                    let mut engine = create_engine_for_model_profile(
+                        &model_type,
+                        &backend,
+                        b,
+                        max_tokens,
+                        block_size,
+                        max_running,
+                    )?;
+                    let report = kanso_infer::bench::run_synthetic_benchmark(
+                        &mut engine,
+                        b,
+                        prompt_len,
+                        gen_len,
+                        !no_warmup,
+                    )?;
                     println!("{:#?}", report);
                     reports.push(report);
                 }

@@ -223,8 +223,7 @@ fn test_model_forward_parity_hybrid_vs_monolithic() {
 
 #[test]
 fn test_engine_hybrid_layer_synchronization_and_decode() {
-    let mut model =
-        Model::create_mock_tiny(32, 4, 2, 2, 100).expect("failed to create mock model");
+    let mut model = Model::create_mock_tiny(32, 4, 2, 2, 100).expect("failed to create mock model");
     model.enable_ane_hybrid();
 
     let mut engine = Engine::new(model, 4, 16, 16);
@@ -253,12 +252,12 @@ fn test_decode_step_parity_hybrid_vs_monolithic() {
     model_hyb.enable_ane_hybrid();
 
     let block_size = 16;
-    let mut kv_mono = kanso_infer::kv_cache::KvStorage::new(
-        2, 4, block_size, 2, 8, &model_mono.device,
-    ).expect("kv mono");
-    let mut kv_hyb = kanso_infer::kv_cache::KvStorage::new(
-        2, 4, block_size, 2, 8, &model_hyb.device,
-    ).expect("kv hyb");
+    let mut kv_mono =
+        kanso_infer::kv_cache::KvStorage::new(2, 4, block_size, 2, 8, &model_mono.device)
+            .expect("kv mono");
+    let mut kv_hyb =
+        kanso_infer::kv_cache::KvStorage::new(2, 4, block_size, 2, 8, &model_hyb.device)
+            .expect("kv hyb");
 
     let mut bt_mono = kanso_infer::kv_cache::BlockTable::new();
     bt_mono.push_block(0);
@@ -292,13 +291,7 @@ fn test_decode_step_parity_hybrid_vs_monolithic() {
 #[test]
 fn test_adapter_input_validation_errors() {
     let model = Model::create_mock_tiny(32, 4, 2, 2, 100).expect("model");
-    let adapter = CoreMlAneAdapter::new(
-        0,
-        32,
-        64,
-        &model.weights.layers[0],
-        "cpu",
-    );
+    let adapter = CoreMlAneAdapter::new(0, 32, 64, &model.weights.layers[0], "cpu");
 
     // Empty input error
     assert!(adapter.forward_mlp(&[]).is_err());

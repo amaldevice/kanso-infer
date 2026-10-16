@@ -6,15 +6,12 @@ use kanso_infer::model::Model;
 #[test]
 fn test_incremental_decode_matches_monolithic_forward() {
     let model = Model::create_mock_tiny(
-        /* hidden_size */ 16,
-        /* num_attention_heads */ 4,
-        /* num_kv_heads */ 2,
-        /* num_layers */ 2,
-        /* vocab_size */ 50,
+        /* hidden_size */ 16, /* num_attention_heads */ 4, /* num_kv_heads */ 2,
+        /* num_layers */ 2, /* vocab_size */ 50,
     )
     .expect("failed to create mock model");
 
-    let prompt = vec![5u32];
+    let prompt = [5u32];
     let next_token = 12u32;
     let full_sequence = vec![5u32, 12u32];
 
@@ -51,8 +48,16 @@ fn test_incremental_decode_matches_monolithic_forward() {
 
     assert_eq!(incremental_logits.dims(), monolithic_logits.dims());
 
-    let mono_vec = monolithic_logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-    let incr_vec = incremental_logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let mono_vec = monolithic_logits
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let incr_vec = incremental_logits
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
 
     assert_eq!(mono_vec.len(), incr_vec.len());
     for (i, (m, inc)) in mono_vec.iter().zip(incr_vec.iter()).enumerate() {
@@ -75,12 +80,7 @@ fn test_physical_kv_cache_storage_write_and_gather() {
     let head_dim = 4;
 
     let mut kv = KvStorage::new(
-        num_layers,
-        num_blocks,
-        block_size,
-        n_kv_heads,
-        head_dim,
-        &device,
+        num_layers, num_blocks, block_size, n_kv_heads, head_dim, &device,
     )
     .expect("failed to create kv storage");
 
@@ -173,17 +173,14 @@ fn test_multiturn_generation_parity_with_reference() {
         let logits = model
             .forward_single_prompt(&reference_tokens)
             .expect("monolithic forward failed");
-        let next_tok = kanso_infer::sampler::sample_token(&logits, 0.0, 1.0, 42)
-            .expect("sampling failed");
+        let next_tok =
+            kanso_infer::sampler::sample_token(&logits, 0.0, 1.0, 42).expect("sampling failed");
         reference_tokens.push(next_tok);
     }
 
     // 2. Incremental engine generation
     let mut engine = kanso_infer::engine::Engine::new(
-        model,
-        /* max_running */ 1,
-        /* total_blocks */ 10,
-        /* block_size */ 2,
+        model, /* max_running */ 1, /* total_blocks */ 10, /* block_size */ 2,
     );
     let req_id = engine.add_request(prompt.clone(), num_tokens_to_gen);
 
@@ -200,10 +197,8 @@ fn test_multiturn_generation_parity_with_reference() {
     assert_eq!(engine_generated.len(), num_tokens_to_gen);
     let reference_generated = &reference_tokens[prompt.len()..];
     assert_eq!(
-        engine_generated,
-        reference_generated,
+        engine_generated, reference_generated,
         "Incremental decode generated tokens {:?} do not match reference {:?}",
-        engine_generated,
-        reference_generated
+        engine_generated, reference_generated
     );
 }

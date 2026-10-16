@@ -36,7 +36,7 @@ impl BlockTable {
     }
 
     pub fn required_blocks(&self, block_size: usize) -> usize {
-        (self.num_tokens + block_size - 1) / block_size
+        self.num_tokens.div_ceil(block_size)
     }
 
     pub fn rollback_blocks(
@@ -48,7 +48,7 @@ impl BlockTable {
         let needed_blocks = if target_num_tokens == 0 {
             0
         } else {
-            (target_num_tokens + block_size - 1) / block_size
+            target_num_tokens.div_ceil(block_size)
         };
         let mut freed = Vec::new();
         while self.blocks.len() > needed_blocks {

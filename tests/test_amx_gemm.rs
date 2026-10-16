@@ -144,7 +144,9 @@ fn test_model_forward_amx_backend_support() {
     // Check parity with default/cpu
     let mut cpu_model = Model::create_mock_tiny(64, 4, 2, 2, 256).expect("model creation");
     cpu_model.set_backend("cpu");
-    let logits_cpu = cpu_model.forward_single_prompt(&prompt).expect("cpu forward");
+    let logits_cpu = cpu_model
+        .forward_single_prompt(&prompt)
+        .expect("cpu forward");
 
     let vals_amx = logits_amx.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     let vals_cpu = logits_cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -195,7 +197,8 @@ fn test_amx_throughput_speedup_over_neon_large_matrices() {
         amx_gemm(m, n, k, &a, &b, &mut c_amx);
     }
     let dur_amx = t_amx.elapsed().as_secs_f64();
-    let amx_throughput_gflops = (2.0 * m as f64 * n as f64 * k as f64 * iters as f64 / dur_amx) / 1e9;
+    let amx_throughput_gflops =
+        (2.0 * m as f64 * n as f64 * k as f64 * iters as f64 / dur_amx) / 1e9;
 
     // Benchmark 1D NEON SIMD vector operations on a subset of rows to extrapolate full matrix time
     let test_rows = 30;
@@ -237,7 +240,8 @@ fn test_amx_throughput_speedup_over_neon_large_matrices() {
     }
     let neon_sample_dur = t_neon.elapsed().as_secs_f64();
     let neon_extrapolated_dur_per_iter = neon_sample_dur * (m as f64 / test_rows as f64);
-    let neon_throughput_gflops = (2.0 * m as f64 * n as f64 * k as f64 / neon_extrapolated_dur_per_iter) / 1e9;
+    let neon_throughput_gflops =
+        (2.0 * m as f64 * n as f64 * k as f64 / neon_extrapolated_dur_per_iter) / 1e9;
 
     let speedup = amx_throughput_gflops / neon_throughput_gflops;
     println!(

@@ -1,7 +1,7 @@
-use metal::{Buffer, MTLSize, ResourceRef};
 use crate::error::EngineError;
 use crate::metal::context::MetalContext;
 use crate::metal::ops::{gpu_rmsnorm_buffer, gpu_rope_buffer};
+use metal::{Buffer, MTLSize, ResourceRef};
 
 /// Dimensions for a compact transformer layer (e.g. ~350M models).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,9 @@ impl FusedLayerDimensions {
     }
 }
 
+/// Q, K, V output triple returned by fused/discrete layer helpers.
+pub type FusedQkvTriple = (Vec<f32>, Vec<f32>, Vec<f32>);
+
 /// Host-side weights for RMSNorm and QKV linear projections.
 #[derive(Debug, Clone)]
 pub struct FusedLayerWeights {
@@ -34,6 +37,7 @@ pub struct FusedLayerWeights {
 }
 
 /// Dispatches the fused RMSNorm + RoPE compute kernel in threadgroup memory.
+#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_fused_rmsnorm_rope_buffer(
     ctx: &MetalContext,
     in_buf: &Buffer,
@@ -64,10 +68,26 @@ pub fn gpu_fused_rmsnorm_rope_buffer(
     let head_dim_u32 = head_dim as u32;
     let pos_u32 = pos as u32;
 
-    encoder.set_bytes(5, std::mem::size_of::<u32>() as u64, &dim_u32 as *const _ as *const _);
-    encoder.set_bytes(6, std::mem::size_of::<u32>() as u64, &head_dim_u32 as *const _ as *const _);
-    encoder.set_bytes(7, std::mem::size_of::<u32>() as u64, &pos_u32 as *const _ as *const _);
-    encoder.set_bytes(8, std::mem::size_of::<f32>() as u64, &eps as *const _ as *const _);
+    encoder.set_bytes(
+        5,
+        std::mem::size_of::<u32>() as u64,
+        &dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        6,
+        std::mem::size_of::<u32>() as u64,
+        &head_dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        7,
+        std::mem::size_of::<u32>() as u64,
+        &pos_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        8,
+        std::mem::size_of::<f32>() as u64,
+        &eps as *const _ as *const _,
+    );
 
     let threads = (dim.next_power_of_two() as u64).clamp(32, 256);
     let threadgroup_count = MTLSize {
@@ -91,6 +111,7 @@ pub fn gpu_fused_rmsnorm_rope_buffer(
 }
 
 /// Fused RMSNorm + RoPE execution helper with host slices.
+#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_fused_rmsnorm_rope(
     ctx: &MetalContext,
     input: &[f32],
@@ -101,7 +122,11 @@ pub fn gpu_fused_rmsnorm_rope(
     pos: usize,
     eps: f32,
 ) -> Result<Vec<f32>, EngineError> {
-    assert_eq!(input.len(), weight.len(), "input and weight must have matching length");
+    assert_eq!(
+        input.len(),
+        weight.len(),
+        "input and weight must have matching length"
+    );
     let dim = input.len();
 
     let in_buf = ctx.alloc_buffer_with_data(input);
@@ -148,12 +173,20 @@ pub fn encode_linear_gemv(
 
     let in_dim_u32 = in_dim as u32;
     let out_dim_u32 = out_dim as u32;
-    encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &in_dim_u32 as *const _ as *const _);
-    encoder.set_bytes(4, std::mem::size_of::<u32>() as u64, &out_dim_u32 as *const _ as *const _);
+    encoder.set_bytes(
+        3,
+        std::mem::size_of::<u32>() as u64,
+        &in_dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        4,
+        std::mem::size_of::<u32>() as u64,
+        &out_dim_u32 as *const _ as *const _,
+    );
 
     let threads_per_group = (out_dim as u64).clamp(32, 256);
     let threadgroups = MTLSize {
-        width: ((out_dim as u64) + threads_per_group - 1) / threads_per_group,
+        width: (out_dim as u64).div_ceil(threads_per_group),
         height: 1,
         depth: 1,
     };
@@ -169,6 +202,7 @@ pub fn encode_linear_gemv(
 /// Single-encoder deep Metal fusion pipeline for a compact transformer layer.
 /// Fuses RMSNorm, QKV Linear projection, and RoPE within a single MTLComputeCommandEncoder.
 /// Internal memory barriers and threadgroup memory eliminate multi-pass CPU command buffer commit stalls.
+#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_fused_layer_single_encoder(
     ctx: &MetalContext,
     hidden_in: &[f32],
@@ -178,7 +212,7 @@ pub fn gpu_fused_layer_single_encoder(
     sin_table: &[f32],
     pos: usize,
     eps: f32,
-) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), EngineError> {
+) -> Result<FusedQkvTriple, EngineError> {
     let q_dim = dims.q_dim();
     let kv_dim = dims.kv_dim();
 
@@ -219,12 +253,36 @@ pub fn gpu_fused_layer_single_encoder(
     let head_dim_u32 = dims.head_dim as u32;
     let pos_u32 = pos as u32;
 
-    encoder.set_bytes(10, std::mem::size_of::<u32>() as u64, &hidden_dim_u32 as *const _ as *const _);
-    encoder.set_bytes(11, std::mem::size_of::<u32>() as u64, &q_dim_u32 as *const _ as *const _);
-    encoder.set_bytes(12, std::mem::size_of::<u32>() as u64, &kv_dim_u32 as *const _ as *const _);
-    encoder.set_bytes(13, std::mem::size_of::<u32>() as u64, &head_dim_u32 as *const _ as *const _);
-    encoder.set_bytes(14, std::mem::size_of::<u32>() as u64, &pos_u32 as *const _ as *const _);
-    encoder.set_bytes(15, std::mem::size_of::<f32>() as u64, &eps as *const _ as *const _);
+    encoder.set_bytes(
+        10,
+        std::mem::size_of::<u32>() as u64,
+        &hidden_dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        11,
+        std::mem::size_of::<u32>() as u64,
+        &q_dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        12,
+        std::mem::size_of::<u32>() as u64,
+        &kv_dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        13,
+        std::mem::size_of::<u32>() as u64,
+        &head_dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        14,
+        std::mem::size_of::<u32>() as u64,
+        &pos_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        15,
+        std::mem::size_of::<f32>() as u64,
+        &eps as *const _ as *const _,
+    );
 
     let threads = (dims.hidden_dim.next_power_of_two() as u64).clamp(32, 256);
     let threadgroup_count = MTLSize {
@@ -263,6 +321,7 @@ pub fn gpu_fused_layer_single_encoder(
 /// Discrete multi-encoder execution that executes RMSNorm, QKV Linear GEMVs, and RoPE
 /// using separate command buffers / command encoders and CPU commit-and-wait stalls.
 /// Used as ground truth numerical and performance baseline.
+#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_discrete_layer_multi_encoder(
     ctx: &MetalContext,
     hidden_in: &[f32],
@@ -272,7 +331,7 @@ pub fn gpu_discrete_layer_multi_encoder(
     sin_table: &[f32],
     pos: usize,
     eps: f32,
-) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), EngineError> {
+) -> Result<FusedQkvTriple, EngineError> {
     let q_dim = dims.q_dim();
     let kv_dim = dims.kv_dim();
 
@@ -292,18 +351,51 @@ pub fn gpu_discrete_layer_multi_encoder(
     let sin_buf = ctx.alloc_buffer_with_data(sin_table);
 
     // 1. Pass 1: RMSNorm in separate command buffer
-    gpu_rmsnorm_buffer(ctx, &in_buf, &norm_w_buf, &normed_buf, 1, dims.hidden_dim, eps)?;
+    gpu_rmsnorm_buffer(
+        ctx,
+        &in_buf,
+        &norm_w_buf,
+        &normed_buf,
+        1,
+        dims.hidden_dim,
+        eps,
+    )?;
 
     // 2. Pass 2: Linear GEMV projections in separate command buffer
-    let gemv_pipeline = ctx.pipelines.get("linear_gemv").ok_or_else(|| {
-        EngineError::Metal("Pipeline 'linear_gemv' not found in cache".into())
-    })?;
+    let gemv_pipeline = ctx
+        .pipelines
+        .get("linear_gemv")
+        .ok_or_else(|| EngineError::Metal("Pipeline 'linear_gemv' not found in cache".into()))?;
 
     let cmd2 = ctx.queue.new_command_buffer();
     let enc2 = cmd2.new_compute_command_encoder();
-    encode_linear_gemv(enc2, gemv_pipeline, &normed_buf, &w_q_buf, &q_buf, dims.hidden_dim, q_dim);
-    encode_linear_gemv(enc2, gemv_pipeline, &normed_buf, &w_k_buf, &k_buf, dims.hidden_dim, kv_dim);
-    encode_linear_gemv(enc2, gemv_pipeline, &normed_buf, &w_v_buf, &v_buf, dims.hidden_dim, kv_dim);
+    encode_linear_gemv(
+        enc2,
+        gemv_pipeline,
+        &normed_buf,
+        &w_q_buf,
+        &q_buf,
+        dims.hidden_dim,
+        q_dim,
+    );
+    encode_linear_gemv(
+        enc2,
+        gemv_pipeline,
+        &normed_buf,
+        &w_k_buf,
+        &k_buf,
+        dims.hidden_dim,
+        kv_dim,
+    );
+    encode_linear_gemv(
+        enc2,
+        gemv_pipeline,
+        &normed_buf,
+        &w_v_buf,
+        &v_buf,
+        dims.hidden_dim,
+        kv_dim,
+    );
     enc2.end_encoding();
     cmd2.commit();
     cmd2.wait_until_completed();
@@ -330,6 +422,7 @@ pub fn gpu_discrete_layer_multi_encoder(
 
 /// Pipeline encoder that chains multi-step kernels within a single command encoder
 /// using Metal memory barriers (`memory_barrier_with_resources`).
+#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_chained_pipeline_single_encoder(
     ctx: &MetalContext,
     hidden_in: &[f32],
@@ -339,7 +432,7 @@ pub fn gpu_chained_pipeline_single_encoder(
     sin_table: &[f32],
     pos: usize,
     eps: f32,
-) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), EngineError> {
+) -> Result<FusedQkvTriple, EngineError> {
     let q_dim = dims.q_dim();
     let kv_dim = dims.kv_dim();
 
@@ -358,15 +451,18 @@ pub fn gpu_chained_pipeline_single_encoder(
     let cos_buf = ctx.alloc_buffer_with_data(cos_table);
     let sin_buf = ctx.alloc_buffer_with_data(sin_table);
 
-    let rmsnorm_pipeline = ctx.pipelines.get("rmsnorm").ok_or_else(|| {
-        EngineError::Metal("Pipeline 'rmsnorm' not found in cache".into())
-    })?;
-    let gemv_pipeline = ctx.pipelines.get("linear_gemv").ok_or_else(|| {
-        EngineError::Metal("Pipeline 'linear_gemv' not found in cache".into())
-    })?;
-    let rope_pipeline = ctx.pipelines.get("rope").ok_or_else(|| {
-        EngineError::Metal("Pipeline 'rope' not found in cache".into())
-    })?;
+    let rmsnorm_pipeline = ctx
+        .pipelines
+        .get("rmsnorm")
+        .ok_or_else(|| EngineError::Metal("Pipeline 'rmsnorm' not found in cache".into()))?;
+    let gemv_pipeline = ctx
+        .pipelines
+        .get("linear_gemv")
+        .ok_or_else(|| EngineError::Metal("Pipeline 'linear_gemv' not found in cache".into()))?;
+    let rope_pipeline = ctx
+        .pipelines
+        .get("rope")
+        .ok_or_else(|| EngineError::Metal("Pipeline 'rope' not found in cache".into()))?;
 
     let command_buffer = ctx.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -377,12 +473,28 @@ pub fn gpu_chained_pipeline_single_encoder(
     encoder.set_buffer(1, Some(&norm_w_buf), 0);
     encoder.set_buffer(2, Some(&normed_buf), 0);
     let dim_u32 = dims.hidden_dim as u32;
-    encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &dim_u32 as *const _ as *const _);
-    encoder.set_bytes(4, std::mem::size_of::<f32>() as u64, &eps as *const _ as *const _);
+    encoder.set_bytes(
+        3,
+        std::mem::size_of::<u32>() as u64,
+        &dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        4,
+        std::mem::size_of::<f32>() as u64,
+        &eps as *const _ as *const _,
+    );
     let threads = (dims.hidden_dim.next_power_of_two() as u64).clamp(32, 256);
     encoder.dispatch_thread_groups(
-        MTLSize { width: 1, height: 1, depth: 1 },
-        MTLSize { width: threads, height: 1, depth: 1 },
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        },
     );
 
     // Internal memory barrier on normed_buf before GEMV reads it
@@ -390,9 +502,33 @@ pub fn gpu_chained_pipeline_single_encoder(
     encoder.memory_barrier_with_resources(&[normed_res]);
 
     // 2. QKV Linear GEMVs
-    encode_linear_gemv(encoder, gemv_pipeline, &normed_buf, &w_q_buf, &q_buf, dims.hidden_dim, q_dim);
-    encode_linear_gemv(encoder, gemv_pipeline, &normed_buf, &w_k_buf, &k_buf, dims.hidden_dim, kv_dim);
-    encode_linear_gemv(encoder, gemv_pipeline, &normed_buf, &w_v_buf, &v_buf, dims.hidden_dim, kv_dim);
+    encode_linear_gemv(
+        encoder,
+        gemv_pipeline,
+        &normed_buf,
+        &w_q_buf,
+        &q_buf,
+        dims.hidden_dim,
+        q_dim,
+    );
+    encode_linear_gemv(
+        encoder,
+        gemv_pipeline,
+        &normed_buf,
+        &w_k_buf,
+        &k_buf,
+        dims.hidden_dim,
+        kv_dim,
+    );
+    encode_linear_gemv(
+        encoder,
+        gemv_pipeline,
+        &normed_buf,
+        &w_v_buf,
+        &v_buf,
+        dims.hidden_dim,
+        kv_dim,
+    );
 
     // Internal memory barrier on Q and K buffers before RoPE rotates them
     let q_res: &ResourceRef = &q_buf;
@@ -406,22 +542,46 @@ pub fn gpu_chained_pipeline_single_encoder(
     encoder.set_buffer(2, Some(&sin_buf), 0);
     let head_dim_u32 = dims.head_dim as u32;
     let pos_u32 = pos as u32;
-    encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &head_dim_u32 as *const _ as *const _);
-    encoder.set_bytes(4, std::mem::size_of::<u32>() as u64, &pos_u32 as *const _ as *const _);
+    encoder.set_bytes(
+        3,
+        std::mem::size_of::<u32>() as u64,
+        &head_dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        4,
+        std::mem::size_of::<u32>() as u64,
+        &pos_u32 as *const _ as *const _,
+    );
     let total_q_threads = (q_dim / 2) as u64;
-    let q_group_width = total_q_threads.min(256).max(1);
+    let q_group_width = total_q_threads.clamp(1, 256);
     encoder.dispatch_threads(
-        MTLSize { width: total_q_threads, height: 1, depth: 1 },
-        MTLSize { width: q_group_width, height: 1, depth: 1 },
+        MTLSize {
+            width: total_q_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: q_group_width,
+            height: 1,
+            depth: 1,
+        },
     );
 
     // RoPE on K
     encoder.set_buffer(0, Some(&k_buf), 0);
     let total_k_threads = (kv_dim / 2) as u64;
-    let k_group_width = total_k_threads.min(256).max(1);
+    let k_group_width = total_k_threads.clamp(1, 256);
     encoder.dispatch_threads(
-        MTLSize { width: total_k_threads, height: 1, depth: 1 },
-        MTLSize { width: k_group_width, height: 1, depth: 1 },
+        MTLSize {
+            width: total_k_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: k_group_width,
+            height: 1,
+            depth: 1,
+        },
     );
 
     encoder.end_encoding();

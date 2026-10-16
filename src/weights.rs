@@ -1,9 +1,9 @@
-use candle_core::Tensor;
-use std::path::{Path, PathBuf};
-use candle_core::Device;
-use candle_core::quantized::gguf_file;
 use crate::config::{ModelArchitecture, ModelConfig};
 use crate::error::EngineError;
+use candle_core::Device;
+use candle_core::Tensor;
+use candle_core::quantized::gguf_file;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub struct LayerWeights {
@@ -89,17 +89,17 @@ pub fn resolve_model_path(input: &str) -> Result<PathBuf, EngineError> {
             if let Ok(entries) = std::fs::read_dir(&hf_hub) {
                 for entry in entries.flatten() {
                     let snapshots = entry.path().join("snapshots");
-                    if snapshots.is_dir() {
-                        if let Ok(snaps) = std::fs::read_dir(snapshots) {
-                            for snap in snaps.flatten() {
-                                let target = snap.path().join(filename);
-                                if target.is_file() {
-                                    return Ok(target);
-                                }
-                                let target_gguf = snap.path().join(format!("{}.gguf", filename));
-                                if target_gguf.is_file() {
-                                    return Ok(target_gguf);
-                                }
+                    if snapshots.is_dir()
+                        && let Ok(snaps) = std::fs::read_dir(snapshots)
+                    {
+                        for snap in snaps.flatten() {
+                            let target = snap.path().join(filename);
+                            if target.is_file() {
+                                return Ok(target);
+                            }
+                            let target_gguf = snap.path().join(format!("{}.gguf", filename));
+                            if target_gguf.is_file() {
+                                return Ok(target_gguf);
                             }
                         }
                     }
@@ -118,10 +118,17 @@ pub fn resolve_model_path(input: &str) -> Result<PathBuf, EngineError> {
 
 impl ModelWeights {
     /// Loads weights and architecture hyperparameters from an authentic GGUF file.
-    pub fn load_from_gguf(path: &Path, device: &Device) -> Result<(Self, ModelConfig), EngineError> {
+    pub fn load_from_gguf(
+        path: &Path,
+        device: &Device,
+    ) -> Result<(Self, ModelConfig), EngineError> {
         let mut file = std::fs::File::open(path)?;
         let content = gguf_file::Content::read(&mut file).map_err(|e| {
-            EngineError::Config(format!("Failed to parse GGUF file {}: {}", path.display(), e))
+            EngineError::Config(format!(
+                "Failed to parse GGUF file {}: {}",
+                path.display(),
+                e
+            ))
         })?;
 
         let metadata = |key: &str| -> Result<&gguf_file::Value, EngineError> {
@@ -132,14 +139,18 @@ impl ModelWeights {
         };
 
         let mut load_tensor = |name: &str| -> Result<Tensor, EngineError> {
-            let tensor = content
-                .tensor(&mut file, name, device)
-                .map_err(|e| EngineError::Config(format!("Failed to load tensor '{}': {}", name, e)))?;
+            let tensor = content.tensor(&mut file, name, device).map_err(|e| {
+                EngineError::Config(format!("Failed to load tensor '{}': {}", name, e))
+            })?;
             Ok(tensor.dequantize(device)?)
         };
 
         let arch = metadata("general.architecture")
-            .and_then(|v| v.to_string().map(|s| s.clone()).map_err(|e| EngineError::Config(e.to_string())))
+            .and_then(|v| {
+                v.to_string()
+                    .cloned()
+                    .map_err(|e| EngineError::Config(e.to_string()))
+            })
             .unwrap_or_else(|_| "llama".to_string());
         let prefix = match arch.as_str() {
             "granite" => "granite",
@@ -147,10 +158,13 @@ impl ModelWeights {
         };
 
         let num_layers = metadata(&format!("{}.block_count", prefix))?.to_u32()? as usize;
-        let num_attention_heads = metadata(&format!("{}.attention.head_count", prefix))?.to_u32()? as usize;
-        let num_kv_heads = metadata(&format!("{}.attention.head_count_kv", prefix))?.to_u32()? as usize;
+        let num_attention_heads =
+            metadata(&format!("{}.attention.head_count", prefix))?.to_u32()? as usize;
+        let num_kv_heads =
+            metadata(&format!("{}.attention.head_count_kv", prefix))?.to_u32()? as usize;
         let hidden_size = metadata(&format!("{}.embedding_length", prefix))?.to_u32()? as usize;
-        let intermediate_size = metadata(&format!("{}.feed_forward_length", prefix))?.to_u32()? as usize;
+        let intermediate_size =
+            metadata(&format!("{}.feed_forward_length", prefix))?.to_u32()? as usize;
         let rms_norm_eps = metadata(&format!("{}.attention.layer_norm_rms_epsilon", prefix))
             .map(|v| v.to_f32().unwrap_or(1e-5) as f64)
             .unwrap_or(1e-5);

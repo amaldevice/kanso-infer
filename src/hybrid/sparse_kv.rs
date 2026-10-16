@@ -7,17 +7,13 @@ pub struct SparseBlockTable {
 }
 
 impl SparseBlockTable {
-    pub fn allocate_initial(
-        config: &ModelConfig,
-        pool: &mut BlockPool,
-        num_tokens: usize,
-    ) -> Self {
+    pub fn allocate_initial(config: &ModelConfig, pool: &mut BlockPool, num_tokens: usize) -> Self {
         let attention_layers = match &config.attention_layers {
             Some(layers) => layers.clone(),
             None => (0..config.num_hidden_layers).collect(),
         };
 
-        let blocks_per_layer = (num_tokens + config.block_size - 1) / config.block_size;
+        let blocks_per_layer = num_tokens.div_ceil(config.block_size);
         let mut layer_blocks = Vec::with_capacity(attention_layers.len());
 
         for _ in 0..attention_layers.len() {

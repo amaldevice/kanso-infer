@@ -1,5 +1,5 @@
-use candle_core::{DType, Device, Tensor};
 use crate::error::EngineError;
+use candle_core::{DType, Device, Tensor};
 
 #[cfg(target_os = "macos")]
 #[link(name = "Accelerate", kind = "framework")]

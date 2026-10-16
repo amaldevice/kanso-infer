@@ -1,17 +1,17 @@
-use std::sync::Arc;
-use parking_lot::Mutex;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
-};
 use crate::engine::Engine;
 use crate::server::dto::{
     ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
     HealthResponse,
 };
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -23,10 +23,7 @@ pub fn create_app(engine: Arc<Mutex<Engine>>) -> Router {
     create_app_with_queue_limit(engine, Some(64))
 }
 
-pub fn create_app_with_queue_limit(
-    engine: Arc<Mutex<Engine>>,
-    max_queue: Option<usize>,
-) -> Router {
+pub fn create_app_with_queue_limit(engine: Arc<Mutex<Engine>>, max_queue: Option<usize>) -> Router {
     let state = AppState {
         engine,
         max_queue_size: max_queue,
@@ -53,7 +50,7 @@ async fn chat_completions_handler(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let max_tokens = req.max_tokens.unwrap_or(16);
-    
+
     // Minimal mock tokenization: convert characters to token IDs
     let prompt_text = req
         .messages
@@ -61,7 +58,7 @@ async fn chat_completions_handler(
         .map(|m| m.content.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    
+
     let prompt_tokens: Vec<u32> = prompt_text
         .as_bytes()
         .iter()
@@ -78,9 +75,7 @@ async fn chat_completions_handler(
                     StatusCode::TOO_MANY_REQUESTS,
                     format!(
                         "Engine queue full: {} waiting / {} active requests exceeds capacity limit of {}",
-                        waiting,
-                        active,
-                        limit
+                        waiting, active, limit
                     ),
                 ));
             }
@@ -118,7 +113,10 @@ async fn chat_completions_handler(
         }
         tokio::task::yield_now().await;
     }
-    let response_text = format!("Response generated with {} tokens", generated_token_ids.len());
+    let response_text = format!(
+        "Response generated with {} tokens",
+        generated_token_ids.len()
+    );
 
     let resp = ChatCompletionResponse {
         id: format!("chatcmpl-{}", request_id),

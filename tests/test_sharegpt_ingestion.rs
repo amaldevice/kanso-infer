@@ -1,6 +1,6 @@
 use kanso_infer::bench::{
-    format_chatml_prompt, parse_sharegpt_dataset, run_trace_benchmark, tokenize_chatml,
-    ShareGptTurn,
+    ShareGptTurn, format_chatml_prompt, parse_sharegpt_dataset, run_trace_benchmark,
+    tokenize_chatml,
 };
 use kanso_infer::engine::Engine;
 use kanso_infer::model::Model;
@@ -20,15 +20,25 @@ fn test_sharegpt_conversation_parsing() {
     ]"#;
 
     let trace = parse_sharegpt_dataset(json_data).expect("Failed to parse ShareGPT dataset");
-    assert_eq!(trace.len(), 2, "2 human turns should produce 2 TraceEntry requests");
+    assert_eq!(
+        trace.len(),
+        2,
+        "2 human turns should produce 2 TraceEntry requests"
+    );
 
     // Both entries must have non-zero lengths and tokens
     assert!(trace[0].prompt_len > 0);
     assert!(trace[0].gen_len > 0);
     assert!(trace[0].prompt_tokens.is_some());
-    assert_eq!(trace[0].prompt_tokens.as_ref().unwrap().len(), trace[0].prompt_len);
+    assert_eq!(
+        trace[0].prompt_tokens.as_ref().unwrap().len(),
+        trace[0].prompt_len
+    );
 
-    assert!(trace[1].prompt_len > trace[0].prompt_len, "Turn 2 prompt must include Turn 1 history");
+    assert!(
+        trace[1].prompt_len > trace[0].prompt_len,
+        "Turn 2 prompt must include Turn 1 history"
+    );
     assert!(trace[1].gen_len > 0);
     assert!(trace[1].prompt_tokens.is_some());
 
@@ -53,7 +63,9 @@ fn test_chatml_formatting_and_token_stream() {
     ];
 
     let formatted = format_chatml_prompt(&turns);
-    assert!(formatted.contains("<|im_start|>system\nYou are a helpful coding assistant.<|im_end|>\n"));
+    assert!(
+        formatted.contains("<|im_start|>system\nYou are a helpful coding assistant.<|im_end|>\n")
+    );
     assert!(formatted.contains("<|im_start|>user\nWrite hello world in Rust.<|im_end|>\n"));
     assert!(formatted.ends_with("<|im_start|>assistant\n"));
 
@@ -97,12 +109,16 @@ fn test_sharegpt_prefix_cache_hit_rate_above_60_percent() {
     let trace = parse_sharegpt_dataset(json_data).expect("Failed to parse ShareGPT dataset");
     assert_eq!(trace.len(), 6);
 
-    let _max_tokens = trace.iter().map(|t| t.prompt_len + t.gen_len).max().unwrap_or(256);
+    let _max_tokens = trace
+        .iter()
+        .map(|t| t.prompt_len + t.gen_len)
+        .max()
+        .unwrap_or(256);
     let model = Model::create_mock_tiny(64, 4, 2, 2, 256).expect("Model creation failed");
     let mut engine = Engine::new(model, 16, 256, 16);
 
-    let report = run_trace_benchmark(&mut engine, &trace, false)
-        .expect("Trace benchmark execution failed");
+    let report =
+        run_trace_benchmark(&mut engine, &trace, false).expect("Trace benchmark execution failed");
 
     assert_eq!(report.num_requests, 6);
     assert!(

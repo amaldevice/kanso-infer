@@ -1,5 +1,5 @@
-use candle_core::Tensor;
 use crate::error::EngineError;
+use candle_core::Tensor;
 use rand::Rng;
 
 pub fn sample_token(

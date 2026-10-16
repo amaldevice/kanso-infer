@@ -1,10 +1,10 @@
-use metal::{Buffer, MTLSize};
 use crate::error::EngineError;
 use crate::metal::context::MetalContext;
+use metal::{Buffer, MTLSize};
 
 pub use crate::metal::paged_attention::{
-    cpu_paged_attention, gpu_paged_attention_v2, gpu_paged_attention_v2_buffer,
-    PagedAttentionParams,
+    PagedAttentionParams, cpu_paged_attention, gpu_paged_attention_v2,
+    gpu_paged_attention_v2_buffer,
 };
 
 pub fn cpu_rmsnorm(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
@@ -39,7 +39,11 @@ pub fn cpu_rope(
 ) {
     let half_dim = head_dim / 2;
     let total_elements = q_k.len();
-    assert_eq!(total_elements % head_dim, 0, "total elements must be divisible by head_dim");
+    assert_eq!(
+        total_elements % head_dim,
+        0,
+        "total elements must be divisible by head_dim"
+    );
     let num_heads = total_elements / head_dim;
 
     for h in 0..num_heads {
@@ -66,9 +70,10 @@ pub fn gpu_rmsnorm_buffer(
     dim: usize,
     eps: f32,
 ) -> Result<(), EngineError> {
-    let pipeline = ctx.pipelines.get("rmsnorm").ok_or_else(|| {
-        EngineError::Metal("Pipeline 'rmsnorm' not found in cache".into())
-    })?;
+    let pipeline = ctx
+        .pipelines
+        .get("rmsnorm")
+        .ok_or_else(|| EngineError::Metal("Pipeline 'rmsnorm' not found in cache".into()))?;
 
     let command_buffer = ctx.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -79,8 +84,16 @@ pub fn gpu_rmsnorm_buffer(
     encoder.set_buffer(2, Some(out_buf), 0);
 
     let dim_u32 = dim as u32;
-    encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &dim_u32 as *const _ as *const _);
-    encoder.set_bytes(4, std::mem::size_of::<f32>() as u64, &eps as *const _ as *const _);
+    encoder.set_bytes(
+        3,
+        std::mem::size_of::<u32>() as u64,
+        &dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        4,
+        std::mem::size_of::<f32>() as u64,
+        &eps as *const _ as *const _,
+    );
 
     let threads = (dim.next_power_of_two() as u64).clamp(32, 256);
     let threadgroup_count = MTLSize {
@@ -136,9 +149,10 @@ pub fn gpu_rope_buffer(
     head_dim: usize,
     pos: usize,
 ) -> Result<(), EngineError> {
-    let pipeline = ctx.pipelines.get("rope").ok_or_else(|| {
-        EngineError::Metal("Pipeline 'rope' not found in cache".into())
-    })?;
+    let pipeline = ctx
+        .pipelines
+        .get("rope")
+        .ok_or_else(|| EngineError::Metal("Pipeline 'rope' not found in cache".into()))?;
 
     let command_buffer = ctx.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -150,11 +164,19 @@ pub fn gpu_rope_buffer(
 
     let head_dim_u32 = head_dim as u32;
     let pos_u32 = pos as u32;
-    encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &head_dim_u32 as *const _ as *const _);
-    encoder.set_bytes(4, std::mem::size_of::<u32>() as u64, &pos_u32 as *const _ as *const _);
+    encoder.set_bytes(
+        3,
+        std::mem::size_of::<u32>() as u64,
+        &head_dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        4,
+        std::mem::size_of::<u32>() as u64,
+        &pos_u32 as *const _ as *const _,
+    );
 
     let total_threads = (total_elements / 2) as u64;
-    let threadgroup_width = (total_threads.min(256)).max(1);
+    let threadgroup_width = total_threads.clamp(1, 256);
     let threads_per_grid = MTLSize {
         width: total_threads,
         height: 1,
@@ -203,9 +225,10 @@ pub fn gpu_silu_gate_multiply_buffer(
     out_buf: &Buffer,
     len: usize,
 ) -> Result<(), EngineError> {
-    let pipeline = ctx.pipelines.get("silu_gate").ok_or_else(|| {
-        EngineError::Metal("Pipeline 'silu_gate' not found in cache".into())
-    })?;
+    let pipeline = ctx
+        .pipelines
+        .get("silu_gate")
+        .ok_or_else(|| EngineError::Metal("Pipeline 'silu_gate' not found in cache".into()))?;
 
     let command_buffer = ctx.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -216,7 +239,7 @@ pub fn gpu_silu_gate_multiply_buffer(
     encoder.set_buffer(2, Some(out_buf), 0);
 
     let total_threads = len as u64;
-    let threadgroup_width = (total_threads.min(256)).max(1);
+    let threadgroup_width = total_threads.clamp(1, 256);
     let threads_per_grid = MTLSize {
         width: total_threads,
         height: 1,

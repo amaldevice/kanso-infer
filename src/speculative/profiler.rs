@@ -1,6 +1,6 @@
-use std::time::Duration;
-use serde::{Deserialize, Serialize};
 use crate::speculative::verifier::VerificationResult;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// Standalone metrics snapshot for speculative decoding performance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -259,7 +259,8 @@ impl SpeculativeProfiler {
         &self,
         autoregressive_time: Duration,
     ) -> Result<String, serde_json::Error> {
-        self.report_with_speedup(autoregressive_time).to_json_pretty()
+        self.report_with_speedup(autoregressive_time)
+            .to_json_pretty()
     }
 
     /// Formats human-readable report.

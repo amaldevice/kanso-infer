@@ -54,16 +54,27 @@ impl ChatSession {
     pub fn format_prompt(&self) -> (String, Vec<u32>) {
         let mut prompt_text = String::new();
         for msg in &self.history {
-            prompt_text.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content));
+            prompt_text.push_str(&format!(
+                "<|im_start|>{}\n{}<|im_end|>\n",
+                msg.role, msg.content
+            ));
         }
         prompt_text.push_str("<|im_start|>assistant\n");
 
         let tokens: Vec<u32> = if let Some(tok) = &self.tokenizer {
             tok.encode(&prompt_text).unwrap_or_else(|_| {
-                prompt_text.as_bytes().iter().map(|&b| (b % 40) as u32).collect()
+                prompt_text
+                    .as_bytes()
+                    .iter()
+                    .map(|&b| (b % 40) as u32)
+                    .collect()
             })
         } else {
-            prompt_text.as_bytes().iter().map(|&b| (b % 40) as u32).collect()
+            prompt_text
+                .as_bytes()
+                .iter()
+                .map(|&b| (b % 40) as u32)
+                .collect()
         };
 
         (prompt_text, tokens)
