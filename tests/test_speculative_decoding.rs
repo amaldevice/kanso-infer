@@ -4,7 +4,7 @@ use kanso_infer::model::Model;
 use kanso_infer::speculative::SpeculativeEngine;
 
 #[test]
-#[ignore = "#57: monolithic-vs-incremental forward parity is #43/#44 territory; re-enable after the forward-path fix"]
+#[ignore = "KNOWN-FAIL #43 (tracking: amaldevice/kanso-infer#43#issuecomment-6216433916): monolithic-vs-verify divergen pada mock random; re-enable penuh setelah fix #43"]
 fn test_draft_candidate_verification_acceptance_and_rejection() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     let mut engine = Engine::new(model, 1, 20, 4);
@@ -112,7 +112,7 @@ fn test_atomic_rollback_and_zero_memory_leak() {
 }
 
 #[test]
-#[ignore = "#57: monolithic-vs-incremental forward parity is #43/#44 territory; re-enable after the forward-path fix"]
+#[ignore = "KNOWN-FAIL #43 (tracking: amaldevice/kanso-infer#43#issuecomment-6216433916): monolithic-vs-verify divergen pada mock random; re-enable penuh setelah fix #43"]
 fn test_greedy_token_parity_with_autoregressive_generation() {
     let prompt = vec![5, 12, 19, 23];
     let num_tokens_to_generate = 8;
@@ -164,7 +164,7 @@ fn test_greedy_token_parity_with_autoregressive_generation() {
 }
 
 #[test]
-#[ignore = "#57: monolithic-vs-incremental forward parity is #43/#44 territory; re-enable after the forward-path fix"]
+#[ignore = "KNOWN-FAIL #43 (tracking: amaldevice/kanso-infer#43#issuecomment-6216433916): monolithic-vs-verify divergen pada mock random; re-enable penuh setelah fix #43"]
 fn test_speculative_multi_candidate_acceptance_rate_greater_than_one() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     let mut engine = Engine::new(model, 1, 30, 4);
@@ -204,7 +204,7 @@ fn test_speculative_multi_candidate_acceptance_rate_greater_than_one() {
 }
 
 #[test]
-#[ignore = "#57: monolithic-vs-incremental forward parity is #43/#44 territory; re-enable after the forward-path fix"]
+#[ignore = "KNOWN-FAIL #43 (tracking: amaldevice/kanso-infer#43#issuecomment-6216433916): monolithic-vs-verify divergen pada mock random; re-enable penuh setelah fix #43"]
 fn test_partial_candidate_acceptance_and_kv_rollback() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     // Small block_size=2 so adding candidates triggers block allocation
@@ -243,7 +243,7 @@ fn test_partial_candidate_acceptance_and_kv_rollback() {
 }
 
 #[test]
-#[ignore = "#57: monolithic-vs-incremental forward parity is #43/#44 territory; re-enable after the forward-path fix"]
+#[ignore = "KNOWN-FAIL #43 (tracking: amaldevice/kanso-infer#43#issuecomment-6216433916): monolithic-vs-verify divergen pada mock random; re-enable penuh setelah fix #43"]
 fn test_speculative_parity_with_adversarial_draft_candidates() {
     let prompt = vec![3, 7, 11];
     let num_tokens = 6;

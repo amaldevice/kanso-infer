@@ -9,6 +9,9 @@ use std::path::PathBuf;
 
 use kanso_infer::model::Model;
 
+mod common;
+use common::{last_token_logits, max_abs_diff};
+
 const FIXTURE: &str = "tests/fixtures/golden_logits.json";
 const TOP_K: usize = 5;
 const TOL: f32 = 1e-4;
@@ -25,16 +28,6 @@ fn prompts() -> Vec<Vec<u32>> {
     vec![vec![1, 2, 3, 4], vec![7, 7, 7, 7], vec![0, 49, 25, 13, 42]]
 }
 
-fn logits_of(model: &Model, prompt: &[u32]) -> Vec<f32> {
-    model
-        .forward_single_prompt(prompt)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap()
-}
-
 fn top_k(logits: &[f32], k: usize) -> Vec<u32> {
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     idx.sort_by(|&a, &b| {
@@ -43,13 +36,6 @@ fn top_k(logits: &[f32], k: usize) -> Vec<u32> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     idx.into_iter().take(k).map(|i| i as u32).collect()
-}
-
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0f32, f32::max)
 }
 
 #[test]
@@ -62,7 +48,7 @@ fn test_golden_logits_full_prefill() {
             .map(|t| t.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        current.insert(key, logits_of(&model, &p));
+        current.insert(key, last_token_logits(&model, &p));
     }
 
     let path = fixture_path();
@@ -106,7 +92,7 @@ fn test_golden_logits_full_prefill() {
 
 #[test]
 fn test_mock_weights_are_deterministic() {
-    let a = logits_of(&mock(), &[3, 1, 4, 1, 5]);
-    let b = logits_of(&mock(), &[3, 1, 4, 1, 5]);
+    let a = last_token_logits(&mock(), &[3, 1, 4, 1, 5]);
+    let b = last_token_logits(&mock(), &[3, 1, 4, 1, 5]);
     assert_eq!(a, b, "fixed-seed mock must be bit-deterministic");
 }

@@ -20,6 +20,16 @@ pub struct Model {
 /// via Box-Muller from a seeded `StdRng` and build tensors with `from_vec`.
 const MOCK_SEED: u64 = 0x5EED_0057;
 
+/// Builds a tensor filled with standard-normal samples (Box-Muller) from a seeded RNG.
+fn mock_randn_tensor(
+    rng: &mut StdRng,
+    dev: &Device,
+    shape: Vec<usize>,
+) -> Result<Tensor, EngineError> {
+    let n: usize = shape.iter().product();
+    Ok(Tensor::from_vec(mock_randn_vec(n, rng), shape, dev)?)
+}
+
 /// Draws `n` standard-normal samples (Box-Muller) from a seeded RNG.
 fn mock_randn_vec(n: usize, rng: &mut StdRng) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);
@@ -112,10 +122,7 @@ impl Model {
         let head_dim = hidden_size / num_attention_heads;
         let intermediate_size = hidden_size * 2;
         let mut rng = StdRng::seed_from_u64(MOCK_SEED);
-        let mut randn = |shape: Vec<usize>| -> Result<Tensor, EngineError> {
-            let n: usize = shape.iter().product();
-            Ok(Tensor::from_vec(mock_randn_vec(n, &mut rng), shape, &dev)?)
-        };
+        let mut randn = |shape: Vec<usize>| mock_randn_tensor(&mut rng, &dev, shape);
 
         let mut layers = Vec::new();
         for _ in 0..num_layers {
@@ -134,16 +141,10 @@ impl Model {
         }
 
         let weights = ModelWeights {
-            embed_tokens: {
-                let n = vocab_size * hidden_size;
-                Tensor::from_vec(mock_randn_vec(n, &mut rng), (vocab_size, hidden_size), &dev)?
-            },
+            embed_tokens: mock_randn_tensor(&mut rng, &dev, vec![vocab_size, hidden_size])?,
             layers,
             norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
-            lm_head: {
-                let n = vocab_size * hidden_size;
-                Tensor::from_vec(mock_randn_vec(n, &mut rng), (vocab_size, hidden_size), &dev)?
-            },
+            lm_head: mock_randn_tensor(&mut rng, &dev, vec![vocab_size, hidden_size])?,
         };
 
         let config = ModelConfig {
@@ -174,10 +175,7 @@ impl Model {
         let num_layers = config.num_hidden_layers.min(2);
         let vocab_size = config.vocab_size.min(1000);
         let mut rng = StdRng::seed_from_u64(MOCK_SEED);
-        let mut randn = |shape: Vec<usize>| -> Result<Tensor, EngineError> {
-            let n: usize = shape.iter().product();
-            Ok(Tensor::from_vec(mock_randn_vec(n, &mut rng), shape, &dev)?)
-        };
+        let mut randn = |shape: Vec<usize>| mock_randn_tensor(&mut rng, &dev, shape);
 
         let mut layers = Vec::new();
         for _ in 0..num_layers {
@@ -196,16 +194,10 @@ impl Model {
         }
 
         let weights = ModelWeights {
-            embed_tokens: {
-                let n = vocab_size * hidden_size;
-                Tensor::from_vec(mock_randn_vec(n, &mut rng), (vocab_size, hidden_size), &dev)?
-            },
+            embed_tokens: mock_randn_tensor(&mut rng, &dev, vec![vocab_size, hidden_size])?,
             layers,
             norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
-            lm_head: {
-                let n = vocab_size * hidden_size;
-                Tensor::from_vec(mock_randn_vec(n, &mut rng), (vocab_size, hidden_size), &dev)?
-            },
+            lm_head: mock_randn_tensor(&mut rng, &dev, vec![vocab_size, hidden_size])?,
         };
 
         let mut cfg = config.clone();

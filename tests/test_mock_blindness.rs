@@ -5,28 +5,18 @@
 
 use kanso_infer::model::Model;
 
-fn last_token_logits(prompt: &[u32]) -> Vec<f32> {
-    let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-    model
-        .forward_single_prompt(prompt)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap()
-}
+mod common;
+use common::{last_token_logits, max_abs_diff};
 
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0f32, f32::max)
+fn mock_logits(prompt: &[u32]) -> Vec<f32> {
+    let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
+    last_token_logits(&model, prompt)
 }
 
 #[test]
 fn test_mock_distinguishes_token_content() {
-    let a = last_token_logits(&[1, 2, 3]);
-    let b = last_token_logits(&[7, 8, 9]);
+    let a = mock_logits(&[1, 2, 3]);
+    let b = mock_logits(&[7, 8, 9]);
     let d = max_abs_diff(&a, &b);
     assert!(
         d > 1e-6,
@@ -36,8 +26,8 @@ fn test_mock_distinguishes_token_content() {
 
 #[test]
 fn test_mock_distinguishes_single_token_identity() {
-    let a = last_token_logits(&[5]);
-    let b = last_token_logits(&[12]);
+    let a = mock_logits(&[5]);
+    let b = mock_logits(&[12]);
     let d = max_abs_diff(&a, &b);
     assert!(
         d > 1e-6,
