@@ -399,18 +399,22 @@ impl Model {
         let cos = cos.reshape((chunk_len, 1, head_dim / 2))?;
         let sin = sin.reshape((chunk_len, 1, head_dim / 2))?;
 
-        let causal_mask = if chunk_len > 1 {
-            let mut mask_data = vec![0.0f32; chunk_len * chunk_len];
+        let total_len = start_pos + chunk_len;
+        // Offset causal mask [chunk_len, total_len]: query i at absolute
+        // position start_pos + i may attend keys 0..=start_pos+i (#43).
+        let causal_mask = if chunk_len > 1 || total_len > 1 {
+            let mut mask_data = vec![0.0f32; chunk_len * total_len];
             for i in 0..chunk_len {
-                for j in 0..chunk_len {
-                    if j > i {
-                        mask_data[i * chunk_len + j] = -1e9f32;
+                let allowed_key_limit = start_pos + i;
+                for j in 0..total_len {
+                    if j > allowed_key_limit {
+                        mask_data[i * total_len + j] = -1e9f32;
                     }
                 }
             }
             Some(Tensor::from_vec(
                 mask_data,
-                (1, 1, chunk_len, chunk_len),
+                (1, 1, chunk_len, total_len),
                 &self.device,
             )?)
         } else {
@@ -444,10 +448,15 @@ impl Model {
                 }
             }
 
-            let k_attn = k.transpose(0, 1)?;
-            let v_attn = v.transpose(0, 1)?;
+            // Gather full K/V context 0..start_pos+chunk_len (prior chunks +
+            // current chunk just written above) so attention sees the whole
+            // prefix, not only the intra-chunk slice (#43).
+            let (k_all, v_all) =
+                kv_storage.gather_blocks(layer_idx, block_table.blocks(), total_len)?;
+            let k_all = k_all.transpose(0, 1)?;
+            let v_all = v_all.transpose(0, 1)?;
 
-            let attn_out = self.gqa_attention(&q, &k_attn, &v_attn, causal_mask.as_ref())?;
+            let attn_out = self.gqa_attention(&q, &k_all, &v_all, causal_mask.as_ref())?;
             let attn_out = attn_out
                 .transpose(0, 1)?
                 .reshape((chunk_len, num_q_heads * head_dim))?;
