@@ -11,10 +11,10 @@ fn test_block_allocation_and_ref_counting() {
 
     // Ref counting check
     pool.increment_ref(b0); // ref count = 2
-    pool.free(b0);          // ref count = 1, still in use
+    pool.free(b0); // ref count = 1, still in use
     assert_eq!(pool.free_blocks_count(), 0);
 
-    pool.free(b0);          // ref count = 0, returns to pool
+    pool.free(b0); // ref count = 0, returns to pool
     assert_eq!(pool.free_blocks_count(), 1);
 
     pool.free(b1);

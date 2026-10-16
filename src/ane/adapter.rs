@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-use parking_lot::Mutex;
-use candle_core::{Device, Tensor};
 use crate::error::EngineError;
 use crate::weights::LayerWeights;
+use candle_core::{Device, Tensor};
+use parking_lot::Mutex;
+use std::path::PathBuf;
 
 /// Checks whether Apple Neural Engine (ANE) hardware is present on current platform.
 pub fn has_ane_support() -> bool {
@@ -60,6 +60,7 @@ pub struct CpuFallbackAneAdapter {
 }
 
 impl CpuFallbackAneAdapter {
+    #[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
     pub fn new(
         layer_index: usize,
         hidden_size: usize,
@@ -111,7 +112,7 @@ impl AneLayerAdapter for CpuFallbackAneAdapter {
         if input.is_empty() {
             return Err(EngineError::Model("Empty input to forward_mlp".to_string()));
         }
-        if input.len() % self.hidden_size != 0 {
+        if !input.len().is_multiple_of(self.hidden_size) {
             return Err(EngineError::Model(format!(
                 "Input length {} is not a multiple of hidden_size {}",
                 input.len(),
@@ -285,7 +286,8 @@ impl HybridExecutionPipeline {
         let hidden_size = model.config.hidden_size;
         let intermediate_size = model.config.intermediate_size;
 
-        let mut adapters: Vec<Box<dyn AneLayerAdapter>> = Vec::with_capacity(model.weights.layers.len());
+        let mut adapters: Vec<Box<dyn AneLayerAdapter>> =
+            Vec::with_capacity(model.weights.layers.len());
         for (idx, layer) in model.weights.layers.iter().enumerate() {
             let adapter = CoreMlAneAdapter::new(
                 idx,
@@ -328,7 +330,8 @@ impl HybridExecutionPipeline {
 
         let input_vec = ffn_normed.flatten_all()?.to_vec1::<f32>()?;
         let output_vec = adapter.forward_mlp(&input_vec)?;
-        Tensor::from_vec(output_vec, ffn_normed.dims(), ffn_normed.device()).map_err(EngineError::from)
+        Tensor::from_vec(output_vec, ffn_normed.dims(), ffn_normed.device())
+            .map_err(EngineError::from)
     }
 
     /// Executes a single hybrid transformer layer:
@@ -359,9 +362,15 @@ impl HybridExecutionPipeline {
         let num_kv_heads = model.config.num_key_value_heads;
         let seq_len = hidden.dim(0)?;
 
-        let q = q.reshape((seq_len, num_q_heads, head_dim))?.transpose(0, 1)?;
-        let k = k.reshape((seq_len, num_kv_heads, head_dim))?.transpose(0, 1)?;
-        let v = v.reshape((seq_len, num_kv_heads, head_dim))?.transpose(0, 1)?;
+        let q = q
+            .reshape((seq_len, num_q_heads, head_dim))?
+            .transpose(0, 1)?;
+        let k = k
+            .reshape((seq_len, num_kv_heads, head_dim))?
+            .transpose(0, 1)?;
+        let v = v
+            .reshape((seq_len, num_kv_heads, head_dim))?
+            .transpose(0, 1)?;
 
         let (k, v) = if num_q_heads > num_kv_heads {
             let factor = num_q_heads / num_kv_heads;

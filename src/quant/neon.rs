@@ -1,9 +1,7 @@
 #![allow(unused_imports, unsafe_op_in_unsafe_fn)]
 
-use super::q4_k::{get_scale_min_k4, scalar_dot_q4_k, scalar_gemv_q4_k, BlockQ4_K, QK_K};
-use super::q8_0::{
-    scalar_dot_q8_0, scalar_dot_q8_0_q8_0, scalar_gemv_q8_0, BlockQ8_0, QK8_0,
-};
+use super::q4_k::{BlockQ4_K, QK_K, get_scale_min_k4, scalar_dot_q4_k, scalar_gemv_q4_k};
+use super::q8_0::{BlockQ8_0, QK8_0, scalar_dot_q8_0, scalar_dot_q8_0_q8_0, scalar_gemv_q8_0};
 
 /// Dot product between a Q8_0 block and an unquantized f32 slice.
 /// Uses ARM NEON vfmaq_f32 on aarch64, or falls back to scalar reference.
@@ -48,13 +46,7 @@ pub fn neon_dot_q4_k(w: &BlockQ4_K, x: &[f32; QK_K]) -> f32 {
 }
 
 /// Quantized matrix-vector multiplication for Q8_0 weights: out = W * x
-pub fn neon_gemv_q8_0(
-    weights: &[BlockQ8_0],
-    x: &[f32],
-    out: &mut [f32],
-    rows: usize,
-    cols: usize,
-) {
+pub fn neon_gemv_q8_0(weights: &[BlockQ8_0], x: &[f32], out: &mut [f32], rows: usize, cols: usize) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         neon_gemv_q8_0_arch(weights, x, out, rows, cols);
@@ -67,13 +59,7 @@ pub fn neon_gemv_q8_0(
 }
 
 /// Quantized matrix-vector multiplication for Q4_K weights: out = W * x
-pub fn neon_gemv_q4_k(
-    weights: &[BlockQ4_K],
-    x: &[f32],
-    out: &mut [f32],
-    rows: usize,
-    cols: usize,
-) {
+pub fn neon_gemv_q4_k(weights: &[BlockQ4_K], x: &[f32], out: &mut [f32], rows: usize, cols: usize) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         neon_gemv_q4_k_arch(weights, x, out, rows, cols);
@@ -178,10 +164,22 @@ unsafe fn neon_dot_q4_k_arch(w: &BlockQ4_K, x: &[f32; QK_K]) -> f32 {
         let x_ptr1 = x.as_ptr().add(j);
         let u16_0 = vmovl_u8(vget_low_u8(low0));
         let u16_1 = vmovl_u8(vget_high_u8(low0));
-        let w0 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_0))), vd1), vmin1);
-        let w1 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_0))), vd1), vmin1);
-        let w2 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_1))), vd1), vmin1);
-        let w3 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_1))), vd1), vmin1);
+        let w0 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_0))), vd1),
+            vmin1,
+        );
+        let w1 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_0))), vd1),
+            vmin1,
+        );
+        let w2 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_1))), vd1),
+            vmin1,
+        );
+        let w3 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_1))), vd1),
+            vmin1,
+        );
         acc = vfmaq_f32(acc, w0, vld1q_f32(x_ptr1));
         acc = vfmaq_f32(acc, w1, vld1q_f32(x_ptr1.add(4)));
         acc = vfmaq_f32(acc, w2, vld1q_f32(x_ptr1.add(8)));
@@ -189,10 +187,22 @@ unsafe fn neon_dot_q4_k_arch(w: &BlockQ4_K, x: &[f32; QK_K]) -> f32 {
 
         let u16_2 = vmovl_u8(vget_low_u8(low1));
         let u16_3 = vmovl_u8(vget_high_u8(low1));
-        let w4 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_2))), vd1), vmin1);
-        let w5 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_2))), vd1), vmin1);
-        let w6 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_3))), vd1), vmin1);
-        let w7 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_3))), vd1), vmin1);
+        let w4 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_2))), vd1),
+            vmin1,
+        );
+        let w5 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_2))), vd1),
+            vmin1,
+        );
+        let w6 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_3))), vd1),
+            vmin1,
+        );
+        let w7 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_3))), vd1),
+            vmin1,
+        );
         acc = vfmaq_f32(acc, w4, vld1q_f32(x_ptr1.add(16)));
         acc = vfmaq_f32(acc, w5, vld1q_f32(x_ptr1.add(20)));
         acc = vfmaq_f32(acc, w6, vld1q_f32(x_ptr1.add(24)));
@@ -202,10 +212,22 @@ unsafe fn neon_dot_q4_k_arch(w: &BlockQ4_K, x: &[f32; QK_K]) -> f32 {
         let x_ptr2 = x.as_ptr().add(j + 32);
         let u16_4 = vmovl_u8(vget_low_u8(hi0));
         let u16_5 = vmovl_u8(vget_high_u8(hi0));
-        let w8 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_4))), vd2), vmin2);
-        let w9 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_4))), vd2), vmin2);
-        let w10 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_5))), vd2), vmin2);
-        let w11 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_5))), vd2), vmin2);
+        let w8 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_4))), vd2),
+            vmin2,
+        );
+        let w9 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_4))), vd2),
+            vmin2,
+        );
+        let w10 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_5))), vd2),
+            vmin2,
+        );
+        let w11 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_5))), vd2),
+            vmin2,
+        );
         acc = vfmaq_f32(acc, w8, vld1q_f32(x_ptr2));
         acc = vfmaq_f32(acc, w9, vld1q_f32(x_ptr2.add(4)));
         acc = vfmaq_f32(acc, w10, vld1q_f32(x_ptr2.add(8)));
@@ -213,10 +235,22 @@ unsafe fn neon_dot_q4_k_arch(w: &BlockQ4_K, x: &[f32; QK_K]) -> f32 {
 
         let u16_6 = vmovl_u8(vget_low_u8(hi1));
         let u16_7 = vmovl_u8(vget_high_u8(hi1));
-        let w12 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_6))), vd2), vmin2);
-        let w13 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_6))), vd2), vmin2);
-        let w14 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_7))), vd2), vmin2);
-        let w15 = vsubq_f32(vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_7))), vd2), vmin2);
+        let w12 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_6))), vd2),
+            vmin2,
+        );
+        let w13 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_6))), vd2),
+            vmin2,
+        );
+        let w14 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_7))), vd2),
+            vmin2,
+        );
+        let w15 = vsubq_f32(
+            vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_7))), vd2),
+            vmin2,
+        );
         acc = vfmaq_f32(acc, w12, vld1q_f32(x_ptr2.add(16)));
         acc = vfmaq_f32(acc, w13, vld1q_f32(x_ptr2.add(20)));
         acc = vfmaq_f32(acc, w14, vld1q_f32(x_ptr2.add(24)));

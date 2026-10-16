@@ -1,7 +1,7 @@
-use std::time::Duration;
-use kanso_infer::speculative::profiler::{SpeculativeProfiler, SpeculativeReport};
-use kanso_infer::speculative::VerificationResult;
 use kanso_infer::bench::BenchmarkReport;
+use kanso_infer::speculative::VerificationResult;
+use kanso_infer::speculative::profiler::{SpeculativeProfiler, SpeculativeReport};
+use std::time::Duration;
 
 #[test]
 fn test_speculative_profiler_initial_state() {
@@ -117,7 +117,9 @@ fn test_speculative_profiler_json_export_and_report() {
     assert!((report.total_duration_secs - 0.050).abs() < 1e-6);
 
     // JSON export
-    let json_str = profiler.to_json().expect("failed to serialize profiler to JSON");
+    let json_str = profiler
+        .to_json()
+        .expect("failed to serialize profiler to JSON");
     assert!(json_str.contains("\"total_proposed\":10"));
     assert!(json_str.contains("\"total_accepted\":8"));
     assert!(json_str.contains("\"total_target_tokens\":2"));
@@ -219,7 +221,9 @@ fn test_benchmark_report_speculative_integration() {
     assert_eq!(spec.rollback_events, 1);
     assert_eq!(spec.speedup_ratio, Some(2.0));
 
-    let json = bench_report.to_json().expect("failed to serialize BenchmarkReport");
+    let json = bench_report
+        .to_json()
+        .expect("failed to serialize BenchmarkReport");
     assert!(json.contains("\"speculative\":"));
     assert!(json.contains("\"speedup_ratio\":2.0"));
 }
@@ -249,9 +253,15 @@ fn test_speculative_engine_profiler_automatic_tracking() {
 
     // Verify the engine's built-in profiler recorded steps and metrics automatically
     let profiler = &spec_engine.profiler;
-    assert!(profiler.total_proposed > 0, "Proposed tokens must be recorded");
+    assert!(
+        profiler.total_proposed > 0,
+        "Proposed tokens must be recorded"
+    );
     assert!(profiler.total_steps > 0, "Steps must be recorded");
-    assert!(profiler.total_duration > Duration::ZERO, "Duration must be positive");
+    assert!(
+        profiler.total_duration > Duration::ZERO,
+        "Duration must be positive"
+    );
     assert!(profiler.acceptance_rate() >= 0.0 && profiler.acceptance_rate() <= 1.0);
     assert!(profiler.mean_accepted_per_step() >= 0.0);
 

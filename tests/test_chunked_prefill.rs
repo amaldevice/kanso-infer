@@ -1,6 +1,6 @@
-use std::time::Instant;
 use kanso_infer::engine::Engine;
 use kanso_infer::model::Model;
+use std::time::Instant;
 
 #[test]
 fn test_chunked_prefill_admission_and_budget_enforcement() {
@@ -15,17 +15,27 @@ fn test_chunked_prefill_admission_and_budget_enforcement() {
 
     // Step 1: Chunk 0..4 prefilled, 0 tokens generated
     let out1 = engine.step().expect("step 1 failed");
-    assert!(out1.is_empty(), "Partial prefill chunk must not emit output");
+    assert!(
+        out1.is_empty(),
+        "Partial prefill chunk must not emit output"
+    );
     assert_eq!(engine.sequences[0].prefilled_tokens, 4);
 
     // Step 2: Chunk 4..8 prefilled, 0 tokens generated
     let out2 = engine.step().expect("step 2 failed");
-    assert!(out2.is_empty(), "Partial prefill chunk must not emit output");
+    assert!(
+        out2.is_empty(),
+        "Partial prefill chunk must not emit output"
+    );
     assert_eq!(engine.sequences[0].prefilled_tokens, 8);
 
     // Step 3: Chunk 8..10 prefilled (prompt finished), 1st decode token generated
     let out3 = engine.step().expect("step 3 failed");
-    assert_eq!(out3.len(), 1, "Final prefill chunk emits first generated token");
+    assert_eq!(
+        out3.len(),
+        1,
+        "Final prefill chunk emits first generated token"
+    );
     assert_eq!(out3[0].request_id, id);
     assert!(!out3[0].is_finished);
     assert_eq!(engine.sequences[0].prefilled_tokens, 10);
@@ -72,7 +82,11 @@ fn test_co_scheduling_active_decode_and_prefill_chunks() {
     // - Req 2 needs 4 tokens (4..8): completes prefill and emits token 1!
     // Both active decode and finished prefill emit tokens in the same iteration!
     let out3 = engine.step().expect("step 3 failed");
-    assert_eq!(out3.len(), 2, "Both Req 1 decode and Req 2 first token emitted");
+    assert_eq!(
+        out3.len(),
+        2,
+        "Both Req 1 decode and Req 2 first token emitted"
+    );
     let req_ids: Vec<u64> = out3.iter().map(|o| o.request_id).collect();
     assert!(req_ids.contains(&id1));
     assert!(req_ids.contains(&id2));
@@ -86,7 +100,7 @@ fn test_prefix_cache_lookup_reused_before_first_chunk() {
     let mut engine = Engine::new_with_budget(model, 2, 30, 4, 16);
 
     let prefix_prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
-    let id1 = engine.add_request(prefix_prompt.clone(), 1);
+    let _id1 = engine.add_request(prefix_prompt.clone(), 1);
 
     // Run Req 1 to completion so its blocks are stored in prefix cache
     while engine.has_unfinished_requests() {
@@ -128,7 +142,7 @@ fn test_streaming_benchmark_2048_prompt_no_itl_spike() {
 
     let mut active_req_intervals = Vec::new();
     let mut last_step_emitted = engine.current_step;
-    let mut huge_admitted = false;
+    let mut huge_emitted_count = 0;
 
     // Track active request generation across consecutive steps while 2048 prompt is chunked
     while engine.has_unfinished_requests() && engine.current_step < 50 {
@@ -150,7 +164,7 @@ fn test_streaming_benchmark_2048_prompt_no_itl_spike() {
         }
 
         if outputs.iter().any(|o| o.request_id == id_huge) {
-            huge_admitted = true;
+            huge_emitted_count += 1;
         }
     }
 
@@ -162,16 +176,20 @@ fn test_streaming_benchmark_2048_prompt_no_itl_spike() {
 
     // Calculate p99 ITL and mean ITL to verify no latency spikes
     active_req_intervals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mean_itl: f64 = active_req_intervals.iter().sum::<f64>() / active_req_intervals.len() as f64;
+    let mean_itl: f64 =
+        active_req_intervals.iter().sum::<f64>() / active_req_intervals.len() as f64;
     let p99_idx = ((active_req_intervals.len() as f64) * 0.99).ceil() as usize - 1;
     let p99_itl = active_req_intervals[p99_idx.min(active_req_intervals.len() - 1)];
 
-    // ITL p99 must be stably bounded (no catastrophic 100x spike from monolithic 2048 prefill)
     // ITL p99 must be stably bounded (no catastrophic 40x-100x spike from monolithic 2048 prefill)
     assert!(
         p99_itl < mean_itl * 15.0 + 100.0,
         "p99 ITL latency spiked: mean={:.2}ms, p99={:.2}ms",
         mean_itl,
         p99_itl
+    );
+    assert!(
+        huge_emitted_count >= 1,
+        "2048-token prompt must be admitted and emit within 50 steps"
     );
 }

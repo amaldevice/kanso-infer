@@ -1,6 +1,6 @@
 use kanso_infer::bench::{
-    evaluate_run, fnv1a_64, parse_trace_file, run_synthetic_benchmark, run_trace_benchmark,
-    BenchmarkReport, TraceEntry,
+    BenchmarkReport, TraceEntry, fnv1a_64, parse_trace_file, run_synthetic_benchmark,
+    run_trace_benchmark,
 };
 use kanso_infer::engine::Engine;
 use kanso_infer::model::Model;
@@ -39,9 +39,18 @@ fn test_fnv1a_64_parity_verification() {
     let metal_hash = fnv1a_64(&metal_tokens);
     let div_hash = fnv1a_64(&divergent_tokens);
 
-    assert_eq!(cpu_hash, neon_hash, "NEON tokens must match CPU reference hash");
-    assert_eq!(cpu_hash, metal_hash, "Metal tokens must match CPU reference hash");
-    assert_ne!(cpu_hash, div_hash, "Divergent tokens must produce different hash");
+    assert_eq!(
+        cpu_hash, neon_hash,
+        "NEON tokens must match CPU reference hash"
+    );
+    assert_eq!(
+        cpu_hash, metal_hash,
+        "Metal tokens must match CPU reference hash"
+    );
+    assert_ne!(
+        cpu_hash, div_hash,
+        "Divergent tokens must produce different hash"
+    );
 }
 
 #[test]
@@ -98,7 +107,10 @@ fn test_jsonl_trace_parsing_invalid() {
     assert!(res.is_err(), "Invalid JSON must return an EngineError");
 
     let non_existent = parse_trace_file("/non/existent/path/trace.jsonl");
-    assert!(non_existent.is_err(), "Non-existent path must return an EngineError");
+    assert!(
+        non_existent.is_err(),
+        "Non-existent path must return an EngineError"
+    );
 }
 
 #[test]
@@ -136,7 +148,8 @@ fn test_batch_sweep_with_warmup_exclusion_and_metrics() {
     // Repeat run should match deterministic checksum
     let model2 = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     let mut engine2 = Engine::new(model2, 4, 60, 4);
-    let report2 = run_synthetic_benchmark(&mut engine2, batch_size, prompt_len, gen_len, true).unwrap();
+    let report2 =
+        run_synthetic_benchmark(&mut engine2, batch_size, prompt_len, gen_len, true).unwrap();
     assert_eq!(report.checksum, report2.checksum);
 }
 

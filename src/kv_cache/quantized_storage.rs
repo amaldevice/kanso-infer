@@ -1,6 +1,6 @@
-use candle_core::{DType, Device, Tensor};
 use crate::error::EngineError;
 use crate::kv_cache::block_table::BlockTable;
+use candle_core::{DType, Device, Tensor};
 
 /// Quantization mode for KV cache storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,10 +295,16 @@ impl QuantizedKvStorage {
         }
 
         if num_tokens == 0 || blocks.is_empty() {
-            let empty_k =
-                Tensor::zeros((0, self.n_kv_heads, self.head_dim), DType::F32, &self.device)?;
-            let empty_v =
-                Tensor::zeros((0, self.n_kv_heads, self.head_dim), DType::F32, &self.device)?;
+            let empty_k = Tensor::zeros(
+                (0, self.n_kv_heads, self.head_dim),
+                DType::F32,
+                &self.device,
+            )?;
+            let empty_v = Tensor::zeros(
+                (0, self.n_kv_heads, self.head_dim),
+                DType::F32,
+                &self.device,
+            )?;
             return Ok((empty_k, empty_v));
         }
 

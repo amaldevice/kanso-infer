@@ -51,7 +51,6 @@ impl BlockPool {
         }
     }
 
-
     pub fn free(&mut self, block: usize) {
         if block < self.total_blocks && self.ref_counts[block] > 0 {
             self.ref_counts[block] -= 1;

@@ -5,9 +5,7 @@ fn test_sparse_kv_cache_allocates_only_for_attention_layers() {
 
     // Granite-4.0-h has 32 layers total, but ONLY 4 attention layers: [7, 15, 23, 31]
     let sparse_table = kanso_infer::hybrid::SparseBlockTable::allocate_initial(
-        &config,
-        &mut pool,
-        /* num_tokens */ 16,
+        &config, &mut pool, /* num_tokens */ 16,
     );
 
     assert_eq!(sparse_table.attention_layers().len(), 4);

@@ -87,7 +87,11 @@ impl SpeculativeEngine {
                 .unwrap();
 
             let mut draft_tokens = Vec::with_capacity(self.gamma);
-            let mut curr = [seq.prompt_tokens.as_slice(), seq.generated_tokens.as_slice()].concat();
+            let mut curr = [
+                seq.prompt_tokens.as_slice(),
+                seq.generated_tokens.as_slice(),
+            ]
+            .concat();
 
             let draft_model = self.draft_model.as_ref().unwrap();
             for _ in 0..self.gamma {

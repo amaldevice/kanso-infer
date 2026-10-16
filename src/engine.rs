@@ -87,12 +87,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(
-        model: Model,
-        max_running: usize,
-        total_blocks: usize,
-        block_size: usize,
-    ) -> Self {
+    pub fn new(model: Model, max_running: usize, total_blocks: usize, block_size: usize) -> Self {
         Self::new_with_budget(model, max_running, total_blocks, block_size, usize::MAX)
     }
 
@@ -149,7 +144,8 @@ impl Engine {
     pub fn add_request(&mut self, prompt_tokens: Vec<u32>, max_tokens: usize) -> u64 {
         let id = self.next_request_id;
         self.next_request_id += 1;
-        self.sequences.push(Sequence::new(id, prompt_tokens, max_tokens));
+        self.sequences
+            .push(Sequence::new(id, prompt_tokens, max_tokens));
         id
     }
 
@@ -223,10 +219,10 @@ impl Engine {
 
                 let current_blocks = seq.block_table.blocks().len();
                 let needed_blocks = seq.block_table.required_blocks(self.block_size);
-                if needed_blocks > current_blocks {
-                    if let Some(blk) = self.block_pool.allocate() {
-                        seq.block_table.push_block(blk);
-                    }
+                if needed_blocks > current_blocks
+                    && let Some(blk) = self.block_pool.allocate()
+                {
+                    seq.block_table.push_block(blk);
                 }
 
                 let is_finished = seq.generated_tokens.len() >= seq.max_tokens;
@@ -316,7 +312,7 @@ impl Engine {
 
                 let start_pos = seq.prefilled_tokens;
                 let end_pos = start_pos + chunk_len;
-                let needed_blocks = (end_pos + self.block_size - 1) / self.block_size;
+                let needed_blocks = end_pos.div_ceil(self.block_size);
                 let current_blocks = seq.block_table.blocks().len();
 
                 if needed_blocks > current_blocks {
@@ -345,36 +341,36 @@ impl Engine {
                 remaining_budget = remaining_budget.saturating_sub(chunk_len);
 
                 // If prefill completed, sample the first generated token
-                if seq.prefilled_tokens == seq.prompt_tokens.len() {
-                    if let Some(logits) = last_logits {
-                        let next_token = sample_token(&logits, 0.0, 1.0, 42)?;
-                        seq.generated_tokens.push(next_token);
-                        seq.block_table.advance_tokens(1);
+                if seq.prefilled_tokens == seq.prompt_tokens.len()
+                    && let Some(logits) = last_logits
+                {
+                    let next_token = sample_token(&logits, 0.0, 1.0, 42)?;
+                    seq.generated_tokens.push(next_token);
+                    seq.block_table.advance_tokens(1);
 
-                        let current_blocks = seq.block_table.blocks().len();
-                        let needed_blocks = seq.block_table.required_blocks(self.block_size);
-                        if needed_blocks > current_blocks {
-                            if let Some(blk) = self.block_pool.allocate() {
-                                seq.block_table.push_block(blk);
-                            }
-                        }
-
-                        let is_finished = seq.generated_tokens.len() >= seq.max_tokens;
-                        if is_finished {
-                            seq.status = SequenceStatus::Finished;
-                            finished_indices.push(idx);
-                        }
-
-                        outputs.push(StepOutput {
-                            request_id: seq.id,
-                            token_id: next_token,
-                            is_finished,
-                        });
-
-                        // Insert prompt prefix into prefix cache
-                        self.prefix_cache
-                            .insert_prefix(&seq.prompt_tokens, seq.block_table.blocks());
+                    let current_blocks = seq.block_table.blocks().len();
+                    let needed_blocks = seq.block_table.required_blocks(self.block_size);
+                    if needed_blocks > current_blocks
+                        && let Some(blk) = self.block_pool.allocate()
+                    {
+                        seq.block_table.push_block(blk);
                     }
+
+                    let is_finished = seq.generated_tokens.len() >= seq.max_tokens;
+                    if is_finished {
+                        seq.status = SequenceStatus::Finished;
+                        finished_indices.push(idx);
+                    }
+
+                    outputs.push(StepOutput {
+                        request_id: seq.id,
+                        token_id: next_token,
+                        is_finished,
+                    });
+
+                    // Insert prompt prefix into prefix cache
+                    self.prefix_cache
+                        .insert_prefix(&seq.prompt_tokens, seq.block_table.blocks());
                 }
             }
         }
@@ -399,9 +395,7 @@ impl Engine {
             .sequences
             .iter()
             .position(|s| s.id == request_id)
-            .ok_or_else(|| {
-                EngineError::Model(format!("Request {} not found", request_id))
-            })?;
+            .ok_or_else(|| EngineError::Model(format!("Request {} not found", request_id)))?;
 
         let seq = &self.sequences[seq_idx];
         if seq.status != SequenceStatus::Running || seq.is_finished() {

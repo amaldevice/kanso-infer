@@ -2,10 +2,7 @@
 fn test_continuous_batching_staggered_arrival() {
     let model = kanso_infer::model::Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     let mut engine = kanso_infer::engine::Engine::new(
-        model,
-        /* max_running */ 2,
-        /* total_blocks */ 20,
-        /* block_size */ 4,
+        model, /* max_running */ 2, /* total_blocks */ 20, /* block_size */ 4,
     );
 
     let id1 = engine.add_request(vec![1, 2], 3);
@@ -19,7 +16,7 @@ fn test_continuous_batching_staggered_arrival() {
     assert_eq!(engine.running_count(), 1);
 
     // Mid-generation arrival: Request 2 arrives
-    let id2 = engine.add_request(vec![3, 4], 2);
+    let _id2 = engine.add_request(vec![3, 4], 2);
     assert_eq!(engine.waiting_count(), 1);
 
     // Step 2: Request 1 decodes token 2, Request 2 is admitted & prefilled
@@ -34,7 +31,7 @@ fn test_continuous_batching_staggered_arrival() {
         steps += 1;
     }
 
-    assert_eq!(engine.has_unfinished_requests(), false);
+    assert!(!engine.has_unfinished_requests());
     assert_eq!(engine.running_count(), 0);
     assert_eq!(engine.waiting_count(), 0);
     // All blocks must be returned to pool

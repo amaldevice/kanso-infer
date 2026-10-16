@@ -111,9 +111,8 @@ pub fn parse_conversations(json_content: &str) -> Result<Vec<ShareGptConversatio
             convs.push(conv);
         }
         if convs.is_empty() {
-            let single: ShareGptConversation = serde_json::from_str(trimmed).map_err(|e| {
-                EngineError::Config(format!("Invalid ShareGPT JSON object: {}", e))
-            })?;
+            let single: ShareGptConversation = serde_json::from_str(trimmed)
+                .map_err(|e| EngineError::Config(format!("Invalid ShareGPT JSON object: {}", e)))?;
             convs.push(single);
         }
         Ok(convs)
@@ -168,11 +167,12 @@ pub fn parse_sharegpt_dataset_with_config(
                     16
                 };
 
-                let prompt_slice = if history.last().map(|t| normalize_role(&t.from)) == Some("assistant") {
-                    &history[..history.len() - 1]
-                } else {
-                    &history[..]
-                };
+                let prompt_slice =
+                    if history.last().map(|t| normalize_role(&t.from)) == Some("assistant") {
+                        &history[..history.len() - 1]
+                    } else {
+                        &history[..]
+                    };
 
                 let prompt_str = format_chatml_prompt(prompt_slice);
                 let prompt_tokens = tokenize_chatml(&prompt_str);

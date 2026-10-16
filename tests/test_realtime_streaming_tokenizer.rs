@@ -7,7 +7,9 @@ fn test_tokenizer_wrapper_encode_and_decode() {
     let token_ids = tokenizer.encode(text).expect("Failed to encode text");
     assert!(!token_ids.is_empty());
 
-    let decoded = tokenizer.decode(&token_ids).expect("Failed to decode tokens");
+    let decoded = tokenizer
+        .decode(&token_ids)
+        .expect("Failed to decode tokens");
     assert_eq!(decoded.trim(), text.trim());
 }
 
@@ -37,13 +39,18 @@ fn test_chat_session_streaming_callback_and_stop_token() {
     let model = kanso_infer::model::Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     let engine = kanso_infer::engine::Engine::new(model, 4, 100, 4);
 
-    let mut session = kanso_infer::chat::ChatSession::new(engine, Some("You are a helpful assistant.".to_string()));
+    let mut session = kanso_infer::chat::ChatSession::new(
+        engine,
+        Some("You are a helpful assistant.".to_string()),
+    );
     session.add_user_message("Hello");
 
     let mut collected_chunks = Vec::new();
-    let full_reply = session.stream_step_reply(5, |delta| {
-        collected_chunks.push(delta.to_string());
-    }).expect("Streaming reply failed");
+    let full_reply = session
+        .stream_step_reply(5, |delta| {
+            collected_chunks.push(delta.to_string());
+        })
+        .expect("Streaming reply failed");
 
     assert!(!full_reply.is_empty());
     assert_eq!(session.history().len(), 3);

@@ -1,9 +1,7 @@
 #[test]
 fn test_bench_metric_calculation() {
     let report = kanso_infer::bench::evaluate_run(
-        /* total_tokens */ 128,
-        /* total_duration_secs */ 2.0,
-        /* num_requests */ 4,
+        /* total_tokens */ 128, /* total_duration_secs */ 2.0, /* num_requests */ 4,
     );
 
     assert_eq!(report.total_tokens, 128);
@@ -17,16 +15,7 @@ fn test_bench_itl_metrics_calculation() {
     let ttfts = vec![10.0, 15.0];
     let itls = vec![5.0, 10.0, 15.0, 20.0];
     let report = kanso_infer::bench::evaluate_run_with_timings(
-        100,
-        1.0,
-        2,
-        &ttfts,
-        &itls,
-        10,
-        0.1,
-        20,
-        0.5,
-        12345,
+        100, 1.0, 2, &ttfts, &itls, 10, 0.1, 20, 0.5, 12345,
     );
 
     assert_eq!(report.itl_mean_ms, 12.5);
@@ -46,7 +35,8 @@ fn test_run_synthetic_sweep_execution() {
         /* batch_size */ 2,
         /* prompt_len */ 2,
         /* gen_len */ 3,
-    ).expect("sweep failed");
+    )
+    .expect("sweep failed");
 
     assert_eq!(report.num_requests, 2);
     assert_eq!(report.total_tokens, 6);
@@ -60,23 +50,15 @@ fn test_benchmark_report_json_serialization_percentiles() {
     let ttfts = vec![12.0, 18.0, 24.0];
     let itls = vec![4.0, 6.0, 8.0, 10.0];
     let report = kanso_infer::bench::evaluate_run_with_timings(
-        50,
-        0.5,
-        3,
-        &ttfts,
-        &itls,
-        15,
-        0.1,
-        10,
-        0.4,
-        999,
+        50, 0.5, 3, &ttfts, &itls, 15, 0.1, 10, 0.4, 999,
     );
     let json_str = report.to_json().unwrap();
     assert!(json_str.contains("\"ttft_p50_ms\":"));
     assert!(json_str.contains("\"ttft_p90_ms\":"));
     assert!(json_str.contains("\"itl_p50_ms\":"));
     assert!(json_str.contains("\"itl_p90_ms\":"));
-    let deserialized: kanso_infer::bench::BenchmarkReport = serde_json::from_str(&json_str).unwrap();
+    let deserialized: kanso_infer::bench::BenchmarkReport =
+        serde_json::from_str(&json_str).unwrap();
     assert_eq!(deserialized.ttft_p50_ms, report.ttft_p50_ms);
     assert_eq!(deserialized.ttft_p90_ms, report.ttft_p90_ms);
     assert_eq!(deserialized.itl_p50_ms, report.itl_p50_ms);

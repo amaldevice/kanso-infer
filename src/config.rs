@@ -37,7 +37,10 @@ impl ModelConfig {
 
     /// Computes uncompressed KV cache bytes per token: 2 * n_attn_layers * n_kv_heads * head_dim * 4 bytes (F32)
     pub fn kv_cache_bytes_per_token_f32(&self) -> usize {
-        2 * self.num_attention_layers() * self.num_key_value_heads * self.head_dim() * std::mem::size_of::<f32>()
+        2 * self.num_attention_layers()
+            * self.num_key_value_heads
+            * self.head_dim()
+            * std::mem::size_of::<f32>()
     }
 
     pub fn from_model_type(name: &str) -> Result<Self, crate::error::EngineError> {

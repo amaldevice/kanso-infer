@@ -1,17 +1,17 @@
-use std::sync::Arc;
-use parking_lot::Mutex;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use tower::ServiceExt;
 use kanso_infer::bench::traffic::{
-    calculate_percentiles, generate_poisson_schedule, run_poisson_concurrency_sweep,
-    CONCURRENCY_SWEEP_RATES,
+    CONCURRENCY_SWEEP_RATES, calculate_percentiles, generate_poisson_schedule,
+    run_poisson_concurrency_sweep,
 };
 use kanso_infer::engine::Engine;
 use kanso_infer::model::Model;
 use kanso_infer::server::create_app_with_queue_limit;
+use parking_lot::Mutex;
+use std::sync::Arc;
+use tower::ServiceExt;
 
 #[test]
 fn test_poisson_inter_arrival_times_convergence() {
@@ -143,7 +143,6 @@ fn test_ttft_and_itl_latency_percentiles() {
     let p = kanso_infer::bench::calculate_percentiles(&[1.0, 2.0, 3.0]);
     assert_eq!(p.0, 2.0);
 }
-
 
 #[test]
 fn test_concurrency_sweep_rates_and_execution() {

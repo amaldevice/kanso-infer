@@ -1,4 +1,4 @@
-use crate::bench::{run_benchmark_workload, BenchmarkReport, TraceEntry};
+use crate::bench::{BenchmarkReport, TraceEntry, run_benchmark_workload};
 use crate::engine::Engine;
 use crate::error::EngineError;
 use rand::{Rng, SeedableRng};
@@ -46,7 +46,11 @@ pub fn calculate_percentiles(values: &[f64]) -> (f64, f64, f64) {
     let p90_rank = ((n as f64 * 0.90).ceil() as usize).max(1).min(n);
     let p99_rank = ((n as f64 * 0.99).ceil() as usize).max(1).min(n);
 
-    (sorted[p50_rank - 1], sorted[p90_rank - 1], sorted[p99_rank - 1])
+    (
+        sorted[p50_rank - 1],
+        sorted[p90_rank - 1],
+        sorted[p99_rank - 1],
+    )
 }
 
 /// Latency percentiles summary (p50, p90, p99, and mean).
@@ -66,7 +70,12 @@ impl LatencyPercentiles {
         } else {
             values.iter().sum::<f64>() / (values.len() as f64)
         };
-        Self { p50, p90, p99, mean }
+        Self {
+            p50,
+            p90,
+            p99,
+            mean,
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use kanso_infer::quant::{
-    neon_dot_q4_k, neon_dot_q8_0, neon_dot_q8_0_q8_0, neon_gemv_q4_k, neon_gemv_q8_0,
-    quantize_row_q8_0, scalar_dot_q4_k, scalar_dot_q8_0, scalar_dot_q8_0_q8_0,
-    scalar_gemv_q4_k, scalar_gemv_q8_0, BlockQ4_K, BlockQ8_0, QK8_0, QK_K,
+    BlockQ4_K, BlockQ8_0, QK_K, QK8_0, neon_dot_q4_k, neon_dot_q8_0, neon_dot_q8_0_q8_0,
+    neon_gemv_q4_k, neon_gemv_q8_0, quantize_row_q8_0, scalar_dot_q4_k, scalar_dot_q8_0,
+    scalar_dot_q8_0_q8_0, scalar_gemv_q4_k, scalar_gemv_q8_0,
 };
 use std::time::Instant;
 
@@ -49,7 +49,13 @@ fn test_quantize_row_q8_0() {
     for (i, x) in xs.iter_mut().enumerate() {
         *x = (i as f32) * 0.1 - 3.2;
     }
-    let mut blocks = vec![BlockQ8_0 { d: 0.0, qs: [0; QK8_0] }; 2];
+    let mut blocks = vec![
+        BlockQ8_0 {
+            d: 0.0,
+            qs: [0; QK8_0]
+        };
+        2
+    ];
     quantize_row_q8_0(&xs, &mut blocks);
 
     assert!(blocks[0].d > 0.0);

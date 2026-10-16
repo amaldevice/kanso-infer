@@ -1,14 +1,17 @@
 use clap::Parser;
+use kanso_infer::DEFAULT_BACKEND;
 use kanso_infer::bench::{
-    parse_trace_file, run_synthetic_benchmark, run_trace_benchmark, BenchmarkReport,
+    BenchmarkReport, parse_trace_file, run_synthetic_benchmark, run_trace_benchmark,
 };
 use kanso_infer::engine::Engine;
 use kanso_infer::error::EngineError;
 use kanso_infer::model::Model;
-use kanso_infer::DEFAULT_BACKEND;
 
 #[derive(Parser, Debug)]
-#[command(name = "kanso-bench", about = "kanso-infer multi-engine benchmark suite")]
+#[command(
+    name = "kanso-bench",
+    about = "kanso-infer multi-engine benchmark suite"
+)]
 pub struct Args {
     /// Comma-separated list of batch sizes to sweep (e.g. "1,4,8,16,32")
     #[arg(long, default_value = "1,4,8,16,32")]
@@ -20,7 +23,6 @@ pub struct Args {
     /// Dataset format: "synthetic" (default), "sharegpt", or "lmsys"
     #[arg(long, default_value = "synthetic")]
     pub dataset: String,
-
 
     /// Synthetic prompt token length
     #[arg(long, default_value_t = 128)]
@@ -75,9 +77,7 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
 
     println!(
         "{label:<24} backend={backend:<6} batch={:<4} tok/s(total)={:<9.1} tok/s/req={:<8.2}",
-        report.num_requests,
-        report.total_tokens_per_sec,
-        report.tokens_per_sec_per_request,
+        report.num_requests, report.total_tokens_per_sec, report.tokens_per_sec_per_request,
     );
     println!(
         "{:<24} ttft_ms(p50/p90/mean/max)={:.1}/{:.1}/{:.1}/{:.1} itl_ms(p50/p90/p99)={:.1}/{:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} prefix_hit={:.1}% checksum={:016x}",
@@ -119,7 +119,7 @@ fn create_engine_for_workload(
     let mut model = Model::load_gguf(model_path, device)?;
     model.set_backend(backend);
 
-    let blocks_per_seq = (max_tokens_per_seq + block_size - 1) / block_size + 1;
+    let blocks_per_seq = max_tokens_per_seq.div_ceil(block_size) + 1;
     let total_blocks = (blocks_per_seq * num_requests.max(1)).max(128);
 
     Ok(Engine::new(model, max_running, total_blocks, block_size))
@@ -154,13 +154,19 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("============================================================");
     println!(" kanso-infer multi-engine benchmark suite");
     println!(" Model    : {}", model_path.display());
-    println!(" Hardware : {} ({} cores, {:.1} GB RAM, Model: {})", hw.chip_name, hw.core_count, hw.total_ram_gb, hw.model_identifier);
+    println!(
+        " Hardware : {} ({} cores, {:.1} GB RAM, Model: {})",
+        hw.chip_name, hw.core_count, hw.total_ram_gb, hw.model_identifier
+    );
     println!(" Thermal  : {}", thermal.as_str());
     println!(" Backend  : {}, Warmup: {}", args.backend, warmup);
     println!("============================================================");
     if let Some(dataset) = &args.eval_ppl {
         println!("Evaluating perplexity on dataset: {}", dataset);
-        let report = kanso_infer::bench::run_wikitext2_perplexity_eval(model_path.to_str().unwrap_or("model"), args.ppl_stride)?;
+        let report = kanso_infer::bench::run_wikitext2_perplexity_eval(
+            model_path.to_str().unwrap_or("model"),
+            args.ppl_stride,
+        )?;
         let ascii_table = kanso_infer::bench::format_ascii_ppl_report(&report);
         println!("{}", ascii_table);
 

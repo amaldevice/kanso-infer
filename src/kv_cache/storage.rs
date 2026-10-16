@@ -1,6 +1,6 @@
-use candle_core::{DType, Device, Tensor};
 use crate::error::EngineError;
 use crate::kv_cache::block_table::BlockTable;
+use candle_core::{DType, Device, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct KvStorage {
@@ -144,7 +144,7 @@ impl KvStorage {
             return Ok((empty_k, empty_v));
         }
 
-        let needed_blocks = (num_tokens + self.block_size - 1) / self.block_size;
+        let needed_blocks = num_tokens.div_ceil(self.block_size);
         let active_blocks = &blocks[..needed_blocks.min(blocks.len())];
 
         let block_idx_u32: Vec<u32> = active_blocks.iter().map(|&b| b as u32).collect();

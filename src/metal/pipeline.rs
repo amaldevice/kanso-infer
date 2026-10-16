@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use metal::{CompileOptions, ComputePipelineState, Device};
 use crate::error::EngineError;
 use crate::metal::shaders;
+use metal::{CompileOptions, ComputePipelineState, Device};
+use std::collections::HashMap;
 
 pub struct MetalPipelineCache {
     pipelines: HashMap<String, ComputePipelineState>,
@@ -16,22 +16,44 @@ impl MetalPipelineCache {
             (shaders::RMSNORM_SHADER, "rmsnorm_kernel", "rmsnorm"),
             (shaders::ROPE_SHADER, "rope_kernel", "rope"),
             (shaders::SILU_GATE_SHADER, "silu_gate_kernel", "silu_gate"),
-            (shaders::PAGED_KV_SHADER, "paged_kv_gather_kernel", "paged_kv"),
-            (shaders::PAGED_ATTENTION_V2_SHADER, "paged_attention_v2_kernel", "paged_attention_v2"),
-            (shaders::FUSED_LLAMA_LAYER_SHADER, "fused_rmsnorm_rope_kernel", "fused_rmsnorm_rope"),
-            (shaders::FUSED_LLAMA_LAYER_SHADER, "fused_rmsnorm_qkv_rope_kernel", "fused_rmsnorm_qkv_rope"),
-            (shaders::FUSED_LLAMA_LAYER_SHADER, "linear_gemv_kernel", "linear_gemv"),
+            (
+                shaders::PAGED_KV_SHADER,
+                "paged_kv_gather_kernel",
+                "paged_kv",
+            ),
+            (
+                shaders::PAGED_ATTENTION_V2_SHADER,
+                "paged_attention_v2_kernel",
+                "paged_attention_v2",
+            ),
+            (
+                shaders::FUSED_LLAMA_LAYER_SHADER,
+                "fused_rmsnorm_rope_kernel",
+                "fused_rmsnorm_rope",
+            ),
+            (
+                shaders::FUSED_LLAMA_LAYER_SHADER,
+                "fused_rmsnorm_qkv_rope_kernel",
+                "fused_rmsnorm_qkv_rope",
+            ),
+            (
+                shaders::FUSED_LLAMA_LAYER_SHADER,
+                "linear_gemv_kernel",
+                "linear_gemv",
+            ),
         ];
         for (source, kernel_name, key) in shader_defs {
             let library = device
                 .new_library_with_source(source, &compile_options)
                 .map_err(|e| EngineError::Metal(format!("Failed to compile shader {key}: {e}")))?;
-            let function = library
-                .get_function(kernel_name, None)
-                .map_err(|e| EngineError::Metal(format!("Failed to get kernel {kernel_name} in {key}: {e}")))?;
+            let function = library.get_function(kernel_name, None).map_err(|e| {
+                EngineError::Metal(format!("Failed to get kernel {kernel_name} in {key}: {e}"))
+            })?;
             let pipeline = device
                 .new_compute_pipeline_state_with_function(&function)
-                .map_err(|e| EngineError::Metal(format!("Failed to create pipeline state for {key}: {e}")))?;
+                .map_err(|e| {
+                    EngineError::Metal(format!("Failed to create pipeline state for {key}: {e}"))
+                })?;
             pipelines.insert(key.to_string(), pipeline);
         }
 

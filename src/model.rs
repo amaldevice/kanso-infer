@@ -1,15 +1,39 @@
-use candle_core::{DType, Device, IndexOp, Tensor};
 use crate::config::{ModelArchitecture, ModelConfig};
 use crate::engine::ScratchpadWorkspace;
 use crate::error::EngineError;
 use crate::kv_cache::{BlockTable, KvStorage};
 use crate::weights::{LayerWeights, ModelWeights};
+use candle_core::{DType, Device, IndexOp, Tensor};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 pub struct Model {
     pub weights: ModelWeights,
     pub config: ModelConfig,
     pub device: Device,
     pub backend: String,
     pub hybrid_pipeline: Option<crate::ane::HybridExecutionPipeline>,
+}
+
+/// Fixed seed for mock-model weights so tests are reproducible.
+/// NOTE: candle's CPU RNG cannot be seeded (`Device::set_seed` bails on CPU
+/// and `Tensor::randn` draws from a thread RNG), so we draw N(0,1) ourselves
+/// via Box-Muller from a seeded `StdRng` and build tensors with `from_vec`.
+const MOCK_SEED: u64 = 0x5EED_0057;
+
+/// Draws `n` standard-normal samples (Box-Muller) from a seeded RNG.
+fn mock_randn_vec(n: usize, rng: &mut StdRng) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        let u1: f64 = rng.random_range(f64::MIN_POSITIVE..1.0);
+        let u2: f64 = rng.random_range(0.0..1.0);
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f64::consts::PI * u2;
+        out.push((r * theta.cos()) as f32);
+        if out.len() < n {
+            out.push((r * theta.sin()) as f32);
+        }
+    }
+    out
 }
 
 impl Model {
@@ -25,7 +49,10 @@ impl Model {
 
     /// Loads a model directly from a real GGUF file.
     /// Fails fast if the file does not exist. Shadow/mock models are disabled.
-    pub fn load_gguf<P: AsRef<std::path::Path>>(path: P, device: Device) -> Result<Self, EngineError> {
+    pub fn load_gguf<P: AsRef<std::path::Path>>(
+        path: P,
+        device: Device,
+    ) -> Result<Self, EngineError> {
         let path_ref = path.as_ref();
         let resolved = crate::weights::resolve_model_path(path_ref.to_str().unwrap_or(""))?;
         let (weights, config) = ModelWeights::load_from_gguf(&resolved, &device)?;
@@ -84,28 +111,39 @@ impl Model {
         let dev = Device::Cpu;
         let head_dim = hidden_size / num_attention_heads;
         let intermediate_size = hidden_size * 2;
+        let mut rng = StdRng::seed_from_u64(MOCK_SEED);
+        let mut randn = |shape: Vec<usize>| -> Result<Tensor, EngineError> {
+            let n: usize = shape.iter().product();
+            Ok(Tensor::from_vec(mock_randn_vec(n, &mut rng), shape, &dev)?)
+        };
 
         let mut layers = Vec::new();
         for _ in 0..num_layers {
             let layer = LayerWeights {
-                attn_q: Tensor::ones((num_attention_heads * head_dim, hidden_size), DType::F32, &dev)?,
-                attn_k: Tensor::ones((num_kv_heads * head_dim, hidden_size), DType::F32, &dev)?,
-                attn_v: Tensor::ones((num_kv_heads * head_dim, hidden_size), DType::F32, &dev)?,
-                attn_output: Tensor::ones((hidden_size, num_attention_heads * head_dim), DType::F32, &dev)?,
+                attn_q: randn(vec![num_attention_heads * head_dim, hidden_size])?,
+                attn_k: randn(vec![num_kv_heads * head_dim, hidden_size])?,
+                attn_v: randn(vec![num_kv_heads * head_dim, hidden_size])?,
+                attn_output: randn(vec![hidden_size, num_attention_heads * head_dim])?,
                 attn_norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
-                ffn_gate: Tensor::ones((intermediate_size, hidden_size), DType::F32, &dev)?,
-                ffn_up: Tensor::ones((intermediate_size, hidden_size), DType::F32, &dev)?,
-                ffn_down: Tensor::ones((hidden_size, intermediate_size), DType::F32, &dev)?,
+                ffn_gate: randn(vec![intermediate_size, hidden_size])?,
+                ffn_up: randn(vec![intermediate_size, hidden_size])?,
+                ffn_down: randn(vec![hidden_size, intermediate_size])?,
                 ffn_norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
             };
             layers.push(layer);
         }
 
         let weights = ModelWeights {
-            embed_tokens: Tensor::ones((vocab_size, hidden_size), DType::F32, &dev)?,
+            embed_tokens: {
+                let n = vocab_size * hidden_size;
+                Tensor::from_vec(mock_randn_vec(n, &mut rng), (vocab_size, hidden_size), &dev)?
+            },
             layers,
             norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
-            lm_head: Tensor::ones((vocab_size, hidden_size), DType::F32, &dev)?,
+            lm_head: {
+                let n = vocab_size * hidden_size;
+                Tensor::from_vec(mock_randn_vec(n, &mut rng), (vocab_size, hidden_size), &dev)?
+            },
         };
 
         let config = ModelConfig {
@@ -135,28 +173,39 @@ impl Model {
         let intermediate_size = config.intermediate_size;
         let num_layers = config.num_hidden_layers.min(2);
         let vocab_size = config.vocab_size.min(1000);
+        let mut rng = StdRng::seed_from_u64(MOCK_SEED);
+        let mut randn = |shape: Vec<usize>| -> Result<Tensor, EngineError> {
+            let n: usize = shape.iter().product();
+            Ok(Tensor::from_vec(mock_randn_vec(n, &mut rng), shape, &dev)?)
+        };
 
         let mut layers = Vec::new();
         for _ in 0..num_layers {
             let layer = LayerWeights {
-                attn_q: Tensor::ones((num_attention_heads * head_dim, hidden_size), DType::F32, &dev)?,
-                attn_k: Tensor::ones((num_kv_heads * head_dim, hidden_size), DType::F32, &dev)?,
-                attn_v: Tensor::ones((num_kv_heads * head_dim, hidden_size), DType::F32, &dev)?,
-                attn_output: Tensor::ones((hidden_size, num_attention_heads * head_dim), DType::F32, &dev)?,
+                attn_q: randn(vec![num_attention_heads * head_dim, hidden_size])?,
+                attn_k: randn(vec![num_kv_heads * head_dim, hidden_size])?,
+                attn_v: randn(vec![num_kv_heads * head_dim, hidden_size])?,
+                attn_output: randn(vec![hidden_size, num_attention_heads * head_dim])?,
                 attn_norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
-                ffn_gate: Tensor::ones((intermediate_size, hidden_size), DType::F32, &dev)?,
-                ffn_up: Tensor::ones((intermediate_size, hidden_size), DType::F32, &dev)?,
-                ffn_down: Tensor::ones((hidden_size, intermediate_size), DType::F32, &dev)?,
+                ffn_gate: randn(vec![intermediate_size, hidden_size])?,
+                ffn_up: randn(vec![intermediate_size, hidden_size])?,
+                ffn_down: randn(vec![hidden_size, intermediate_size])?,
                 ffn_norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
             };
             layers.push(layer);
         }
 
         let weights = ModelWeights {
-            embed_tokens: Tensor::ones((vocab_size, hidden_size), DType::F32, &dev)?,
+            embed_tokens: {
+                let n = vocab_size * hidden_size;
+                Tensor::from_vec(mock_randn_vec(n, &mut rng), (vocab_size, hidden_size), &dev)?
+            },
             layers,
             norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
-            lm_head: Tensor::ones((vocab_size, hidden_size), DType::F32, &dev)?,
+            lm_head: {
+                let n = vocab_size * hidden_size;
+                Tensor::from_vec(mock_randn_vec(n, &mut rng), (vocab_size, hidden_size), &dev)?
+            },
         };
 
         let mut cfg = config.clone();
@@ -178,7 +227,11 @@ impl Model {
         let head_dim = self.config.head_dim();
         let half = head_dim / 2;
         let theta: Vec<f32> = (0..half)
-            .map(|j| self.config.rope_theta.powf(-2.0 * j as f32 / head_dim as f32))
+            .map(|j| {
+                self.config
+                    .rope_theta
+                    .powf(-2.0 * j as f32 / head_dim as f32)
+            })
             .collect();
         let theta = Tensor::from_vec(theta, (1, half), &self.device)?;
 
@@ -189,7 +242,12 @@ impl Model {
         Ok((angles.cos()?, angles.sin()?))
     }
 
-    pub fn rope_apply(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor, EngineError> {
+    pub fn rope_apply(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor, EngineError> {
         let half = x.dim(candle_core::D::Minus1)? / 2;
         let first = x.narrow(candle_core::D::Minus1, 0, half)?;
         let second = x.narrow(candle_core::D::Minus1, half, half)?;
@@ -197,7 +255,10 @@ impl Model {
         let first_rot = (first.broadcast_mul(cos)? - second.broadcast_mul(sin)?)?;
         let second_rot = (first.broadcast_mul(sin)? + second.broadcast_mul(cos)?)?;
 
-        Ok(Tensor::cat(&[&first_rot, &second_rot], candle_core::D::Minus1)?)
+        Ok(Tensor::cat(
+            &[&first_rot, &second_rot],
+            candle_core::D::Minus1,
+        )?)
     }
 
     pub fn gqa_attention(
@@ -212,7 +273,9 @@ impl Model {
         let group_size = n_heads / n_kv_heads;
 
         // Fold Q heads into groups: [n_kv_heads, group_size * q_len, head_dim]
-        let q_folded = q.contiguous()?.reshape((n_kv_heads, group_size * q_len, head_dim))?;
+        let q_folded = q
+            .contiguous()?
+            .reshape((n_kv_heads, group_size * q_len, head_dim))?;
 
         // Attention scores: [n_kv_heads, group_size * q_len, ctx_len]
         let scale = 1.0 / (head_dim as f64).sqrt();
@@ -258,7 +321,11 @@ impl Model {
                     }
                 }
             }
-            Some(Tensor::from_vec(mask_data, (1, 1, seq_len, seq_len), &self.device)?)
+            Some(Tensor::from_vec(
+                mask_data,
+                (1, 1, seq_len, seq_len),
+                &self.device,
+            )?)
         } else {
             None
         };
@@ -281,7 +348,9 @@ impl Model {
             let v = v.transpose(0, 1)?;
             let attn_out = self.gqa_attention(&q, &k, &v, causal_mask.as_ref())?;
             // Merge heads back: [num_q_heads, seq_len, head_dim] -> [seq_len, hidden_size]
-            let attn_out = attn_out.transpose(0, 1)?.reshape((seq_len, num_q_heads * head_dim))?;
+            let attn_out = attn_out
+                .transpose(0, 1)?
+                .reshape((seq_len, num_q_heads * head_dim))?;
             let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
 
             // Residual connection
@@ -347,7 +416,11 @@ impl Model {
                     }
                 }
             }
-            Some(Tensor::from_vec(mask_data, (1, 1, chunk_len, chunk_len), &self.device)?)
+            Some(Tensor::from_vec(
+                mask_data,
+                (1, 1, chunk_len, chunk_len),
+                &self.device,
+            )?)
         } else {
             None
         };
@@ -383,7 +456,9 @@ impl Model {
             let v_attn = v.transpose(0, 1)?;
 
             let attn_out = self.gqa_attention(&q, &k_attn, &v_attn, causal_mask.as_ref())?;
-            let attn_out = attn_out.transpose(0, 1)?.reshape((chunk_len, num_q_heads * head_dim))?;
+            let attn_out = attn_out
+                .transpose(0, 1)?
+                .reshape((chunk_len, num_q_heads * head_dim))?;
             let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
 
             hidden = (hidden + attn_proj)?;
@@ -478,7 +553,9 @@ impl Model {
 
             let attn_out = self.gqa_attention(&q, &k_all, &v_all, None)?;
             // Merge heads back: [1, hidden_size]
-            let attn_out = attn_out.transpose(0, 1)?.reshape((1, num_q_heads * head_dim))?;
+            let attn_out = attn_out
+                .transpose(0, 1)?
+                .reshape((1, num_q_heads * head_dim))?;
             let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
 
             // Residual connection
@@ -498,13 +575,12 @@ impl Model {
         // LM Head projection: [1, vocab_size]
         let logits = self.matmul(&final_normed, &self.weights.lm_head.t()?)?;
 
-        if let Some(ws) = workspace {
-            if let Ok(flat) = logits.flatten_all() {
-                if let Ok(slice) = flat.to_vec1::<f32>() {
-                    let len = slice.len().min(ws.logits.len());
-                    ws.logits[..len].copy_from_slice(&slice[..len]);
-                }
-            }
+        if let Some(ws) = workspace
+            && let Ok(flat) = logits.flatten_all()
+            && let Ok(slice) = flat.to_vec1::<f32>()
+        {
+            let len = slice.len().min(ws.logits.len());
+            ws.logits[..len].copy_from_slice(&slice[..len]);
         }
 
         Ok(logits)
@@ -601,7 +677,9 @@ impl Model {
             let k = self.matmul(&normed, &layer.attn_k.t()?)?;
             let v = self.matmul(&normed, &layer.attn_v.t()?)?;
 
-            let q = q.reshape((seq_len, num_q_heads, head_dim))?.transpose(0, 1)?;
+            let q = q
+                .reshape((seq_len, num_q_heads, head_dim))?
+                .transpose(0, 1)?;
             let k_reshaped = k.reshape((seq_len, num_kv_heads, head_dim))?;
             let v_reshaped = v.reshape((seq_len, num_kv_heads, head_dim))?;
 
@@ -624,11 +702,8 @@ impl Model {
                 kv_storage.write_kv_token(layer_idx, physical_block, offset, &k_token, &v_token)?;
             }
 
-            let (k_all, v_all) = kv_storage.gather_blocks(
-                layer_idx,
-                block_table.blocks(),
-                total_tokens,
-            )?;
+            let (k_all, v_all) =
+                kv_storage.gather_blocks(layer_idx, block_table.blocks(), total_tokens)?;
 
             let k_all = k_all.transpose(0, 1)?;
             let v_all = v_all.transpose(0, 1)?;

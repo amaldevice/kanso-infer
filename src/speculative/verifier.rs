@@ -1,8 +1,8 @@
-use candle_core::IndexOp;
 use crate::error::EngineError;
 use crate::kv_cache::{BlockPool, BlockTable, KvStorage};
 use crate::model::Model;
 use crate::sampler::sample_token;
+use candle_core::IndexOp;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerificationResult {
@@ -17,6 +17,7 @@ pub struct VerificationResult {
 pub struct SpeculativeVerifier;
 
 impl SpeculativeVerifier {
+    #[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
     pub fn verify(
         model: &Model,
         current_token: u32,
@@ -28,14 +29,15 @@ impl SpeculativeVerifier {
         block_size: usize,
     ) -> Result<VerificationResult, EngineError> {
         if candidates.is_empty() {
-            let needed_blocks = (start_pos + 1 + block_size - 1) / block_size;
+            let needed_blocks = (start_pos + 1).div_ceil(block_size);
             while block_table.blocks().len() < needed_blocks {
                 let blk = block_pool.allocate().ok_or_else(|| {
                     EngineError::Model("Out of memory: cannot allocate KV block".to_string())
                 })?;
                 block_table.push_block(blk);
             }
-            let logits = model.forward_decode_step(current_token, start_pos, block_table, kv_storage)?;
+            let logits =
+                model.forward_decode_step(current_token, start_pos, block_table, kv_storage)?;
             let emitted = sample_token(&logits, 0.0, 1.0, 42)?;
             return Ok(VerificationResult {
                 accepted_tokens: Vec::new(),
@@ -54,7 +56,7 @@ impl SpeculativeVerifier {
             .collect();
 
         // Ensure sufficient blocks are allocated for speculative tokens
-        let needed_blocks = (start_pos + total_candidate_tokens + block_size - 1) / block_size;
+        let needed_blocks = (start_pos + total_candidate_tokens).div_ceil(block_size);
         while block_table.blocks().len() < needed_blocks {
             let blk = block_pool.allocate().ok_or_else(|| {
                 EngineError::Model("Out of memory: cannot allocate KV block".to_string())
@@ -63,12 +65,8 @@ impl SpeculativeVerifier {
         }
 
         // Execute single forward pass verification
-        let logits = model.forward_verify_tokens(
-            &verify_tokens,
-            start_pos,
-            block_table,
-            kv_storage,
-        )?;
+        let logits =
+            model.forward_verify_tokens(&verify_tokens, start_pos, block_table, kv_storage)?;
 
         // Verify draft candidates greedily
         let mut accepted_tokens = Vec::new();

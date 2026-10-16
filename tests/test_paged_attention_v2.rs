@@ -2,8 +2,8 @@
 mod paged_attention_v2_tests {
     use kanso_infer::metal::context::MetalContext;
     use kanso_infer::metal::paged_attention::{
-        cpu_paged_attention, gpu_paged_attention_v2, gpu_paged_attention_v2_buffer,
-        PagedAttentionParams,
+        PagedAttentionParams, cpu_paged_attention, gpu_paged_attention_v2,
+        gpu_paged_attention_v2_buffer,
     };
 
     #[test]
@@ -39,7 +39,7 @@ mod paged_attention_v2_tests {
         let context_lens = vec![context_len as u32];
 
         // Fill token 0 in block 2, offset 0: K = [1, 0, 0, 0], V = [10, 0, 0, 0]
-        let offset_t0 = (2 * block_size + 0) * (num_kv_heads * head_dim);
+        let offset_t0 = (2 * block_size) * (num_kv_heads * head_dim);
         k_cache[offset_t0] = 1.0;
         v_cache[offset_t0] = 10.0;
 
@@ -49,7 +49,7 @@ mod paged_attention_v2_tests {
         v_cache[offset_t1 + 1] = 20.0;
 
         // Fill token 2 in block 1, offset 0: K = [1, 0, 1, 0], V = [0, 0, 30, 0]
-        let offset_t2 = (1 * block_size + 0) * (num_kv_heads * head_dim);
+        let offset_t2 = block_size * (num_kv_heads * head_dim);
         k_cache[offset_t2] = 1.0;
         k_cache[offset_t2 + 2] = 1.0;
         v_cache[offset_t2 + 2] = 30.0;
@@ -281,8 +281,8 @@ mod paged_attention_v2_tests {
         // seq 2: blocks [10] (len 8)
         let block_tables = vec![
             1u32, 5, 0, 0, // seq 0
-            0, 8, 2, 0,    // seq 1
-            10, 0, 0, 0,   // seq 2
+            0, 8, 2, 0, // seq 1
+            10, 0, 0, 0, // seq 2
         ];
         let context_lens = vec![25u32, 40, 8];
 
