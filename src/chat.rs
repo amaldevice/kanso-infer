@@ -94,6 +94,8 @@ impl ChatSession {
         let eos_id = self.tokenizer.as_ref().map(|t| t.eos_token_id).unwrap_or(2);
         // #56: hand the engine the stop token, so EOS retires the sequence and releases
         // its KV blocks instead of generating up to max_tokens holding them.
+        // F5: the REPL exposes no sampling flags, so this path keeps the greedy default
+        // `SamplingParams` (`add_request_with_sampling` is the hook if it ever grows one).
         let request_id = self
             .engine
             .add_request_with_stops(tokens, max_tokens, vec![eos_id]);

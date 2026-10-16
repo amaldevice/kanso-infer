@@ -40,6 +40,18 @@ enum Commands {
         /// Path to tokenizer.json (optional, auto-resolved from working directory or HF cache)
         #[arg(long)]
         tokenizer: Option<String>,
+
+        /// Sampling temperature; 0 = greedy (default)
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+
+        /// Nucleus sampling top-p
+        #[arg(long, default_value_t = 1.0)]
+        top_p: f32,
+
+        /// Sampling RNG seed
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
     },
 
     /// Start an interactive multi-turn terminal chat session (REPL)
@@ -154,6 +166,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             backend,
             max_tokens,
             tokenizer,
+            temperature,
+            top_p,
+            seed,
         } => {
             if prompt.is_empty() {
                 eprintln!("Error: Please provide at least one prompt with --prompt \"...\"");
@@ -196,7 +211,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let eos_id = tok_wrapper.as_ref().map(|t| t.eos_token_id).unwrap_or(2);
                 // #56: EOS retires the sequence in the engine (blocks freed) instead of
                 // generating up to max_tokens after the client already stopped reading.
-                let req_id = engine.add_request_with_stops(tokens, max_tokens, vec![eos_id]);
+                // F5: the user's sampling knobs ride along on the sequence.
+                let req_id = engine.add_request_with_sampling(
+                    tokens,
+                    max_tokens,
+                    vec![eos_id],
+                    kanso_infer::scheduler::SamplingParams {
+                        temperature,
+                        top_p,
+                        seed,
+                    },
+                );
 
                 println!("\nPrompt: \"{}\"", p);
                 print!("Assistant > ");

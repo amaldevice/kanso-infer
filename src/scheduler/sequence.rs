@@ -62,6 +62,12 @@ impl Sequence {
         self.status == SequenceStatus::Finished
     }
 
+    /// #56: the one termination rule — `max_tokens` reached, or `token` (the token just
+    /// appended to `generated_tokens`) is one of the configured stop ids.
+    pub fn is_done_after(&self, token: u32) -> bool {
+        self.generated_tokens.len() >= self.max_tokens || self.stop_token_ids.contains(&token)
+    }
+
     pub fn total_tokens(&self) -> usize {
         self.prompt_tokens.len() + self.generated_tokens.len()
     }

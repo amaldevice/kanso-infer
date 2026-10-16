@@ -2,7 +2,7 @@ use crate::error::EngineError;
 use crate::kv_cache::{BlockPool, BlockTable, KvStorage, PrefixCache};
 use crate::model::Model;
 use crate::sampler::sample_token;
-use crate::scheduler::{Sequence, SequenceStatus};
+use crate::scheduler::{SamplingParams, Sequence, SequenceStatus};
 
 #[derive(Debug, Clone)]
 pub struct StepOutput {
@@ -152,10 +152,28 @@ impl Engine {
         max_tokens: usize,
         stop_token_ids: Vec<u32>,
     ) -> u64 {
+        self.add_request_with_sampling(
+            prompt_tokens,
+            max_tokens,
+            stop_token_ids,
+            SamplingParams::default(),
+        )
+    }
+
+    /// Full constructor: stop ids plus the per-request sampling knobs the engine's sample
+    /// sites read (#56, CLI/server user knobs).
+    pub fn add_request_with_sampling(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        stop_token_ids: Vec<u32>,
+        sampling: SamplingParams,
+    ) -> u64 {
         let id = self.next_request_id;
         self.next_request_id += 1;
         let mut seq = Sequence::new(id, prompt_tokens, max_tokens);
         seq.stop_token_ids = stop_token_ids;
+        seq.sampling = sampling;
         self.sequences.push(seq);
         id
     }
@@ -247,8 +265,7 @@ impl Engine {
 
             // #56: EOS (any configured stop id) retires the sequence exactly like
             // max_tokens, so its blocks return to the pool in this same step.
-            let is_finished = seq.generated_tokens.len() >= seq.max_tokens
-                || seq.stop_token_ids.contains(&next_token);
+            let is_finished = seq.is_done_after(next_token);
             if is_finished {
                 seq.status = SequenceStatus::Finished;
                 finished_indices.push(idx);
@@ -374,8 +391,7 @@ impl Engine {
                 seq.block_table.advance_tokens(1);
 
                 // #56: EOS retires the sequence in this same step.
-                let is_finished = seq.generated_tokens.len() >= seq.max_tokens
-                    || seq.stop_token_ids.contains(&next_token);
+                let is_finished = seq.is_done_after(next_token);
                 if is_finished {
                     seq.status = SequenceStatus::Finished;
                     finished_indices.push(idx);
@@ -406,7 +422,8 @@ impl Engine {
 
     /// #56: drops finished requests from the active vector so a long-lived engine
     /// (server, CLI) does not rescan unbounded history every step. Returns how many
-    /// were dropped. Finished sequences stay visible until the embedder drains them.
+    /// were dropped. Finished sequences stay visible until the caller (chat/CLI/server)
+    /// calls this; their KV blocks are already back in the pool by then.
     pub fn drain_finished(&mut self) -> usize {
         let before = self.sequences.len();
         self.sequences.retain(|s| !s.is_finished());
@@ -509,6 +526,7 @@ impl Engine {
             start_pos,
             &mut seq_mut.block_table,
             &mut self.block_pool,
+            &mut self.prefix_cache,
             &mut self.kv_storage,
             self.block_size,
         )?;
@@ -532,11 +550,18 @@ impl Engine {
             &mut self.block_pool,
         );
 
-        let stopped = committed
+        // #56/F1: same termination rule as the decode/prefill paths.
+        let done = seq_mut
+            .generated_tokens
             .last()
-            .is_some_and(|tok| seq_mut.stop_token_ids.contains(tok));
-        if seq_mut.generated_tokens.len() >= seq_mut.max_tokens || stopped {
+            .is_some_and(|&tok| seq_mut.is_done_after(tok));
+        if done {
             seq_mut.status = SequenceStatus::Finished;
+            // #56/F3: a speculative finish never reaches stage-4 retirement, so the
+            // blocks would otherwise stay out of the pool until process end.
+            for &blk in seq_mut.block_table.blocks() {
+                self.block_pool.free(blk);
+            }
         }
 
         let mut final_result = verify_result;

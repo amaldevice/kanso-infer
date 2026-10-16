@@ -31,14 +31,6 @@ impl PrefixCache {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.cached_prefixes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.cached_prefixes.is_empty()
-    }
-
     /// Stores prefix tokens in increments of block_size with their physical block IDs
     pub fn insert_prefix(&mut self, tokens: &[u32], blocks: &[usize]) {
         let num_complete_blocks = tokens.len() / self.block_size;
