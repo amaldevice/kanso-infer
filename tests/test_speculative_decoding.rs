@@ -243,6 +243,35 @@ fn test_partial_candidate_acceptance_and_kv_rollback() {
 }
 
 #[test]
+fn test_speculative_finish_returns_blocks_to_pool() {
+    // #56/F3: a sequence finished by `speculative_step` gets no stage-4 retirement,
+    // so that path must hand its KV blocks back itself.
+    let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
+    let mut engine = Engine::new(model, 1, 8, 2);
+    let req_id = engine.add_request(vec![1, 2], 3);
+    engine.step().expect("prefill failed"); // prefill + first token
+
+    for _ in 0..8 {
+        if engine.sequences[0].is_finished() {
+            break;
+        }
+        engine
+            .speculative_step(req_id, &[49, 48, 47])
+            .expect("speculative step failed");
+    }
+
+    assert!(
+        engine.sequences[0].is_finished(),
+        "max_tokens must finish the sequence"
+    );
+    assert_eq!(
+        engine.free_blocks_count(),
+        8,
+        "finished sequence must release its KV blocks"
+    );
+}
+
+#[test]
 #[ignore = "KNOWN-FAIL #43 (tracking: amaldevice/kanso-infer#43#issuecomment-6216433916): monolithic-vs-verify divergen pada mock random; re-enable penuh setelah fix #43"]
 fn test_speculative_parity_with_adversarial_draft_candidates() {
     let prompt = vec![3, 7, 11];

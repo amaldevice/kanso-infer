@@ -1,9 +1,8 @@
-//! Chunked-vs-monolithic golden for #57 — teeth for #43 (chunk amnesia).
+//! Chunked-vs-monolithic golden for #57 — regression guard for #43 (chunk amnesia).
 //! Compares `forward_prefill` in chunks of 4/7/16 against the monolithic
 //! `forward_tokens` reference on the fixed-seed random mock.
-//! EXPECTED TO FAIL until #43 is fixed (chunked prefill ignores prior-chunk
-//! context: causal mask is chunk-local and attention never gathers earlier K/V).
-//! DO NOT #[ignore] this test: it must stay red as proof the suite can see #43.
+//! Fixed by #43 (offset causal mask + full-context K/V gather); this test
+//! must stay green — reverting the fix turns it red.
 
 use kanso_infer::kv_cache::{BlockTable, KvStorage};
 use kanso_infer::model::Model;
@@ -51,7 +50,6 @@ fn chunked_last_token_logits(model: &Model, prompt: &[u32], chunk: usize) -> Vec
     last
 }
 
-#[ignore = "KNOWN-FAIL #43 (tracking: amaldevice/kanso-infer#43#issuecomment-6216433916): chunked prefill ignores prior-chunk context; re-enable (hapus ignore) setelah fix #43; run eksplisit via -- --ignored untuk bukti gigi"]
 #[test]
 fn test_chunked_prefill_matches_monolithic_golden() {
     let model = mock();

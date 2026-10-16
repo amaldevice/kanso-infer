@@ -1,4 +1,5 @@
 use crate::engine::Engine;
+use crate::scheduler::SamplingParams;
 use crate::server::dto::{
     ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
     HealthResponse,
@@ -51,6 +52,18 @@ async fn chat_completions_handler(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let max_tokens = req.max_tokens.unwrap_or(16);
 
+    // #56/F5: user knobs reach the engine's sample sites via the sequence.
+    let mut sampling = SamplingParams::default();
+    if let Some(t) = req.temperature {
+        sampling.temperature = t;
+    }
+    if let Some(p) = req.top_p {
+        sampling.top_p = p;
+    }
+    if let Some(s) = req.seed {
+        sampling.seed = s;
+    }
+
     // Minimal mock tokenization: convert characters to token IDs
     let prompt_text = req
         .messages
@@ -80,7 +93,11 @@ async fn chat_completions_handler(
                 ));
             }
         }
-        engine.add_request(prompt_tokens, max_tokens)
+        // #56/F4 decision: this path tokenizes bytes by hand and holds no tokenizer, so
+        // there is no EOS id to hand the engine — server requests intentionally run to
+        // `max_tokens` and are retired by `drain_finished` below. Threading stop ids in
+        // needs a tokenizer (and its eos_token_id) in `AppState`.
+        engine.add_request_with_sampling(prompt_tokens, max_tokens, Vec::new(), sampling)
     };
 
     tokio::task::yield_now().await;
@@ -109,6 +126,9 @@ async fn chat_completions_handler(
         }
 
         if done {
+            // #56: this request is retired — drop it (and any other finished sequence)
+            // from the engine so the active vector does not grow without bound.
+            state.engine.lock().drain_finished();
             break;
         }
         tokio::task::yield_now().await;

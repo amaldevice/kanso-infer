@@ -12,6 +12,10 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     pub max_tokens: Option<usize>,
     pub stream: Option<bool>,
+    /// #56: OpenAI-style sampling knobs; unset = greedy defaults.
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
