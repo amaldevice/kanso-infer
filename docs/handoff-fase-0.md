@@ -158,3 +158,33 @@ Native GitHub dependencies sudah dipasang; peta lintas-fase dikomentar di #58.
   GEMV≥60%, attn≤2x teoritis, idle-gap<5% wired-step, RSS/tok/s/PPL real-file.
 - Worktree/branch tiket dihapus; `main` @ `8ea4fb8` bersih.
 - Lanjut: #61 Fase-2 serving — frontier #45/#48 (butuh #51 + Fase-0 hijau).
+
+## 9. Penutup Fase-2 — DONE 2026-10-18
+
+> Fase-2 CLOSED. PR #75 MERGED ke `main` (`eae6e1f`). Spec #61 + tiket
+> #45/#48/#46/#55 CLOSED (auto-close pas merge).
+
+| Tiket | PR tiket | State |
+|---|---|---|
+| #48 paged decode | #74 | CLOSED |
+| #45 batched forward | #76 | CLOSED |
+| #55 draft-KV | #77 | CLOSED |
+| #46 server SSE | #78 | CLOSED |
+| #61 spec Fase-2 | #75 (integration, merged) | CLOSED |
+
+- **#48**: `paged_kv_tokens` zero-copy view + strided AMX + rope table;
+  cpu 1.262x, metal 1.299x, amx 1.063x; 353MB→18MB/step.
+- **#45**: `forward_batch` 1 GEMM/step + `write_kv_slots`; batch-8 4.2x cpu /
+  5x amx (release, mock shapes).
+- **#55**: draft-KV + Leviathan + verify-RoPE fix (root cause 5 ignored tests
+  sejak #43 — kini re-enabled); proxy 2.4x; real-pair 0.84x documented.
+- **#46**: engine-loop thread + per-request mpsc + real tokenizer + SSE
+  `chat.completion.chunk`; 8-konkuren hijau.
+- **Review dua-axis** (`/tmp/review_fase2_final.md`): 4 CONDITIONAL PASS,
+  fix F1–F14 applied (F3 claim scoped non-spec; F5/F7 ignore + release-job).
+- **Suite**: debug hijau kecuali decode-latency (environmental: lolos isolasi
+  base+tip, gagal hanya full-paralel).
+- **Debt F15** (target Mac + GGUF + SDK): batch-8 real, ctx-latency real,
+  spec real-pair speedup, SDK SSE run.
+- Worktree/branch tiket dihapus; `main` @ `eae6e1f` bersih.
+- Lanjut: #62 Fase-3 honesty — #53 telemetri + #54 README table.
