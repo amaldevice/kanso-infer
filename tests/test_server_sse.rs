@@ -8,7 +8,7 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
-use kanso_infer::chat::ChatSession;
+use kanso_infer::chat::{ChatMessage, format_chatml};
 use kanso_infer::engine::Engine;
 use kanso_infer::model::Model;
 use kanso_infer::scheduler::SamplingParams;
@@ -19,10 +19,10 @@ use tower::ServiceExt;
 
 const MODEL: &str = "mock-tiny";
 
-/// Mock weights are fixed-seed and sampling is greedy, so a fresh engine driven by the
-/// test is exact ground truth for what the server must return.
+/// Smallest mock whose vocab covers the real tokenizer's ids: mock weight generation
+/// dominates test wall time, and only `vocab_size` drives the embedding/head cost.
 fn mock_engine(vocab_size: usize) -> Engine {
-    let model = Model::create_mock_tiny(64, 4, 2, 2, vocab_size).unwrap();
+    let model = Model::create_mock_tiny(16, 2, 1, 1, vocab_size).unwrap();
     Engine::new(model, 8, 32, 16)
 }
 
@@ -39,7 +39,7 @@ fn vocab_size() -> usize {
 }
 
 fn app_for(engine: Engine) -> Router {
-    kanso_infer::server::create_app(std::sync::Arc::new(parking_lot::Mutex::new(engine)))
+    kanso_infer::server::create_app(engine, tokenizer())
 }
 
 struct Reference {
@@ -48,46 +48,56 @@ struct Reference {
     finish_reason: &'static str,
 }
 
-/// Ground truth for one prompt: same engine, same real tokenizer, same chat template —
-/// generated and decoded by the test, independent of any server code path.
-fn reference_reply(user_text: &str, max_tokens: usize) -> Reference {
+/// Ground truth: the same prompt tokens, the same real tokenizer, greedy decoding by an
+/// engine the test drives itself. Mock weights are fixed-seed and greedy sampling is
+/// deterministic, so this is exactly what the served engine must emit — for a lone
+/// request and for eight concurrent ones alike (batched forward is parity-tested).
+fn reference_replies(prompts: &[&str], max_tokens: usize) -> Vec<Reference> {
     let tok = tokenizer();
-    let mut session = ChatSession::new_with_tokenizer(mock_engine(vocab_size()), None, Some(tok.clone()));
-    session.add_user_message(user_text);
-    let (_, prompt_tokens) = session.format_prompt();
+    let mut engine = mock_engine(vocab_size());
+    let mut references = Vec::new();
 
-    let mut engine = session.engine;
-    engine.add_request_with_sampling(
-        prompt_tokens,
-        max_tokens,
-        vec![tok.eos_token_id],
-        SamplingParams::default(),
-    );
+    for prompt in prompts {
+        let prompt_tokens = tok
+            .encode(&format_chatml(&[ChatMessage {
+                role: "user".to_string(),
+                content: (*prompt).to_string(),
+            }]))
+            .unwrap();
+        engine.add_request_with_sampling(
+            prompt_tokens,
+            max_tokens,
+            vec![tok.eos_token_id],
+            SamplingParams::default(),
+        );
 
-    let mut decoder = StreamDecoder::new();
-    let mut text = String::new();
-    let mut tokens = 0;
-    let mut finish_reason = "length";
-    for _ in 0..512 {
-        if !engine.has_unfinished_requests() {
-            break;
-        }
-        for out in engine.step().unwrap() {
-            if out.token_id == tok.eos_token_id {
-                finish_reason = "stop";
-                continue;
+        let mut decoder = StreamDecoder::new();
+        let mut text = String::new();
+        let mut tokens = 0;
+        let mut finish_reason = "length";
+        for _ in 0..512 {
+            if !engine.has_unfinished_requests() {
+                break;
             }
-            text.push_str(&decoder.push(&tok, out.token_id).unwrap());
-            tokens += 1;
+            for out in engine.step().unwrap() {
+                if out.token_id == tok.eos_token_id {
+                    finish_reason = "stop";
+                    continue;
+                }
+                text.push_str(&decoder.push(&tok, out.token_id).unwrap());
+                tokens += 1;
+            }
         }
-    }
-    text.push_str(&decoder.flush(&tok).unwrap());
+        text.push_str(&decoder.flush(&tok).unwrap());
+        engine.drain_finished();
 
-    Reference {
-        text,
-        tokens,
-        finish_reason,
+        references.push(Reference {
+            text,
+            tokens,
+            finish_reason,
+        });
     }
+    references
 }
 
 fn chat_request(stream: bool, user_text: &str, max_tokens: usize) -> Request<Body> {
@@ -170,7 +180,10 @@ fn assert_openai_chunks(payloads: &[String]) -> (String, usize, String) {
     assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
     let last = chunks.last().unwrap();
     assert_eq!(last["choices"][0]["delta"], json!({}));
-    let finish_reason = last["choices"][0]["finish_reason"].as_str().unwrap().to_string();
+    let finish_reason = last["choices"][0]["finish_reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let text: String = chunks[1..chunks.len() - 1]
         .iter()
@@ -202,7 +215,7 @@ async fn test_health_reports_engine_state() {
 
 #[tokio::test]
 async fn test_chat_completion_serves_real_model_text() {
-    let expected = reference_reply("hello", 4);
+    let expected = reference_replies(&["hello"], 4).remove(0);
     assert!(!expected.text.is_empty(), "reference generated no text");
     let app = app_for(mock_engine(vocab_size()));
 
@@ -226,12 +239,15 @@ async fn test_chat_completion_serves_real_model_text() {
 
 #[tokio::test]
 async fn test_streaming_chat_completion_is_openai_sse() {
-    let expected = reference_reply("hello", 4);
+    let expected = reference_replies(&["hello"], 4).remove(0);
     let app = app_for(mock_engine(vocab_size()));
 
     let resp = send(&app, chat_request(true, "hello", 4)).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let content_type = resp.headers()[header::CONTENT_TYPE].to_str().unwrap().to_string();
+    let content_type = resp.headers()[header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .to_string();
     assert!(
         content_type.starts_with("text/event-stream"),
         "stream: true must answer with SSE, got {content_type}"
@@ -240,7 +256,10 @@ async fn test_streaming_chat_completion_is_openai_sse() {
     let payloads = sse_payloads(resp).await;
     let (text, frames, finish_reason) = assert_openai_chunks(&payloads);
 
-    assert_eq!(text, expected.text, "streamed deltas must spell the real reply");
+    assert_eq!(
+        text, expected.text,
+        "streamed deltas must spell the real reply"
+    );
     assert_eq!(finish_reason, expected.finish_reason);
     assert!(
         frames == expected.tokens || frames == expected.tokens + 1,
@@ -252,8 +271,10 @@ async fn test_streaming_chat_completion_is_openai_sse() {
 #[tokio::test]
 async fn test_eight_concurrent_requests_keep_their_own_tokens() {
     let app = app_for(mock_engine(vocab_size()));
-    let prompts: Vec<String> = (0..8).map(|i| format!("concurrent request number {i}")).collect();
-    let expected: Vec<Reference> = prompts.iter().map(|p| reference_reply(p, 3)).collect();
+    let prompts: Vec<String> = (0..8)
+        .map(|i| format!("concurrent request number {i}"))
+        .collect();
+    let expected = reference_replies(&prompts.iter().map(String::as_str).collect::<Vec<_>>(), 3);
 
     let mut handles = Vec::new();
     for prompt in &prompts {
