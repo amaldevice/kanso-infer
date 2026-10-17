@@ -23,13 +23,19 @@ const VOCAB: usize = 49_152;
 
 const SHORT_CTX: usize = 128;
 const LONG_CTX: usize = 2048;
-const REPS: usize = 5;
+const REPS: usize = 7;
 
 /// Median wall time of a single decode step with `ctx` tokens already cached.
-fn decode_step_ms(model: &Model, ctx: usize, reps: usize) -> f64 {
+struct Cached {
+    block_table: BlockTable,
+    kv_storage: KvStorage,
+    pos: usize,
+}
+
+fn cached(model: &Model, ctx: usize) -> Cached {
     let block_size = model.config.block_size;
     let blocks = ctx.div_ceil(block_size);
-    let mut kv_storage = KvStorage::new(
+    let kv_storage = KvStorage::new(
         model.config.num_hidden_layers,
         blocks,
         block_size,
@@ -44,25 +50,57 @@ fn decode_step_ms(model: &Model, ctx: usize, reps: usize) -> f64 {
         block_table.push_block(b);
     }
     block_table.set_num_tokens(ctx);
-    let pos = ctx - 1;
 
+    let mut cache = Cached {
+        block_table,
+        kv_storage,
+        pos: ctx - 1,
+    };
     // Warmup: rope table, Accelerate init, allocator arenas.
     for _ in 0..2 {
-        let _ = model
-            .forward_decode_step(1, pos, &block_table, &mut kv_storage)
-            .expect("warmup decode step");
+        step(model, &mut cache);
     }
+    cache
+}
 
-    let mut times = Vec::with_capacity(reps);
-    for _ in 0..reps {
-        let start = Instant::now();
-        let _ = model
-            .forward_decode_step(7, pos, &block_table, &mut kv_storage)
-            .expect("decode step");
-        times.push(start.elapsed().as_secs_f64() * 1e3);
+fn step(model: &Model, cache: &mut Cached) -> f64 {
+    let start = Instant::now();
+    let _ = model
+        .forward_decode_step(7, cache.pos, &cache.block_table, &mut cache.kv_storage)
+        .expect("decode step");
+    start.elapsed().as_secs_f64() * 1e3
+}
+
+/// Paired short/long decode steps, interleaved so that machine load (a sibling build,
+/// thermal drift) inflates both sides of the ratio the same way. The step order flips
+/// every round so a ramp cannot bias one side, and the reported ratio is the median of
+/// the per-round ratios.
+fn decode_step_ms(model: &Model, reps: usize) -> (f64, f64, f64) {
+    let mut short = cached(model, SHORT_CTX);
+    let mut long = cached(model, LONG_CTX);
+
+    let mut ratios = Vec::with_capacity(reps);
+    let mut short_times = Vec::with_capacity(reps);
+    let mut long_times = Vec::with_capacity(reps);
+    for r in 0..reps {
+        let (s, l) = if r % 2 == 0 {
+            (step(model, &mut short), step(model, &mut long))
+        } else {
+            let l = step(model, &mut long);
+            (step(model, &mut short), l)
+        };
+        ratios.push(l / s);
+        short_times.push(s);
+        long_times.push(l);
     }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    times[times.len() / 2]
+    short_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    long_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (
+        short_times[reps / 2],
+        long_times[reps / 2],
+        ratios[reps / 2],
+    )
 }
 
 #[test]
@@ -81,9 +119,7 @@ fn decode_latency_does_not_scale_with_context() {
 
     for backend in backends {
         model.set_backend(backend);
-        let short = decode_step_ms(&model, SHORT_CTX, REPS);
-        let long = decode_step_ms(&model, LONG_CTX, REPS);
-        let ratio = long / short;
+        let (short, long, ratio) = decode_step_ms(&model, REPS);
         println!(
             "#48 [{backend}] decode step: ctx{SHORT_CTX} {short:.2}ms, ctx{LONG_CTX} {long:.2}ms, ratio {ratio:.3} (limit 1.3)"
         );

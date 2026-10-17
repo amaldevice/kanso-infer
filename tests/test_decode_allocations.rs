@@ -1,5 +1,11 @@
-//! Ticket #48 / spec #61: the README claims the inner decode loop is zero-allocation.
-//! This is that claim, measured: allocations inside one decode step after warmup.
+//! Ticket #48 / spec #61: the README's "zero-allocation decode step" claim was removed
+//! because it does not hold — candle allocates an output for every op, so a decode step
+//! always allocates. What this guards instead: a decode step must not allocate the KV
+//! history again (the #48 gather-copy regression), so the bytes allocated past a short
+//! context stay far below one full history.
+//!
+//! The counting global allocator lives in this file's own test binary so its counters
+//! are not polluted by other test modules running in parallel.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,9 +44,10 @@ const Q_HEADS: usize = 15;
 const KV_HEADS: usize = 5;
 const LAYERS: usize = 32;
 const VOCAB: usize = 49_152;
-const CTX: usize = 2048;
+const SHORT_CTX: usize = 128;
+const LONG_CTX: usize = 2048;
 
-/// Allocations (count, bytes) charged to the last of `reps` decode steps.
+/// Allocations (count, bytes) charged to the last of `reps` decode steps at `ctx`.
 fn step_allocations(model: &Model, ctx: usize, reps: usize) -> (usize, usize) {
     let block_size = model.config.block_size;
     let blocks = ctx.div_ceil(block_size);
@@ -84,14 +91,48 @@ fn step_allocations(model: &Model, ctx: usize, reps: usize) -> (usize, usize) {
 }
 
 #[test]
-fn decode_step_is_allocation_free_after_warmup() {
-    let model = Model::create_mock_tiny(HIDDEN, Q_HEADS, KV_HEADS, LAYERS, VOCAB)
+fn decode_step_does_not_allocate_the_kv_history() {
+    let mut model = Model::create_mock_tiny(HIDDEN, Q_HEADS, KV_HEADS, LAYERS, VOCAB)
         .expect("mock model at SmolLM2-360M dimensions");
 
-    let (allocs, bytes) = step_allocations(&model, CTX, 3);
-    println!("#48 decode step at ctx{CTX}: {allocs} allocations, {bytes} bytes");
-    assert_eq!(
-        allocs, 0,
-        "decode step must not allocate after warmup ({bytes} bytes in {allocs} allocations)"
-    );
+    // Bytes one full KV history occupies: K+V per token per layer.
+    let history_bytes = 2
+        * LONG_CTX
+        * model.config.num_key_value_heads
+        * model.config.head_dim()
+        * 4
+        * model.config.num_hidden_layers;
+
+    let mut backends = vec![kanso_infer::Backend::Cpu];
+    if !matches!(kanso_infer::Backend::default(), kanso_infer::Backend::Cpu) {
+        backends.push(kanso_infer::Backend::default());
+    }
+    if kanso_infer::accelerate::amx::has_accelerate_support() {
+        backends.push(kanso_infer::Backend::Amx);
+    }
+
+    for backend in backends {
+        model.set_backend(backend);
+        let (allocs_short, bytes_short) = step_allocations(&model, SHORT_CTX, 3);
+        let (allocs_long, bytes_long) = step_allocations(&model, LONG_CTX, 3);
+        let extra = bytes_long.saturating_sub(bytes_short);
+        println!(
+            "#48 [{backend}] decode allocs: ctx{SHORT_CTX} {allocs_short} allocs / {bytes_short} bytes, \
+             ctx{LONG_CTX} {allocs_long} allocs / {bytes_long} bytes, extra {extra} bytes vs history {history_bytes} (limit {})",
+            history_bytes / 4,
+        );
+        // The old path re-gathered the whole history per layer per token: the extra
+        // bytes at long context were ~3x one full history. The paged read keeps them
+        // to the attention intermediates (scores/probs), far below one history.
+        assert!(
+            extra < history_bytes / 4,
+            "[{backend}] decode at ctx{LONG_CTX} allocates {extra} extra bytes vs {bytes_short} at ctx{SHORT_CTX}: \
+             the KV history ({history_bytes} bytes) must not be re-materialized per step"
+        );
+        // The op count of a step does not depend on the context length.
+        assert!(
+            allocs_long <= allocs_short + 64,
+            "[{backend}] allocation count grows with context: {allocs_long} at ctx{LONG_CTX} vs {allocs_short} at ctx{SHORT_CTX}"
+        );
+    }
 }
