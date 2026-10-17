@@ -125,3 +125,36 @@ Native GitHub dependencies sudah dipasang; peta lintas-fase dikomentar di #58.
 - **Suite di main**: 123 passed, 5 ignored (36 suites; 5 speculative ignore pra-ada).
 - Worktree/branch tiket dihapus; `main` @ `7f13ec8` bersih.
 - Lanjut (bila diminta): #60 Fase-1 GPU — mulai dari frontier #42, pola sama.
+
+## 8. Penutup Fase-1 — DONE 2026-10-17
+
+> Fase-1 CLOSED. PR #68 MERGED ke `main` (`8ea4fb8`). Spec #60 + tiket
+> #42/#47/#49/#50/#51/#52 CLOSED (auto-close pas merge).
+
+| Tiket | PR tiket | State |
+|---|---|---|
+| #42 backend enum | #71 | CLOSED |
+| #51 paged-attn v2 | #67 | CLOSED |
+| #50 GEMV multigroup | #69 | CLOSED |
+| #52 AMX no-memcpy | #70 | CLOSED |
+| #49 cmd-buffer + AOT | #72 | CLOSED |
+| #47 quantized weights | #73 | CLOSED |
+| #60 spec Fase-1 | #68 (integration, merged) | CLOSED |
+
+- **#42**: `Backend` enum + `Device::new_metal(0)` + honest label; foo = error.
+- **#51**: split-K partitions + merge kernel + GQA sharing; parity 8/8.
+- **#50**: multi-TG coalesced float4 + simd_sum; parity 960/2048/4096.
+- **#52**: CblasTrans zero-copy; 4KB/step (was 7.4MB); 1.48x mock-dims.
+- **#49**: `MetalWeights` resident + 1 cmdbuf/step + build.rs metallib AOT
+  (strict-proof di Xcode CI; box ini CLT-only).
+- **#47**: `LinearWeight(QMatMul)` resident; RSS 493MB; 3.89x; PPL d0.18%
+  (synthetic-proxy; real-GGUF hook `KANSO_GGUF=`).
+- **Review dua-axis** (`/tmp/review_fase1_final.md`): #42/#51 PASS;
+  #47/#49/#50/#52 struktur-parity hijau, angka-bandwidth manual. Fix F1–F11
+  applied (F1: decode_step harness-only documented — full Metal decode loop =
+  tiket sendiri; F12 pengukuran manual = debt).
+- **Suite di main**: 155 passed, 5 ignored (41 suites).
+- **Debt pengukuran F12** (butuh target Mac + Instruments + GGUF asli):
+  GEMV≥60%, attn≤2x teoritis, idle-gap<5% wired-step, RSS/tok/s/PPL real-file.
+- Worktree/branch tiket dihapus; `main` @ `8ea4fb8` bersih.
+- Lanjut: #61 Fase-2 serving — frontier #45/#48 (butuh #51 + Fase-0 hijau).
