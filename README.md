@@ -22,7 +22,7 @@ A minimalist, high-performance LLM inference engine written in Rust, engineered 
 - **Apple Silicon Metal Zero-Copy UMA Runtime**: Allocates GPU buffers in shared storage mode (`MTLStorageModeShared`), allowing CPU slices and Metal shaders to share physical Unified Memory with zero PCIe copy overhead.
 - **Startup Metal Pipeline Caching**: Pre-compiles all Metal Shading Language (`.metal`) compute kernels into `MTLComputePipelineState` handles during initialization, preventing first-request compilation stutter.
 - **Fused PagedAttention v2 with Online Softmax**: Computes attention scores and context reduction directly within GPU threadgroup shared memory in tiles, completely eliminating the materialization of intermediate score matrices ($[B, N_h, Q, S]$) in global VRAM.
-- **ARM NEON SIMD Quantization Kernels**: Fast vector kernels using AArch64 intrinsics (`vdotq_s32`, `vfmaq_f32`) for on-the-fly Q8_0 and Q4_K matrix-vector multiplication in CPU registers.
+- **Quantized-Resident Weights**: GGUF projection weights keep their on-disk format (Q8_0/Q4_K blocks, F16 floor) instead of being dequantized to F32 at load, so batch-1 decode reads ~1 byte/param; matmuls run off that storage (NEON/dotprod kernels on CPU, dequant-on-the-fly GEMV on Metal), embeddings dequantize per row at lookup. SmolLM2-360M Q8_0 loads at ~376 MB resident with ~3.9x the F32 decode rate. The hand-written `src/quant` Q8_0/Q4_K GEMV kernels stay as the reference/benchmark path.
 - **Speculative Decoding Verification Pipeline**: Target-draft speculative execution with atomic KV cache block table rollback upon draft token rejection, ensuring 100% mathematical token parity with non-speculative greedy decoding.
 
 ### 3. Multi-Model Architecture Matrix (~350M Compact Class)
