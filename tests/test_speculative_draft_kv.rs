@@ -9,10 +9,11 @@
 //!
 //! Measured (release, 2026-10-17, SmolLM2-360M/135M-Instruct Q8_0 on this Mac, α=0.884):
 //! before #45's batched forward landed on the integration branch the real pair landed at
-//! 0.84-0.99x; after merging it the same test reads 1.63-2.00x. The draft-KV fix is the
-//! same in both, so the difference is the baseline: #45 replaced the single-sequence decode
-//! path with the batched one, and batch-1 decode got slower (load was high, so this is not
-//! a trustworthy A/B). Neither number gates this ticket — see the cost analysis below.
+//! 0.84-0.99x; after merging it the same test reads 1.63-2.00x. The draft-KV fix is the same
+//! in both, so the difference is the baseline: #45 moved `Engine::step()` onto the batched
+//! path, which by design trades batch-1 latency for batch throughput (#45). Machine load was
+//! high during the later runs, so neither number is a trustworthy A/B. Neither gates this
+//! ticket — see the cost analysis below, which uses the single-token decode path.
 //!
 //! On the pre-#45 decode path the round economics do not close: a 5-row target forward costs
 //! 43.6ms against 15.7ms for a single-row decode (weight reads are only partially amortized,
