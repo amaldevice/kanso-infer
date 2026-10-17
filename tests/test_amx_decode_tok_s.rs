@@ -56,10 +56,10 @@ fn test_decode_tok_s_amx_beats_cpu_at_smollm2_dimensions() {
     let mut model = Model::create_mock_tiny(HIDDEN, Q_HEADS, KV_HEADS, LAYERS, VOCAB)
         .expect("mock model at SmolLM2-360M dimensions");
 
-    model.set_backend("amx");
+    model.set_backend(kanso_infer::Backend::Amx);
     let amx_tok_s = decode_tok_s(&model, STEPS);
 
-    model.set_backend("cpu");
+    model.set_backend(kanso_infer::Backend::Cpu);
     let cpu_tok_s = decode_tok_s(&model, STEPS);
 
     println!("decode tok/s @ SmolLM2-360M dims: amx={amx_tok_s:.2}, cpu={cpu_tok_s:.2}");
