@@ -208,7 +208,7 @@ const LAYERS: usize = 8;
 const VOCAB: usize = 49_152;
 const PROMPT: usize = 8;
 const GEN: usize = 12;
-const ROUNDS: usize = 3;
+const ROUNDS: usize = 4;
 
 fn mock_model(backend: kanso_infer::Backend) -> Model {
     let mut model = Model::create_mock_tiny(HIDDEN, Q_HEADS, KV_HEADS, LAYERS, VOCAB)
