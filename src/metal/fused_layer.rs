@@ -3,6 +3,14 @@ use crate::metal::context::MetalContext;
 use crate::metal::ops::{gpu_rmsnorm_buffer, gpu_rope_buffer};
 use metal::{Buffer, MTLSize, ResourceRef};
 
+/// Threads per threadgroup required by the kernels in `fused_llama_layer.metal`
+/// (mirrors `FUSED_THREADS_PER_TG` in the shader; the kernels drop out on mismatch).
+pub const FUSED_THREADS_PER_TG: usize = 256;
+/// SIMD groups (32 lanes each) per threadgroup.
+pub const FUSED_SIMD_GROUPS: usize = FUSED_THREADS_PER_TG / 32;
+/// Output rows one GEMV threadgroup covers: one row pair per SIMD group.
+pub const GEMV_ROWS_PER_THREADGROUP: usize = FUSED_SIMD_GROUPS * 2;
+
 /// Dimensions for a compact transformer layer (e.g. ~350M models).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FusedLayerDimensions {
@@ -22,6 +30,90 @@ impl FusedLayerDimensions {
     pub fn kv_dim(&self) -> usize {
         self.num_kv_heads * self.head_dim
     }
+
+    /// Host-side dimension contract of the fused kernels (ticket #50): anything the
+    /// kernels could index out of range fails here instead of on the GPU. There is no
+    /// hidden-dim ceiling - the fixed `shared_norm[2048]` threadgroup array that capped
+    /// this at 2048 is gone.
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if self.num_q_heads == 0 || self.num_kv_heads == 0 {
+            return Err(EngineError::Metal(format!(
+                "head counts must be non-zero, got num_q_heads={} num_kv_heads={}",
+                self.num_q_heads, self.num_kv_heads
+            )));
+        }
+        if self.head_dim == 0 || !self.head_dim.is_multiple_of(2) {
+            return Err(EngineError::Metal(format!(
+                "head_dim must be a non-zero even count (RoPE rotates two halves), got {}",
+                self.head_dim
+            )));
+        }
+        if self.hidden_dim == 0 || !self.hidden_dim.is_multiple_of(4) {
+            return Err(EngineError::Metal(format!(
+                "hidden_dim must be a non-zero multiple of 4 (GEMV lanes read float4 chunks), got {}",
+                self.hidden_dim
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Threadgroups and threads per threadgroup for a GEMV over `out_dim` rows.
+/// One SIMD group computes one row pair, so a threadgroup covers
+/// [`GEMV_ROWS_PER_THREADGROUP`] rows (ticket #50: the single-threadgroup dispatch is
+/// gone).
+pub fn gemv_threadgroup_geometry(out_dim: usize) -> (u64, u64) {
+    let units = out_dim.div_ceil(2) as u64;
+    (
+        units.div_ceil(FUSED_SIMD_GROUPS as u64),
+        FUSED_THREADS_PER_TG as u64,
+    )
+}
+
+/// Slice-shape contract of the layer entry points: the kernels index these buffers
+/// blindly from `dims`, so a slice of the wrong length is an out-of-bounds GPU read
+/// or write.
+fn validate_layer_inputs(
+    dims: &FusedLayerDimensions,
+    weights: &FusedLayerWeights,
+    hidden_in: &[f32],
+    cos_table: &[f32],
+    sin_table: &[f32],
+    pos: usize,
+) -> Result<(), EngineError> {
+    dims.validate()?;
+
+    let q_dim = dims.q_dim();
+    let kv_dim = dims.kv_dim();
+    let expect = |name: &str, got: usize, want: usize| -> Result<(), EngineError> {
+        if got == want {
+            Ok(())
+        } else {
+            Err(EngineError::Metal(format!(
+                "{name} has {got} elements, expected {want} for hidden_dim {} \
+                 (q_dim {q_dim}, kv_dim {kv_dim})",
+                dims.hidden_dim
+            )))
+        }
+    };
+
+    expect("hidden_in", hidden_in.len(), dims.hidden_dim)?;
+    expect("norm_weight", weights.norm_weight.len(), dims.hidden_dim)?;
+    expect("w_q", weights.w_q.len(), q_dim * dims.hidden_dim)?;
+    expect("w_k", weights.w_k.len(), kv_dim * dims.hidden_dim)?;
+    expect("w_v", weights.w_v.len(), kv_dim * dims.hidden_dim)?;
+
+    let table_len = (pos + 1) * (dims.head_dim / 2);
+    for (name, table) in [("cos_table", cos_table), ("sin_table", sin_table)] {
+        if table.len() < table_len {
+            return Err(EngineError::Metal(format!(
+                "{name} has {} elements, needs at least {table_len} to cover pos {pos}",
+                table.len()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Q, K, V output triple returned by fused/discrete layer helpers.
@@ -50,6 +142,19 @@ pub fn gpu_fused_rmsnorm_rope_buffer(
     pos: usize,
     eps: f32,
 ) -> Result<(), EngineError> {
+    // Host-side contract of the kernel (ticket #50): the rotation loop indexes the row
+    // by whole heads, so dim must be a whole number of even head_dim rows.
+    if dim == 0 || !dim.is_multiple_of(2) {
+        return Err(EngineError::Metal(format!(
+            "fused rmsnorm+rope dim must be a non-zero even count, got {dim}"
+        )));
+    }
+    if head_dim == 0 || !head_dim.is_multiple_of(2) || !dim.is_multiple_of(head_dim) {
+        return Err(EngineError::Metal(format!(
+            "fused rmsnorm+rope needs a non-zero even head_dim dividing dim, got head_dim={head_dim} dim={dim}"
+        )));
+    }
+
     let pipeline = ctx.pipelines.get("fused_rmsnorm_rope").ok_or_else(|| {
         EngineError::Metal("Pipeline 'fused_rmsnorm_rope' not found in cache".into())
     })?;
@@ -89,9 +194,13 @@ pub fn gpu_fused_rmsnorm_rope_buffer(
         &eps as *const _ as *const _,
     );
 
-    let threads = (dim.next_power_of_two() as u64).clamp(32, 256);
+    let threads = FUSED_THREADS_PER_TG as u64;
+
+    // One threadgroup per patch of rotations, instead of the single threadgroup that
+    // left every other GPU core idle (ticket #50).
+    let rotations = (dim / 2) as u64;
     let threadgroup_count = MTLSize {
-        width: 1,
+        width: rotations.div_ceil(threads),
         height: 1,
         depth: 1,
     };
@@ -128,6 +237,15 @@ pub fn gpu_fused_rmsnorm_rope(
         "input and weight must have matching length"
     );
     let dim = input.len();
+    let table_len = (pos + 1) * (head_dim / 2);
+    if cos_table.len() < table_len || sin_table.len() < table_len {
+        return Err(EngineError::Metal(format!(
+            "rotary tables must cover pos {pos}: need at least {table_len} elements, \
+             got cos={} sin={}",
+            cos_table.len(),
+            sin_table.len()
+        )));
+    }
 
     let in_buf = ctx.alloc_buffer_with_data(input);
     let weight_buf = ctx.alloc_buffer_with_data(weight);
@@ -184,9 +302,9 @@ pub fn encode_linear_gemv(
         &out_dim_u32 as *const _ as *const _,
     );
 
-    let threads_per_group = (out_dim as u64).clamp(32, 256);
+    let (threadgroups, threads_per_group) = gemv_threadgroup_geometry(out_dim);
     let threadgroups = MTLSize {
-        width: (out_dim as u64).div_ceil(threads_per_group),
+        width: threadgroups,
         height: 1,
         depth: 1,
     };
@@ -197,6 +315,87 @@ pub fn encode_linear_gemv(
     };
 
     encoder.dispatch_thread_groups(threadgroups, group_size);
+}
+
+/// Encodes one fused RMSNorm + GEMV (+ RoPE) dispatch for a single weight matrix.
+/// Output rows are covered by `gemv_threadgroup_geometry`, one row pair per SIMD group
+/// (ticket #50: the projection used to run on a single threadgroup).
+/// Public so callers can chain several projections into one command encoder, which is
+/// also how the GEMV bandwidth test isolates GPU time from host buffer upload.
+#[allow(clippy::too_many_arguments)] // one kernel binding surface per dispatch
+pub fn encode_fused_qkv_gemv(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &metal::ComputePipelineState,
+    in_buf: &Buffer,
+    norm_w_buf: &Buffer,
+    w_buf: &Buffer,
+    cos_buf: &Buffer,
+    sin_buf: &Buffer,
+    out_buf: &Buffer,
+    dims: &FusedLayerDimensions,
+    out_dim: usize,
+    pos: usize,
+    eps: f32,
+    apply_rope: bool,
+) {
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(in_buf), 0);
+    encoder.set_buffer(1, Some(norm_w_buf), 0);
+    encoder.set_buffer(2, Some(w_buf), 0);
+    encoder.set_buffer(3, Some(cos_buf), 0);
+    encoder.set_buffer(4, Some(sin_buf), 0);
+    encoder.set_buffer(5, Some(out_buf), 0);
+
+    let hidden_dim_u32 = dims.hidden_dim as u32;
+    let out_dim_u32 = out_dim as u32;
+    let head_dim_u32 = dims.head_dim as u32;
+    let pos_u32 = pos as u32;
+    let apply_rope_u32 = u32::from(apply_rope);
+
+    encoder.set_bytes(
+        6,
+        std::mem::size_of::<u32>() as u64,
+        &hidden_dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        7,
+        std::mem::size_of::<u32>() as u64,
+        &out_dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        8,
+        std::mem::size_of::<u32>() as u64,
+        &head_dim_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        9,
+        std::mem::size_of::<u32>() as u64,
+        &pos_u32 as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        10,
+        std::mem::size_of::<f32>() as u64,
+        &eps as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        11,
+        std::mem::size_of::<u32>() as u64,
+        &apply_rope_u32 as *const _ as *const _,
+    );
+
+    let (threadgroups, threads_per_group) = gemv_threadgroup_geometry(out_dim);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: threads_per_group,
+            height: 1,
+            depth: 1,
+        },
+    );
 }
 
 /// Single-encoder deep Metal fusion pipeline for a compact transformer layer.
@@ -213,6 +412,8 @@ pub fn gpu_fused_layer_single_encoder(
     pos: usize,
     eps: f32,
 ) -> Result<FusedQkvTriple, EngineError> {
+    validate_layer_inputs(dims, weights, hidden_in, cos_table, sin_table, pos)?;
+
     let q_dim = dims.q_dim();
     let kv_dim = dims.kv_dim();
 
@@ -234,69 +435,56 @@ pub fn gpu_fused_layer_single_encoder(
 
     let command_buffer = ctx.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(pipeline);
 
-    encoder.set_buffer(0, Some(&in_buf), 0);
-    encoder.set_buffer(1, Some(&norm_w_buf), 0);
-    encoder.set_buffer(2, Some(&w_q_buf), 0);
-    encoder.set_buffer(3, Some(&w_k_buf), 0);
-    encoder.set_buffer(4, Some(&w_v_buf), 0);
-    encoder.set_buffer(5, Some(&cos_buf), 0);
-    encoder.set_buffer(6, Some(&sin_buf), 0);
-    encoder.set_buffer(7, Some(&q_out_buf), 0);
-    encoder.set_buffer(8, Some(&k_out_buf), 0);
-    encoder.set_buffer(9, Some(&v_out_buf), 0);
+    // Q and K are RoPE-rotated on the fly (row pairs are rotation pairs), V is not.
+    // All three write disjoint outputs and only read shared inputs, so no barrier is
+    // needed between them inside this encoder.
+    encode_fused_qkv_gemv(
+        encoder,
+        pipeline,
+        &in_buf,
+        &norm_w_buf,
+        &w_q_buf,
+        &cos_buf,
+        &sin_buf,
+        &q_out_buf,
+        dims,
+        q_dim,
+        pos,
+        eps,
+        true,
+    );
+    encode_fused_qkv_gemv(
+        encoder,
+        pipeline,
+        &in_buf,
+        &norm_w_buf,
+        &w_k_buf,
+        &cos_buf,
+        &sin_buf,
+        &k_out_buf,
+        dims,
+        kv_dim,
+        pos,
+        eps,
+        true,
+    );
+    encode_fused_qkv_gemv(
+        encoder,
+        pipeline,
+        &in_buf,
+        &norm_w_buf,
+        &w_v_buf,
+        &cos_buf,
+        &sin_buf,
+        &v_out_buf,
+        dims,
+        kv_dim,
+        pos,
+        eps,
+        false,
+    );
 
-    let hidden_dim_u32 = dims.hidden_dim as u32;
-    let q_dim_u32 = q_dim as u32;
-    let kv_dim_u32 = kv_dim as u32;
-    let head_dim_u32 = dims.head_dim as u32;
-    let pos_u32 = pos as u32;
-
-    encoder.set_bytes(
-        10,
-        std::mem::size_of::<u32>() as u64,
-        &hidden_dim_u32 as *const _ as *const _,
-    );
-    encoder.set_bytes(
-        11,
-        std::mem::size_of::<u32>() as u64,
-        &q_dim_u32 as *const _ as *const _,
-    );
-    encoder.set_bytes(
-        12,
-        std::mem::size_of::<u32>() as u64,
-        &kv_dim_u32 as *const _ as *const _,
-    );
-    encoder.set_bytes(
-        13,
-        std::mem::size_of::<u32>() as u64,
-        &head_dim_u32 as *const _ as *const _,
-    );
-    encoder.set_bytes(
-        14,
-        std::mem::size_of::<u32>() as u64,
-        &pos_u32 as *const _ as *const _,
-    );
-    encoder.set_bytes(
-        15,
-        std::mem::size_of::<f32>() as u64,
-        &eps as *const _ as *const _,
-    );
-
-    let threads = (dims.hidden_dim.next_power_of_two() as u64).clamp(32, 256);
-    let threadgroup_count = MTLSize {
-        width: 1,
-        height: 1,
-        depth: 1,
-    };
-    let threadgroup_size = MTLSize {
-        width: threads,
-        height: 1,
-        depth: 1,
-    };
-
-    encoder.dispatch_thread_groups(threadgroup_count, threadgroup_size);
     encoder.end_encoding();
 
     command_buffer.commit();
@@ -332,6 +520,8 @@ pub fn gpu_discrete_layer_multi_encoder(
     pos: usize,
     eps: f32,
 ) -> Result<FusedQkvTriple, EngineError> {
+    validate_layer_inputs(dims, weights, hidden_in, cos_table, sin_table, pos)?;
+
     let q_dim = dims.q_dim();
     let kv_dim = dims.kv_dim();
 
@@ -433,6 +623,8 @@ pub fn gpu_chained_pipeline_single_encoder(
     pos: usize,
     eps: f32,
 ) -> Result<FusedQkvTriple, EngineError> {
+    validate_layer_inputs(dims, weights, hidden_in, cos_table, sin_table, pos)?;
+
     let q_dim = dims.q_dim();
     let kv_dim = dims.kv_dim();
 
