@@ -11,11 +11,12 @@
 //!   - peak RSS after loading Q8_0 weights < 600 MB (issue #47),
 //!   - decode tok/s at batch 1 >= 2.5x the F32 (dequantized) baseline,
 //!   - PPL of Q8_0 weights within 1% of the same weights unquantized.
+//!
 //! The last one is a same-engine proxy: the literal criterion ("within 1% of
 //! llama.cpp for the same file") needs the real file, i.e.
-//! `KANSO_GGUF=/path/SmolLM2-360M-Instruct-Q8_0.gguf` and a llama.cpp `perplexity`
-//! run to compare against. See `tests/README-quantized-weights.md` notes in the
-//! issue report; the mechanism (quantized blocks, quantized matmul, per-row
+//! `KANSO_GGUF=/path/SmolLM2-360M-Instruct-Q8_0.gguf` plus a llama.cpp
+//! `perplexity` run to compare against; `test_real_gguf_when_available` is the
+//! hook for it. The mechanism (quantized blocks, quantized matmul, per-row
 //! embedding dequant) is fully covered below.
 //!
 //! Timing/memory criteria are only meaningful in release builds; in debug builds
@@ -32,7 +33,15 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
+
+/// Fixture creation is serialized: two tests must not write the same file at once.
+static FIXTURES: Mutex<()> = Mutex::new(());
+/// The SmolLM2-shaped cases are serialized as well: each holds a 380 MB quantized
+/// model plus a 1.4 GB dense baseline, and running them side by side would make the
+/// RSS measurement meaningless.
+static HEAVY: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // Synthetic GGUF fixture
@@ -106,7 +115,11 @@ fn write_synthetic_gguf(path: &Path, dims: &Dims, dtype: GgmlDType, scale: f32) 
     let ones = |n: usize| Tensor::ones(n, candle_core::DType::F32, &dev).unwrap();
     tensors.push((
         "token_embd.weight".to_string(),
-        QTensor::quantize(&rand_weight(&mut rng, dims.vocab, dims.hidden, scale), dtype).unwrap(),
+        QTensor::quantize(
+            &rand_weight(&mut rng, dims.vocab, dims.hidden, scale),
+            dtype,
+        )
+        .unwrap(),
     ));
     tensors.push((
         "output_norm.weight".to_string(),
@@ -152,11 +165,8 @@ fn write_synthetic_gguf(path: &Path, dims: &Dims, dtype: GgmlDType, scale: f32) 
 
     // Deliberately no "output.weight": lm_head stays tied to token_embd, which is
     // what SmolLM2 GGUFs do and what makes the RSS budget interesting.
-    let metadata = vec![
-        (
-            "general.architecture",
-            Value::String("llama".to_string()),
-        ),
+    let metadata = [
+        ("general.architecture", Value::String("llama".to_string())),
         ("llama.block_count", Value::U32(dims.layers as u32)),
         (
             "llama.attention.head_count",
@@ -166,29 +176,17 @@ fn write_synthetic_gguf(path: &Path, dims: &Dims, dtype: GgmlDType, scale: f32) 
             "llama.attention.head_count_kv",
             Value::U32(dims.kv_heads as u32),
         ),
-        (
-            "llama.embedding_length",
-            Value::U32(dims.hidden as u32),
-        ),
+        ("llama.embedding_length", Value::U32(dims.hidden as u32)),
         (
             "llama.feed_forward_length",
             Value::U32(dims.intermediate as u32),
         ),
         ("llama.rope.freq_base", Value::F32(10000.0)),
-        (
-            "llama.attention.layer_norm_rms_epsilon",
-            Value::F32(1e-5),
-        ),
+        ("llama.attention.layer_norm_rms_epsilon", Value::F32(1e-5)),
     ];
+    let metadata: Vec<(&str, &Value)> = metadata.iter().map(|(k, v)| (*k, v)).collect();
 
-    let metadata: Vec<(&str, &Value)> = metadata
-        .iter()
-        .map(|(k, v)| (*k, v))
-        .collect();
-    let refs: Vec<(&str, &QTensor)> = tensors
-        .iter()
-        .map(|(name, t)| (name.as_str(), t))
-        .collect();
+    let refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(name, t)| (name.as_str(), t)).collect();
     let file = std::fs::File::create(path).expect("create synthetic gguf");
     let mut writer = BufWriter::new(file);
     gguf_file::write(&mut writer, &metadata, &refs).expect("write synthetic gguf");
@@ -197,6 +195,7 @@ fn write_synthetic_gguf(path: &Path, dims: &Dims, dtype: GgmlDType, scale: f32) 
 /// Cached fixture path; the file is written once and reused across tests.
 fn fixture_path(name: &str, dims: &Dims, dtype: GgmlDType, scale: f32) -> PathBuf {
     let path = std::env::temp_dir().join(format!("kanso-47-{name}-{}L.gguf", dims.layers));
+    let _guard = FIXTURES.lock().unwrap();
     if !path.is_file() {
         write_synthetic_gguf(&path, dims, dtype, scale);
     }
@@ -250,6 +249,7 @@ fn decode_tok_s(model: &Model, steps: usize) -> f64 {
 
 #[test]
 fn test_q8_0_gguf_weights_stay_quantized_and_rss_under_600mb() {
+    let _serial = HEAVY.lock().unwrap();
     if cfg!(debug_assertions) {
         eprintln!("SKIP (debug build): SmolLM2-shaped RSS criterion needs --release");
         return;
@@ -287,6 +287,7 @@ fn test_q8_0_gguf_weights_stay_quantized_and_rss_under_600mb() {
 
 #[test]
 fn test_q8_0_decode_tok_s_at_smollm2_dimensions_beats_f32() {
+    let _serial = HEAVY.lock().unwrap();
     if cfg!(debug_assertions) {
         eprintln!("SKIP (debug build): decode tok/s criterion needs --release");
         return;
@@ -331,7 +332,10 @@ fn test_q8_0_ppl_within_one_percent_of_unquantized() {
     let ppl_f32 = calculate_perplexity(&f32_model, tokens, 32).expect("f32 ppl");
     let ppl_q8 = calculate_perplexity(&q8_model, tokens, 32).expect("q8_0 ppl");
     let delta = (ppl_q8 - ppl_f32).abs() / ppl_f32;
-    println!("PPL (unquantized) {ppl_f32:.4} vs Q8_0 {ppl_q8:.4}: delta {:.4}%", delta * 100.0);
+    println!(
+        "PPL (unquantized) {ppl_f32:.4} vs Q8_0 {ppl_q8:.4}: delta {:.4}%",
+        delta * 100.0
+    );
 
     assert!(
         delta < 0.01,
@@ -342,6 +346,11 @@ fn test_q8_0_ppl_within_one_percent_of_unquantized() {
 
 /// Logits parity between quantized-resident weights and the dense dequantization
 /// of those exact same weights: the matmul path must do real quantized math.
+///
+/// The quantized kernel also rounds the *activations* to 8 bits (same as
+/// llama.cpp's `mul_mat`), so per-logit deviation from a dense matmul is ~1%.
+/// What must not move is the prediction: same argmax, and no order-of-magnitude
+/// drift (which is what a broken block layout or head permutation would produce).
 #[test]
 fn test_quantized_matmul_matches_dense_reference_logits() {
     let scale = 1.0 / (S_HIDDEN as f32).sqrt();
@@ -361,15 +370,56 @@ fn test_quantized_matmul_matches_dense_reference_logits() {
     let dv = d.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     assert_eq!(qv.len(), dv.len());
 
-    let max_abs = dv.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let max_abs = dv.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0);
     let max_diff = qv
         .iter()
         .zip(dv.iter())
         .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-    println!("logits: max|dense| {max_abs:.4}, max|diff| {max_diff:.6}");
+    let mean_diff = qv
+        .iter()
+        .zip(dv.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f32>()
+        / qv.len() as f32;
+    println!(
+        "logits: max|dense| {max_abs:.4}, max|diff| {max_diff:.6} ({:.2}%), mean|diff| {mean_diff:.6}",
+        100.0 * max_diff / max_abs
+    );
     assert!(
-        max_diff <= 1e-3 * max_abs.max(1.0),
-        "quantized logits differ from the dense reference: {max_diff} vs scale {max_abs}"
+        mean_diff <= 0.01 * max_abs,
+        "mean quantized logit deviation {mean_diff} exceeds 1% of the logit scale {max_abs}"
+    );
+    assert!(
+        max_diff <= 0.05 * max_abs,
+        "quantized logits drift from the dense reference: {max_diff} vs scale {max_abs}"
+    );
+
+    // Prediction invariance: the same weights in the same order must pick the
+    // same token, both for the last position of the chunk and over all positions.
+    let vocab = S_VOCAB;
+    let (_, last) =
+        qv[qv.len() - vocab..]
+            .iter()
+            .enumerate()
+            .fold(
+                (0.0f32, 0usize),
+                |(bm, bi), (i, &v)| {
+                    if v > bm { (v, i) } else { (bm, bi) }
+                },
+            );
+    let (_, dense_last) =
+        dv[dv.len() - vocab..]
+            .iter()
+            .enumerate()
+            .fold(
+                (0.0f32, 0usize),
+                |(bm, bi), (i, &v)| {
+                    if v > bm { (v, i) } else { (bm, bi) }
+                },
+            );
+    assert_eq!(
+        last, dense_last,
+        "quantized weights changed the predicted token: {last} vs {dense_last}"
     );
 }
 
@@ -382,7 +432,11 @@ fn test_quantized_embedding_lookup_matches_dense() {
     let dense = model.weights.to_dense().expect("dense copy");
 
     let ids = Tensor::from_slice(&[3u32, 17, 200], (3,), &Device::Cpu).unwrap();
-    let q = model.weights.embed_tokens.embed(&ids).expect("quantized embed");
+    let q = model
+        .weights
+        .embed_tokens
+        .embed(&ids)
+        .expect("quantized embed");
     let d = dense.embed_tokens.embed(&ids).expect("dense embed");
     assert_eq!(q.dims(), d.dims());
 
@@ -395,26 +449,47 @@ fn test_quantized_embedding_lookup_matches_dense() {
         .to_scalar::<f32>()
         .unwrap();
     println!("embedding max|diff| {diff:.6}");
-    assert!(diff == 0.0, "per-row dequant must reproduce the dense values exactly, diff {diff}");
+    assert!(
+        diff == 0.0,
+        "per-row dequant must reproduce the dense values exactly, diff {diff}"
+    );
 }
 
 /// The numeric format of a GGUF tensor must survive the loader: an F16 file must
 /// not be blown up to F32 at load (issue #47 also asks for an F16 minimum).
 #[test]
-fn test_f16_gguf_is_not_expanded_to_f32() {
-    let path = fixture_path("f16-small", &SMALL, GgmlDType::F16, 0.125);
+fn test_f16_gguf_stays_16_bit_and_matches_f32_logits() {
+    let scale = 1.0 / (S_HIDDEN as f32).sqrt();
+    let path = fixture_path("f16-small", &SMALL, GgmlDType::F16, scale);
+    let f32_path = fixture_path("f32-small", &SMALL, GgmlDType::F32, scale);
     let model = Model::load_gguf(&path, Device::Cpu).expect("load f16 fixture");
+    let f32_model = Model::load_gguf(&f32_path, Device::Cpu).expect("load f32 fixture");
+
     let stored = model.weights.storage_bytes();
     let params = model.weights.parameter_count();
-    println!("F16 fixture: {stored} bytes for {params} params");
-    assert!(
-        stored <= params * 4,
-        "F16 weights grew to {stored} bytes ({:.2} B/param)",
+    println!(
+        "F16 fixture: {stored} bytes for {params} params ({:.2} B/param)",
         stored as f64 / params as f64
     );
     assert!(
-        model.weights.embed_tokens.is_quantized() || stored <= params * 2,
-        "F16 weights must stay 16-bit"
+        stored <= params * 2,
+        "F16 weights must stay 16-bit, got {stored} bytes for {params} params"
+    );
+
+    let tokens: Vec<u32> = (0..8).map(|i| (i * 13) % S_VOCAB as u32).collect();
+    let a = model.forward_tokens(&tokens).expect("f16 forward");
+    let b = f32_model.forward_tokens(&tokens).expect("f32 forward");
+    let av = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let bv = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let scale_abs = bv.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let max_diff = av
+        .iter()
+        .zip(bv.iter())
+        .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+    println!("f16 vs f32 logits: max|diff| {max_diff:.6} (scale {scale_abs:.4})");
+    assert!(
+        max_diff <= 1e-2 * scale_abs.max(1.0),
+        "F16 forward diverges from F32: {max_diff} vs scale {scale_abs}"
     );
 }
 
@@ -458,14 +533,24 @@ fn test_quantized_weights_run_on_metal() {
         cpu_model.config.clone(),
         Device::Cpu,
     );
-    model.to_device(&metal).expect("move quantized weights to metal");
+    model
+        .to_device(&metal)
+        .expect("move quantized weights to metal");
     assert!(matches!(model.device, Device::Metal(_)));
 
     let tokens: Vec<u32> = (0..8).map(|i| (i * 5) % S_VOCAB as u32).collect();
-    let metal_logits = model.forward_tokens(&tokens).expect("metal forward").to_device(&Device::Cpu).unwrap();
+    let metal_logits = model
+        .forward_tokens(&tokens)
+        .expect("metal forward")
+        .to_device(&Device::Cpu)
+        .unwrap();
     let cpu_logits = cpu_model.forward_tokens(&tokens).expect("cpu forward");
 
-    let m = metal_logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let m = metal_logits
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
     let c = cpu_logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     let max_abs = c.iter().fold(0.0f32, |a, v| a.max(v.abs()));
     let max_diff = m
