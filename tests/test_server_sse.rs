@@ -238,6 +238,21 @@ async fn test_chat_completion_serves_real_model_text() {
 }
 
 #[tokio::test]
+async fn test_max_tokens_out_of_range_is_rejected() {
+    // `max_tokens: 0` asks for nothing and an unbounded value would let one request hold the
+    // engine's block pool (ticket #61 F14).
+    let app = app_for(mock_engine(vocab_size()));
+    for bad in [0usize, 100_000] {
+        let resp = send(&app, chat_request(false, "hello", bad)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "max_tokens {bad} must be rejected"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_streaming_chat_completion_is_openai_sse() {
     let expected = reference_replies(&["hello"], 4).remove(0);
     let app = app_for(mock_engine(vocab_size()));
@@ -261,9 +276,10 @@ async fn test_streaming_chat_completion_is_openai_sse() {
         "streamed deltas must spell the real reply"
     );
     assert_eq!(finish_reason, expected.finish_reason);
-    assert!(
-        frames == expected.tokens || frames == expected.tokens + 1,
-        "one frame per token (plus a possible final partial-UTF-8 frame): {frames} frames for {} tokens",
+    // Exactly one frame per token: empty deltas are skipped, not sent (ticket #61 F14).
+    assert_eq!(
+        frames, expected.tokens,
+        "one frame per token: {frames} frames for {} tokens",
         expected.tokens
     );
 }

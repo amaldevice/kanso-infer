@@ -6,6 +6,8 @@
 //! residual `max(0, p - q)` normalized. The output distribution is then exactly `p`, for
 //! any `q` — which is what makes temperature sampling, not just greedy decoding, exact.
 
+use crate::error::EngineError;
+
 /// Probability that the target accepts `token` proposed by the draft.
 ///
 /// `p` is the target and `q` the draft distribution over the same vocabulary, both already
@@ -24,7 +26,17 @@ pub fn acceptance_prob(p: &[f32], q: &[f32], token: u32) -> f32 {
 
 /// `max(0, p - q)`, renormalized: the distribution a rejected draft token is replaced
 /// with. Falls back to `p` when the residual has no mass (a draft that *is* the target).
-pub fn residual_probs(p: &[f32], q: &[f32]) -> Vec<f32> {
+///
+/// `p` and `q` must cover the same vocabulary: a short `q` used to silently drop the tail
+/// of `p` (ticket #61 F10), which is a caller bug, not a distribution.
+pub fn residual_probs(p: &[f32], q: &[f32]) -> Result<Vec<f32>, EngineError> {
+    if p.len() != q.len() {
+        return Err(EngineError::Model(format!(
+            "residual_probs: p covers {} tokens, q covers {}",
+            p.len(),
+            q.len()
+        )));
+    }
     let mut out: Vec<f32> = p
         .iter()
         .zip(q)
@@ -32,10 +44,10 @@ pub fn residual_probs(p: &[f32], q: &[f32]) -> Vec<f32> {
         .collect();
     let sum: f32 = out.iter().sum();
     if sum <= 0.0 {
-        return p.to_vec();
+        return Ok(p.to_vec());
     }
     for x in out.iter_mut() {
         *x /= sum;
     }
-    out
+    Ok(out)
 }

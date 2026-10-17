@@ -5,7 +5,8 @@ use crate::sampler::{greedy_token, sample_from_probs, softmax_probs};
 use crate::scheduler::SamplingParams;
 use crate::speculative::sampling::{acceptance_prob, residual_probs};
 use candle_core::{IndexOp, Tensor};
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerificationResult {
@@ -53,7 +54,8 @@ impl SpeculativeVerifier {
             }
             let logits =
                 model.forward_decode_step(current_token, start_pos, block_table, kv_storage)?;
-            let (emitted, _) = draw(&logits, sampling)?;
+            let mut rng = StdRng::seed_from_u64(sampling.seed);
+            let (emitted, _) = draw(&logits, sampling, &mut rng)?;
             return Ok(VerificationResult {
                 accepted_tokens: Vec::new(),
                 emitted_token: emitted,
@@ -89,10 +91,12 @@ impl SpeculativeVerifier {
         let mut emitted_token = None;
         let mut num_accepted = 0;
         let mut num_rejected = 0;
-        let mut rng = rand::rng();
+        // Seeded per request (ticket #61 F9): the same round replays exactly instead of
+        // drawing from whatever entropy the thread happened to have.
+        let mut rng = StdRng::seed_from_u64(sampling.seed);
 
         for (idx, &cand) in candidates.iter().enumerate() {
-            let (target_pred, p) = draw(&logits.i(idx)?, sampling)?;
+            let (target_pred, p) = draw(&logits.i(idx)?, sampling, &mut rng)?;
             if sampling.temperature <= 0.0 {
                 if cand == target_pred {
                     accepted_tokens.push(cand);
@@ -110,12 +114,19 @@ impl SpeculativeVerifier {
                     "temperature > 0 speculation needs the draft distribution of candidate {idx}"
                 ))
             })?;
+            if q.len() != p.len() {
+                return Err(EngineError::Model(format!(
+                    "draft distribution of candidate {idx} covers {} tokens, the target's {}",
+                    q.len(),
+                    p.len()
+                )));
+            }
             if rng.random::<f32>() <= acceptance_prob(&p, q, cand) {
                 accepted_tokens.push(cand);
                 num_accepted += 1;
             } else {
                 // Rejected: correct the draft with the residual max(0, p - q).
-                emitted_token = Some(sample_from_probs(&residual_probs(&p, q), &mut rng));
+                emitted_token = Some(sample_from_probs(&residual_probs(&p, q)?, &mut rng));
                 num_rejected = candidates.len() - num_accepted;
                 break;
             }
@@ -123,7 +134,7 @@ impl SpeculativeVerifier {
 
         if emitted_token.is_none() {
             // All K candidates accepted! Emit bonus token from index K
-            let (bonus_pred, _) = draw(&logits.i(k)?, sampling)?;
+            let (bonus_pred, _) = draw(&logits.i(k)?, sampling, &mut rng)?;
             emitted_token = Some(bonus_pred);
         }
 
@@ -153,12 +164,17 @@ impl SpeculativeVerifier {
 }
 
 /// Draws one token from `logits` under `sampling`, plus the distribution it came from when
-/// the request is not greedy (the rejection test and the residual both need `p`).
-fn draw(logits: &Tensor, sampling: SamplingParams) -> Result<(u32, Vec<f32>), EngineError> {
+/// the request is not greedy (the rejection test and the residual both need `p`). The draw
+/// comes from the caller's seeded stream, so a round is reproducible (ticket #61 F9).
+fn draw(
+    logits: &Tensor,
+    sampling: SamplingParams,
+    rng: &mut StdRng,
+) -> Result<(u32, Vec<f32>), EngineError> {
     let flat = logits.flatten_all()?.to_vec1::<f32>()?;
     if sampling.temperature <= 0.0 {
         return Ok((greedy_token(&flat), Vec::new()));
     }
     let probs = softmax_probs(&flat, sampling.temperature, sampling.top_p)?;
-    Ok((sample_from_probs(&probs, &mut rand::rng()), probs))
+    Ok((sample_from_probs(&probs, rng), probs))
 }

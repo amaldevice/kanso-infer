@@ -97,16 +97,44 @@ impl KvStorage {
         Ok(())
     }
 
+    /// The `[len, n_kv_heads, head_dim]` slot ids [`Self::write_kv_slots`] scatters with,
+    /// built once per step instead of once per layer (ticket #61 F11).
+    ///
+    /// candle's `scatter_set` is element-wise (indexes must have the source's shape), so
+    /// each token's slot id is repeated across its head/dim row — a few KB of host work per
+    /// step against one scatter op per layer per K and per V.
+    pub fn slot_id_tensor(&self, slots: &[usize], device: &Device) -> Result<Tensor, EngineError> {
+        let num_slots = self.num_blocks * self.block_size;
+        if let Some(&slot) = slots.iter().find(|&&slot| slot >= num_slots) {
+            return Err(EngineError::Model(format!(
+                "Slot {} out of bounds for {} blocks of size {}",
+                slot, self.num_blocks, self.block_size
+            )));
+        }
+
+        let repeats = self.n_kv_heads * self.head_dim;
+        let mut slot_ids: Vec<u32> = Vec::with_capacity(slots.len() * repeats);
+        for &slot in slots {
+            let end = slot_ids.len() + repeats;
+            slot_ids.resize(end, slot as u32);
+        }
+        Ok(Tensor::from_vec(
+            slot_ids,
+            (slots.len(), self.n_kv_heads, self.head_dim),
+            device,
+        )?)
+    }
+
     /// Writes a whole batch of tokens' K and V in one scatter each (#45).
     ///
-    /// `slots[i] = block * block_size + offset` is where token `i` goes; `k`/`v` are
+    /// `slot_ids` is [`Self::slot_id_tensor`] for the step's `slots`; `k`/`v` are
     /// `[T, n_kv_heads, head_dim]`. Same result as `T` calls to [`Self::write_kv_token`],
     /// but two tensor ops per layer instead of roughly eight per token — which is what
     /// a decode batch pays for otherwise.
     pub fn write_kv_slots(
         &mut self,
         layer: usize,
-        slots: &[usize],
+        slot_ids: &Tensor,
         k: &Tensor,
         v: &Tensor,
     ) -> Result<(), EngineError> {
@@ -116,48 +144,27 @@ impl KvStorage {
                 layer, self.num_layers
             )));
         }
-        let num_slots = self.num_blocks * self.block_size;
-        if slots.iter().any(|&slot| slot >= num_slots) {
-            return Err(EngineError::Model(format!(
-                "Slot out of bounds for {} blocks of size {}",
-                self.num_blocks, self.block_size
-            )));
-        }
-        if k.dims() != [slots.len(), self.n_kv_heads, self.head_dim]
-            || v.dims() != [slots.len(), self.n_kv_heads, self.head_dim]
+        if k.dims() != [slot_ids.dims()[0], self.n_kv_heads, self.head_dim]
+            || v.dims() != [slot_ids.dims()[0], self.n_kv_heads, self.head_dim]
         {
             return Err(EngineError::Model(format!(
                 "write_kv_slots: expected [{}, {}, {}] K/V, got {:?} / {:?}",
-                slots.len(),
+                slot_ids.dims()[0],
                 self.n_kv_heads,
                 self.head_dim,
                 k.dims(),
                 v.dims()
             )));
         }
-
-        // candle's `scatter_set` is element-wise (indexes must have the source's
-        // shape), so each token's slot id is repeated across its head/dim row — a few
-        // KB of host work per layer against one scatter op per K and per V.
-        let repeats = self.n_kv_heads * self.head_dim;
-        let mut slot_ids: Vec<u32> = Vec::with_capacity(slots.len() * repeats);
-        for &slot in slots {
-            let end = slot_ids.len() + repeats;
-            slot_ids.resize(end, slot as u32);
-        }
-        let slot_ids = Tensor::from_vec(
-            slot_ids,
-            (slots.len(), self.n_kv_heads, self.head_dim),
-            k.device(),
-        )?;
+        let num_slots = self.num_blocks * self.block_size;
         let cache_shape = (num_slots, self.n_kv_heads, self.head_dim);
 
         self.kv_k[layer]
             .reshape(cache_shape)?
-            .scatter_set(&slot_ids, k, 0)?;
+            .scatter_set(slot_ids, k, 0)?;
         self.kv_v[layer]
             .reshape(cache_shape)?
-            .scatter_set(&slot_ids, v, 0)?;
+            .scatter_set(slot_ids, v, 0)?;
         Ok(())
     }
 
@@ -209,7 +216,15 @@ impl KvStorage {
         }
 
         let needed_blocks = num_tokens.div_ceil(self.block_size);
-        let active_blocks = &blocks[..needed_blocks.min(blocks.len())];
+        if needed_blocks > blocks.len() {
+            return Err(EngineError::Model(format!(
+                "gather_blocks: {} tokens need {} blocks, block table has {}",
+                num_tokens,
+                needed_blocks,
+                blocks.len()
+            )));
+        }
+        let active_blocks = &blocks[..needed_blocks];
 
         let block_idx_u32: Vec<u32> = active_blocks.iter().map(|&b| b as u32).collect();
         let idx_tensor = Tensor::from_vec(block_idx_u32, (active_blocks.len(),), dev)?;
@@ -244,9 +259,14 @@ impl KvStorage {
     }
 
     /// First physical block of `blocks` when the table's used blocks are one consecutive
-    /// run of the pool, `None` when the table is fragmented (ticket #48).
+    /// run of the pool, `None` when the table is fragmented or too short for `num_tokens`
+    /// (ticket #61 F10 — a short table must not silently narrow the read to fewer blocks
+    /// than the context needs; `paged_kv_tokens` reports it).
     fn contiguous_run(&self, blocks: &[usize], num_tokens: usize) -> Option<usize> {
-        let needed = num_tokens.div_ceil(self.block_size).min(blocks.len());
+        let needed = num_tokens.div_ceil(self.block_size);
+        if needed > blocks.len() {
+            return None;
+        }
         let first = *blocks.first()?;
         (0..needed).all(|i| blocks[i] == first + i).then_some(first)
     }
@@ -258,6 +278,8 @@ impl KvStorage {
     /// sequence stays contiguous) is a zero-copy *view* of the pool storage — the whole
     /// history is never materialized per layer. Fragmented tables (prefix-cache reuse,
     /// speculation rollback) fall back to one `gather_blocks` copy.
+    ///
+    /// A table too short for `num_tokens` is an error, not a truncated read (ticket #61 F10).
     pub fn paged_kv_tokens(
         &self,
         layer: usize,

@@ -1,5 +1,11 @@
 //! Ticket #45 acceptance: continuous batching must be ONE batched forward per
 //! `step()`, not a per-sequence loop over batch-1 forwards.
+//!
+//! Scoped to the serving path (ticket #61 F3): `forward_batch_calls` counts
+//! `forward_batch`, which is what `Engine::step` runs. Speculative traffic
+//! (`SpeculativeEngine`) verifies through `forward_verify_tokens` and spends one draft
+//! `forward_decode_step` per proposal, so its forwards are deliberately outside this
+//! claim and outside the counter.
 
 use candle_core::{IndexOp, Tensor};
 use kanso_infer::engine::Engine;
@@ -20,21 +26,21 @@ fn test_one_forward_call_per_step_regardless_of_batch() {
     }
 
     // Step 1: all four requests prefill (each a 4-token chunk) in the same step.
-    let before = engine.model.forward_calls();
+    let before = engine.model.forward_batch_calls();
     let out = engine.step().unwrap();
     assert_eq!(out.len(), 4, "all four prefills must complete in step 1");
     assert_eq!(
-        engine.model.forward_calls() - before,
+        engine.model.forward_batch_calls() - before,
         1,
         "four prefill chunks must share one forward"
     );
 
     // Step 2: all four requests decode one token each.
-    let before = engine.model.forward_calls();
+    let before = engine.model.forward_batch_calls();
     let out = engine.step().unwrap();
     assert_eq!(out.len(), 4, "four sequences decode in step 2");
     assert_eq!(
-        engine.model.forward_calls() - before,
+        engine.model.forward_batch_calls() - before,
         1,
         "four decode tokens must share one forward"
     );
@@ -200,7 +206,13 @@ fn test_batched_forward_matches_per_sequence_reference() {
 /// layer count trimmed so the sweep still finishes inside a test.
 ///
 /// Wall-clock samples swing with machine load, so each round pairs a batch-1 and a
-/// batch-8 measurement and the gate reads the median of the per-round ratios.
+/// batch-8 measurement and the gate reads the best of the per-round ratios: a busy
+/// machine can only ever slow a sample, never speed one up (ticket #61 F7).
+///
+/// Release-only: a debug build runs candle's ops ~30x slower per op, which swamps the
+/// amortization this measures, so the test is `#[ignore]`d there — reported as ignored,
+/// never as a pass against a floor low enough to be meaningless (ticket #61 F5, S5).
+/// `.github/workflows/ci.yml` runs it in the release-only gates job.
 const HIDDEN: usize = 960;
 const Q_HEADS: usize = 15;
 const KV_HEADS: usize = 3;
@@ -250,18 +262,16 @@ fn lockstep_rates(backend: kanso_infer::Backend) -> (f64, f64) {
 }
 
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only throughput gate (ticket #61 F5): run `cargo test --release`"
+)]
 fn test_batch8_throughput_at_least_4x_batch1() {
-    // Unoptimized candle ops dominate a step in a debug build (they are ~30x slower
-    // per op, while the weight read barely changes), which swamps the amortization
-    // this measures. Run the gate the way it was measured: `cargo test --release`.
-    if cfg!(debug_assertions) {
-        eprintln!("SKIP (debug build): the #45 throughput gate needs `cargo test --release`");
-        return;
-    }
-
-    // `amx` is Apple's Accelerate GEMM, the dense-weight backend on macOS; candle's
-    // plain CPU GEMM hits its own compute ceiling well before batch 8 at this shape,
-    // so the CPU ratio is measured and reported but is not the gate.
+    // Both backends are measured and reported, and the gate reads the best ratio over
+    // backends and rounds: this is a regression tripwire for the batching mechanism
+    // (weights read once per step, not once per sequence), not a benchmark of either
+    // GEMM — a busy machine or a GEMM compute ceiling can only slow a sample, never
+    // speed one up (ticket #61 F7).
     let mut backends = vec![("cpu", kanso_infer::Backend::Cpu)];
     if kanso_infer::accelerate::amx::has_accelerate_support() {
         backends.push(("amx", kanso_infer::Backend::Amx));
@@ -288,7 +298,6 @@ fn test_batch8_throughput_at_least_4x_batch1() {
             best_name = name;
         }
     }
-
     assert!(
         best >= 4.0,
         "batch-8 throughput is only {best:.2}x batch-1 (best backend: {best_name}): \

@@ -1,5 +1,4 @@
 use crate::config::{ModelArchitecture, ModelConfig};
-use crate::engine::ScratchpadWorkspace;
 use crate::error::EngineError;
 use crate::hardware::Backend;
 use crate::kv_cache::{BlockTable, KvStorage};
@@ -18,6 +17,19 @@ struct RopeTable {
     sin: Tensor,
 }
 
+/// Everything a pure-decode batch's attention needs from the block geometry, built once
+/// per step instead of once per layer (ticket #61 F11): the padded physical block index
+/// per sequence, the `-1e9` padding mask shared by every KV head and layer, and the
+/// shapes those indices imply.
+struct DecodeLayout {
+    /// `[num_seqs * max_blocks]` physical block ids, padded to the batch's longest table.
+    indices: Tensor,
+    /// `[num_seqs * num_kv_heads, 1, padded_ctx]` additive attention mask.
+    mask: Tensor,
+    num_seqs: usize,
+    padded_ctx: usize,
+}
+
 pub struct Model {
     pub weights: ModelWeights,
     pub config: ModelConfig,
@@ -27,7 +39,11 @@ pub struct Model {
     /// #45: batched forward passes issued so far. One per engine step is the whole
     /// point of continuous batching — a per-sequence loop shows up here as a count
     /// that grows with the batch size.
-    forward_calls: std::sync::atomic::AtomicU64,
+    ///
+    /// It counts `forward_batch` only (ticket #61 F6): speculative verification
+    /// (`forward_verify_tokens`) and draft decode steps serve the speculative loop, not
+    /// the batched serving path, and are deliberately not counted here.
+    forward_batch_calls: std::sync::atomic::AtomicU64,
     /// Grown on demand, dropped by [`Model::to_device`] because its rows live on the
     /// device the model was built for.
     rope_table: RefCell<Option<RopeTable>>,
@@ -73,14 +89,14 @@ impl Model {
             device,
             backend: crate::hardware::Backend::default(),
             hybrid_pipeline: None,
-            forward_calls: std::sync::atomic::AtomicU64::new(0),
+            forward_batch_calls: std::sync::atomic::AtomicU64::new(0),
             rope_table: RefCell::new(None),
         }
     }
 
-    /// Batched forward passes issued so far (#45 acceptance hook).
-    pub fn forward_calls(&self) -> u64 {
-        self.forward_calls
+    /// Batched forwards (`forward_batch`) issued so far (#45 acceptance hook).
+    pub fn forward_batch_calls(&self) -> u64 {
+        self.forward_batch_calls
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -199,6 +215,12 @@ impl Model {
             // CPU matmul, which streams a strided operand without copying it, and
             // forcing contiguity there would copy the whole attention history per
             // layer per token (ticket #48).
+            //
+            // Exempt from the #48 no-materialization claim (ticket #61 F4): on Metal
+            // this *does* copy the `[ctx, n_kv_heads, head_dim]` pool view per layer
+            // per token — `gpu_paged_attention_v2` (`src/metal/ops.rs`) is the wired
+            // fix, and it has no production caller yet. Metal decode therefore
+            // remains bounded-alloc but not copy-free.
             if a.device().is_metal() {
                 Ok(a.contiguous()?.matmul(&b.contiguous()?)?)
             } else {
@@ -381,7 +403,11 @@ impl Model {
             &self.device,
         )?;
         let table = self.rope_table.borrow();
-        let table = table.as_ref().expect("rope table built above");
+        let table = table.as_ref().ok_or_else(|| {
+            // The block above just built it for `max_pos`; missing here means the table was
+            // dropped (device move) between the two borrows.
+            EngineError::Model("rope table missing after build".to_string())
+        })?;
         Ok((
             table.cos.index_select(&index, 0)?,
             table.sin.index_select(&index, 0)?,
@@ -472,6 +498,11 @@ impl Model {
     /// never copied; every other backend runs the same math through `gqa_attention`
     /// (candle's CPU and metal matmul stream the strided operand without re-copying it).
     /// Returns `[n_heads, 1, head_dim]`.
+    ///
+    /// Two paths fall outside the #48 claim, both documented rather than papered over
+    /// (ticket #61 F4): a Metal tensor reaching `matmul` materializes the history (see
+    /// [`Model::matmul`]), and the AMX fallback below copies once when Accelerate rejects
+    /// the layout.
     fn decode_attention_paged(
         &self,
         q: &Tensor, // [n_heads, 1, head_dim]
@@ -492,7 +523,11 @@ impl Model {
                 // [n_kv_heads, group * q_len, head_dim] -> [n_heads, q_len, head_dim]
                 return Ok(out?.reshape((n_heads, q_len, head_dim))?);
             }
-            // Unusable layout: one contiguous copy, then the generic path.
+            // Unusable layout (a stride Accelerate cannot read): one contiguous copy of the
+            // history, then the generic path. Exempt from the #48 zero-copy claim — it is
+            // the rare fallback, not the decode path the ticket measures (ticket #61 F4).
+            // ponytail: ctx-sized copy here; a strided fallback GEMM if this ever shows up
+            // in a profile.
             let (k_all, v_all) = (
                 k.transpose(0, 1)?.contiguous()?,
                 v.transpose(0, 1)?.contiguous()?,
@@ -695,17 +730,6 @@ impl Model {
         block_table: &BlockTable,
         kv_storage: &mut KvStorage,
     ) -> Result<Tensor, EngineError> {
-        self.forward_decode_step_with_workspace(token, pos, block_table, kv_storage, None)
-    }
-
-    pub fn forward_decode_step_with_workspace(
-        &self,
-        token: u32,
-        pos: usize,
-        block_table: &BlockTable,
-        kv_storage: &mut KvStorage,
-        workspace: Option<&mut ScratchpadWorkspace>,
-    ) -> Result<Tensor, EngineError> {
         let head_dim = self.config.head_dim();
         let num_q_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
@@ -786,14 +810,6 @@ impl Model {
         // LM Head projection: [1, vocab_size]
         let logits = self.linear(&self.weights.lm_head, &final_normed)?;
 
-        if let Some(ws) = workspace
-            && let Ok(flat) = logits.flatten_all()
-            && let Ok(slice) = flat.to_vec1::<f32>()
-        {
-            let len = slice.len().min(ws.logits.len());
-            ws.logits[..len].copy_from_slice(&slice[..len]);
-        }
-
         Ok(logits)
     }
 
@@ -803,17 +819,6 @@ impl Model {
         start_pos: usize,
         block_table: &BlockTable,
         kv_storage: &mut KvStorage,
-    ) -> Result<Tensor, EngineError> {
-        self.forward_verify_tokens_with_workspace(tokens, start_pos, block_table, kv_storage, None)
-    }
-
-    pub fn forward_verify_tokens_with_workspace(
-        &self,
-        tokens: &[u32],
-        start_pos: usize,
-        block_table: &BlockTable,
-        kv_storage: &mut KvStorage,
-        _workspace: Option<&mut ScratchpadWorkspace>,
     ) -> Result<Tensor, EngineError> {
         let seq_len = tokens.len();
         if seq_len == 0 {
@@ -928,6 +933,13 @@ impl Model {
     /// context straight from its physical blocks — in one padded pass when every
     /// sequence contributes a single decode token, per sequence otherwise.
     /// Returns logits `[num_seqs, vocab]`: one row per sequence's last new token.
+    ///
+    /// This is the *serving* path's only forward: the "one model forward per step"
+    /// property (#45) is a property of `Engine::step` over non-speculative traffic.
+    /// Speculative decoding is deliberately outside it (ticket #61 F3) — the verifier runs
+    /// `forward_verify_tokens` for the candidate block and the draft spends one
+    /// `forward_decode_step` per proposal, neither of which goes through here, which is why
+    /// [`Model::forward_batch_calls`] counts this call alone.
     #[allow(clippy::too_many_arguments)] // #45: the issue's flat-batch signature
     pub fn forward_batch(
         &self,
@@ -939,7 +951,7 @@ impl Model {
         context_lens: &[usize],
         query_lens: &[usize],
     ) -> Result<Tensor, EngineError> {
-        self.forward_calls
+        self.forward_batch_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let num_seqs = block_tables.len();
@@ -995,6 +1007,20 @@ impl Model {
                 )));
             }
             let start_pos = positions[offset];
+            // The mask below is built from `start_pos` alone, so the sequence's flattened
+            // tokens must actually sit at `start_pos + i` (ticket #61 F10): a caller that
+            // hands over a hole would otherwise attend with the wrong causal limit.
+            for i in 0..q_len {
+                if positions[offset + i] != start_pos + i {
+                    return Err(EngineError::Model(format!(
+                        "forward_batch: sequence {} token {} is at position {}, expected {}",
+                        s,
+                        i,
+                        positions[offset + i],
+                        start_pos + i
+                    )));
+                }
+            }
             offsets.push(offset);
             masks.push(if !pure_decode && (q_len > 1 || ctx_len > 1) {
                 let mut mask_data = vec![0.0f32; q_len * ctx_len];
@@ -1017,6 +1043,14 @@ impl Model {
             offset += q_len;
         }
 
+        // Per-step, not per-layer (ticket #61 F11): the scatter index tensor and the padded
+        // decode layout (block indices + `-1e9` mask) depend only on the step's shapes and
+        // block tables, so `num_layers` rebuilds of each are pure waste.
+        let slot_ids = kv_storage.slot_id_tensor(slot_mapping, &self.device)?;
+        let decode_layout = pure_decode
+            .then(|| self.decode_layout(kv_storage, block_tables, context_lens))
+            .transpose()?;
+
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
             let (q, k, v) = self.project_qkv(layer, &normed)?;
@@ -1029,37 +1063,43 @@ impl Model {
             let k = self.rope_apply(&k, &cos, &sin)?;
 
             // Scatter this step's K/V into the physical blocks the scheduler mapped.
-            kv_storage.write_kv_slots(layer_idx, slot_mapping, &k, &v)?;
+            kv_storage.write_kv_slots(layer_idx, &slot_ids, &k, &v)?;
 
-            let attn_out = if pure_decode {
-                // One query token per sequence: the whole batch attends in a single
-                // padded GEMM instead of one attention pass per sequence (which is
-                // what per-op overhead makes expensive at small batch sizes).
-                // ponytail: each sequence is padded to the longest context in the batch,
-                // so ragged batches waste lanes; a varlen kernel drops the padding.
-                self.batch_decode_attention(&q, kv_storage, layer_idx, block_tables, context_lens)?
-            } else {
-                // Steps that mix prefill chunks with decode tokens attend per sequence
-                // instead (those steps are latency- not throughput-critical).
-                // ponytail: per-sequence attention costs one gather + a dozen ops per
-                // sequence; a varlen/paged kernel over the whole batch removes that.
-                let mut attn_rows = Vec::with_capacity(num_seqs);
-                for s in 0..num_seqs {
-                    let q_s = q.narrow(0, offsets[s], query_lens[s])?.transpose(0, 1)?;
-                    let (k_all, v_all) =
-                        kv_storage.gather_blocks(layer_idx, &block_tables[s], context_lens[s])?;
-                    let attn = self.gqa_attention(
-                        &q_s,
-                        &k_all.transpose(0, 1)?,
-                        &v_all.transpose(0, 1)?,
-                        masks[s].as_ref(),
-                    )?;
-                    attn_rows.push(
-                        attn.transpose(0, 1)?
-                            .reshape((query_lens[s], num_q_heads * head_dim))?,
-                    );
+            let attn_out = match &decode_layout {
+                Some(layout) => {
+                    // One query token per sequence: the whole batch attends in a single
+                    // padded GEMM instead of one attention pass per sequence (which is
+                    // what per-op overhead makes expensive at small batch sizes).
+                    // ponytail: each sequence is padded to the longest context in the batch,
+                    // so ragged batches waste lanes; a varlen kernel drops the padding.
+                    self.batch_decode_attention(&q, kv_storage, layer_idx, layout)?
                 }
-                Tensor::cat(&attn_rows.iter().collect::<Vec<_>>(), 0)?
+                None => {
+                    // Steps that mix prefill chunks with decode tokens attend per sequence
+                    // instead (those steps are latency- not throughput-critical).
+                    // ponytail: per-sequence attention costs one gather + a dozen ops per
+                    // sequence; a varlen/paged kernel over the whole batch removes that.
+                    let mut attn_rows = Vec::with_capacity(num_seqs);
+                    for s in 0..num_seqs {
+                        let q_s = q.narrow(0, offsets[s], query_lens[s])?.transpose(0, 1)?;
+                        let (k_all, v_all) = kv_storage.gather_blocks(
+                            layer_idx,
+                            &block_tables[s],
+                            context_lens[s],
+                        )?;
+                        let attn = self.gqa_attention(
+                            &q_s,
+                            &k_all.transpose(0, 1)?,
+                            &v_all.transpose(0, 1)?,
+                            masks[s].as_ref(),
+                        )?;
+                        attn_rows.push(
+                            attn.transpose(0, 1)?
+                                .reshape((query_lens[s], num_q_heads * head_dim))?,
+                        );
+                    }
+                    Tensor::cat(&attn_rows.iter().collect::<Vec<_>>(), 0)?
+                }
             };
             let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
             hidden = (hidden + attn_proj)?;
@@ -1089,18 +1129,62 @@ impl Model {
     /// context in the batch — padding lanes repeat a real block and are masked out
     /// with `-1e9`, so they contribute exactly zero to the softmax.
     /// Returns `[num_seqs, num_q_heads * head_dim]`.
+    ///
+    /// The layout (`layout`) is the same for every layer and is built once per step in
+    /// `forward_batch` (ticket #61 F11); only the K/V it indexes change per layer.
     fn batch_decode_attention(
         &self,
         q: &Tensor,
         kv_storage: &KvStorage,
         layer_idx: usize,
-        block_tables: &[Vec<usize>],
-        context_lens: &[usize],
+        layout: &DecodeLayout,
     ) -> Result<Tensor, EngineError> {
         let head_dim = self.config.head_dim();
         let num_q_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let group = num_q_heads / num_kv_heads;
+        let num_seqs = layout.num_seqs;
+        let padded_ctx = layout.padded_ctx;
+
+        // The two GEMMs below are 3D (batch = sequence x KV head), which keeps them on
+        // the accelerated path instead of the 4D fallback. Both right-hand sides have to
+        // be contiguous: candle's CPU kernel rejects a permuted one outright.
+        let k = kv_storage.kv_k[layer_idx]
+            .index_select(&layout.indices, 0)?
+            .reshape((num_seqs, padded_ctx, num_kv_heads, head_dim))?
+            .permute((0, 2, 3, 1))?
+            .contiguous()?
+            .reshape((num_seqs * num_kv_heads, head_dim, padded_ctx))?;
+        let v = kv_storage.kv_v[layer_idx]
+            .index_select(&layout.indices, 0)?
+            .reshape((num_seqs, padded_ctx, num_kv_heads, head_dim))?
+            .permute((0, 2, 1, 3))?
+            .contiguous()?
+            .reshape((num_seqs * num_kv_heads, padded_ctx, head_dim))?;
+
+        let q = q
+            .reshape((num_seqs, num_kv_heads, group, head_dim))?
+            .reshape((num_seqs * num_kv_heads, group, head_dim))?;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let scores = (self.matmul(&q, &k)? * scale)?;
+        let scores = scores.broadcast_add(&layout.mask)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores.contiguous()?)?;
+        let out = self.matmul(&probs, &v)?;
+
+        // out is [num_seqs, num_kv_heads, group, head_dim], which flattens to the
+        // query-head order this model uses everywhere (`head = kv_head * group + group_i`).
+        Ok(out.reshape((num_seqs, num_q_heads * head_dim))?)
+    }
+
+    /// Padded block indices plus the `-1e9` padding mask for a pure-decode batch: what
+    /// every sequence's context is read with, and the same for every layer (ticket #61 F11).
+    fn decode_layout(
+        &self,
+        kv_storage: &KvStorage,
+        block_tables: &[Vec<usize>],
+        context_lens: &[usize],
+    ) -> Result<DecodeLayout, EngineError> {
+        let num_kv_heads = self.config.num_key_value_heads;
         let num_seqs = block_tables.len();
         let block_size = kv_storage.block_size;
 
@@ -1137,39 +1221,15 @@ impl Model {
             }
         }
 
-        let indices = Tensor::from_vec(indices, (num_seqs * max_blocks,), &self.device)?;
-        // The two GEMMs below are 3D (batch = sequence x KV head), which keeps them on
-        // the accelerated path instead of the 4D fallback. Both right-hand sides have to
-        // be contiguous: candle's CPU kernel rejects a permuted one outright.
-        let k = kv_storage.kv_k[layer_idx]
-            .index_select(&indices, 0)?
-            .reshape((num_seqs, padded_ctx, num_kv_heads, head_dim))?
-            .permute((0, 2, 3, 1))?
-            .contiguous()?
-            .reshape((num_seqs * num_kv_heads, head_dim, padded_ctx))?;
-        let v = kv_storage.kv_v[layer_idx]
-            .index_select(&indices, 0)?
-            .reshape((num_seqs, padded_ctx, num_kv_heads, head_dim))?
-            .permute((0, 2, 1, 3))?
-            .contiguous()?
-            .reshape((num_seqs * num_kv_heads, padded_ctx, head_dim))?;
-
-        let q = q
-            .reshape((num_seqs, num_kv_heads, group, head_dim))?
-            .reshape((num_seqs * num_kv_heads, group, head_dim))?;
-        let scale = 1.0 / (head_dim as f64).sqrt();
-        let scores = (self.matmul(&q, &k)? * scale)?;
-        let mask = Tensor::from_vec(
-            mask_data,
-            (num_seqs * num_kv_heads, 1, padded_ctx),
-            &self.device,
-        )?;
-        let scores = scores.broadcast_add(&mask)?;
-        let probs = candle_nn::ops::softmax_last_dim(&scores.contiguous()?)?;
-        let out = self.matmul(&probs, &v)?;
-
-        // out is [num_seqs, num_kv_heads, group, head_dim], which flattens to the
-        // query-head order this model uses everywhere (`head = kv_head * group + group_i`).
-        Ok(out.reshape((num_seqs, num_q_heads * head_dim))?)
+        Ok(DecodeLayout {
+            indices: Tensor::from_vec(indices, (num_seqs * max_blocks,), &self.device)?,
+            mask: Tensor::from_vec(
+                mask_data,
+                (num_seqs * num_kv_heads, 1, padded_ctx),
+                &self.device,
+            )?,
+            num_seqs,
+            padded_ctx,
+        })
     }
 }
