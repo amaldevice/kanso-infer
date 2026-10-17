@@ -23,7 +23,7 @@ A minimalist, high-performance LLM inference engine written in Rust, engineered 
 - **Startup Metal Pipeline Caching**: Pre-compiles all Metal Shading Language (`.metal`) compute kernels into `MTLComputePipelineState` handles during initialization, preventing first-request compilation stutter.
 - **Fused PagedAttention v2 with Online Softmax**: Computes attention scores and context reduction directly within GPU threadgroup shared memory in tiles, completely eliminating the materialization of intermediate score matrices ($[B, N_h, Q, S]$) in global VRAM.
 - **Quantized-Resident Weights**: GGUF projection weights keep their on-disk format (Q8_0/Q4_K blocks, F16 floor) instead of being dequantized to F32 at load, so batch-1 decode reads ~1 byte/param; matmuls run off that storage (NEON/dotprod kernels on CPU, dequant-on-the-fly GEMV on Metal), embeddings dequantize per row at lookup. SmolLM2-360M Q8_0 loads at ~376 MB resident with ~3.9x the F32 decode rate. The hand-written `src/quant` Q8_0/Q4_K GEMV kernels stay as the reference/benchmark path.
-- **Speculative Decoding Verification Pipeline**: Target-draft speculative execution with atomic KV cache block table rollback upon draft token rejection, ensuring 100% mathematical token parity with non-speculative greedy decoding.
+- **Speculative Decoding Verification Pipeline**: The draft model runs on its own paged KV cache (one `forward_decode_step` per proposal, no full-prefix re-computation) and rolls that cache back on rejection, so speculation is a wall-clock win rather than a second full forward pass. Verification is exact: greedy requests accept on argmax match, temperature > 0 requests use standard rejection sampling (`min(1, p/q)`, residual correction), so the token distribution matches plain sampling, not just greedy decoding.
 
 ### 3. Multi-Model Architecture Matrix (~350M Compact Class)
 Supports dense Transformer decoders and next-generation hybrid linear-attention architectures:
@@ -92,6 +92,8 @@ kanso-infer/
 │   │   └── q4_k.rs       # 4-bit block quantization & dot products
 │   ├── speculative/
 │   │   ├── verifier.rs   # Target-draft verification tree & KV cache rollback
+│   │   ├── draft_cache.rs # Draft model's own paged KV cache & rollback
+│   │   ├── sampling.rs   # Rejection sampling (min(1, p/q), residual correction)
 │   │   └── mod.rs        # SpeculativeEngine wrapper
 │   ├── hybrid/
 │   │   ├── recurrent_state.rs # O(1) constant buffer for Mamba-2 & LIV Conv

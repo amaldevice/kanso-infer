@@ -1,8 +1,11 @@
 use crate::error::EngineError;
 use crate::kv_cache::{BlockPool, BlockTable, KvStorage, PrefixCache};
 use crate::model::Model;
-use crate::sampler::sample_token;
-use candle_core::IndexOp;
+use crate::sampler::{greedy_token, sample_from_probs, softmax_probs};
+use crate::scheduler::SamplingParams;
+use crate::speculative::sampling::{acceptance_prob, residual_probs};
+use candle_core::{IndexOp, Tensor};
+use rand::Rng;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerificationResult {
@@ -17,11 +20,20 @@ pub struct VerificationResult {
 pub struct SpeculativeVerifier;
 
 impl SpeculativeVerifier {
+    /// Verifies `candidates` against the target model in one batched forward pass.
+    ///
+    /// Greedy requests (`sampling.temperature <= 0`) accept a candidate when it equals the
+    /// target's argmax. Temperature > 0 requests run standard rejection sampling instead
+    /// (#55): accept with `min(1, p/q)`, otherwise emit a draw from `max(0, p - q)`, which
+    /// reproduces the target distribution exactly — that needs `draft_probs[i]`, the
+    /// distribution the draft drew `candidates[i]` from.
     #[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
     pub fn verify(
         model: &Model,
         current_token: u32,
         candidates: &[u32],
+        draft_probs: &[Vec<f32>],
+        sampling: SamplingParams,
         start_pos: usize,
         block_table: &mut BlockTable,
         block_pool: &mut BlockPool,
@@ -41,7 +53,7 @@ impl SpeculativeVerifier {
             }
             let logits =
                 model.forward_decode_step(current_token, start_pos, block_table, kv_storage)?;
-            let emitted = sample_token(&logits, 0.0, 1.0, 42)?;
+            let (emitted, _) = draw(&logits, sampling)?;
             return Ok(VerificationResult {
                 accepted_tokens: Vec::new(),
                 emitted_token: emitted,
@@ -73,20 +85,37 @@ impl SpeculativeVerifier {
         let logits =
             model.forward_verify_tokens(&verify_tokens, start_pos, block_table, kv_storage)?;
 
-        // Verify draft candidates greedily
         let mut accepted_tokens = Vec::new();
         let mut emitted_token = None;
         let mut num_accepted = 0;
         let mut num_rejected = 0;
+        let mut rng = rand::rng();
 
         for (idx, &cand) in candidates.iter().enumerate() {
-            let token_logits = logits.i(idx)?;
-            let target_pred = sample_token(&token_logits, 0.0, 1.0, 42)?;
-            if cand == target_pred {
+            let (target_pred, p) = draw(&logits.i(idx)?, sampling)?;
+            if sampling.temperature <= 0.0 {
+                if cand == target_pred {
+                    accepted_tokens.push(cand);
+                    num_accepted += 1;
+                } else {
+                    emitted_token = Some(target_pred);
+                    num_rejected = candidates.len() - num_accepted;
+                    break;
+                }
+                continue;
+            }
+
+            let q = draft_probs.get(idx).ok_or_else(|| {
+                EngineError::Model(format!(
+                    "temperature > 0 speculation needs the draft distribution of candidate {idx}"
+                ))
+            })?;
+            if rng.random::<f32>() <= acceptance_prob(&p, q, cand) {
                 accepted_tokens.push(cand);
                 num_accepted += 1;
             } else {
-                emitted_token = Some(target_pred);
+                // Rejected: correct the draft with the residual max(0, p - q).
+                emitted_token = Some(sample_from_probs(&residual_probs(&p, q), &mut rng));
                 num_rejected = candidates.len() - num_accepted;
                 break;
             }
@@ -94,8 +123,7 @@ impl SpeculativeVerifier {
 
         if emitted_token.is_none() {
             // All K candidates accepted! Emit bonus token from index K
-            let bonus_logits = logits.i(k)?;
-            let bonus_pred = sample_token(&bonus_logits, 0.0, 1.0, 42)?;
+            let (bonus_pred, _) = draw(&logits.i(k)?, sampling)?;
             emitted_token = Some(bonus_pred);
         }
 
@@ -122,4 +150,15 @@ impl SpeculativeVerifier {
             rolled_back_blocks,
         })
     }
+}
+
+/// Draws one token from `logits` under `sampling`, plus the distribution it came from when
+/// the request is not greedy (the rejection test and the residual both need `p`).
+fn draw(logits: &Tensor, sampling: SamplingParams) -> Result<(u32, Vec<f32>), EngineError> {
+    let flat = logits.flatten_all()?.to_vec1::<f32>()?;
+    if sampling.temperature <= 0.0 {
+        return Ok((greedy_token(&flat), Vec::new()));
+    }
+    let probs = softmax_probs(&flat, sampling.temperature, sampling.top_p)?;
+    Ok((sample_from_probs(&probs, &mut rand::rng()), probs))
 }

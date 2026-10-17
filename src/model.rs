@@ -829,6 +829,15 @@ impl Model {
         let token_ids = Tensor::from_slice(tokens, (seq_len,), &self.device)?;
         let mut hidden = self.embed(&token_ids)?;
 
+        // #55: this path used to skip RoPE entirely, so its Q/K were unrotated while the
+        // K it *wrote* into the pool came from the decode path's rotated rows — the target
+        // then disagreed with its own decode step on the same prefix (max |Δlogits| ~30 on
+        // a mock model), which capped speculative acceptance at chance level.
+        let positions: Vec<usize> = (start_pos..total_tokens).collect();
+        let (cos, sin) = self.rope_cos_sin(&positions)?;
+        let cos = cos.reshape((seq_len, 1, head_dim / 2))?;
+        let sin = sin.reshape((seq_len, 1, head_dim / 2))?;
+
         let causal_mask = if seq_len > 1 || total_tokens > 1 {
             let mut mask_data = vec![0.0f32; seq_len * total_tokens];
             for i in 0..seq_len {
@@ -853,11 +862,12 @@ impl Model {
 
             let (q, k, v) = self.project_qkv(layer, &normed)?;
 
-            let q = q
-                .reshape((seq_len, num_q_heads, head_dim))?
-                .transpose(0, 1)?;
-            let k_reshaped = k.reshape((seq_len, num_kv_heads, head_dim))?;
-            let v_reshaped = v.reshape((seq_len, num_kv_heads, head_dim))?;
+            let q = q.reshape((seq_len, num_q_heads, head_dim))?;
+            let k = k.reshape((seq_len, num_kv_heads, head_dim))?;
+            let v = v.reshape((seq_len, num_kv_heads, head_dim))?;
+
+            let q = self.rope_apply(&q, &cos, &sin)?.transpose(0, 1)?;
+            let k = self.rope_apply(&k, &cos, &sin)?;
 
             for i in 0..seq_len {
                 let pos = start_pos + i;
@@ -873,31 +883,19 @@ impl Model {
                     )));
                 }
                 let physical_block = block_table.blocks()[block_idx];
-                let k_token = k_reshaped.i(i)?;
-                let v_token = v_reshaped.i(i)?;
+                let k_token = k.i(i)?;
+                let v_token = v.i(i)?;
                 kv_storage.write_kv_token(layer_idx, physical_block, offset, &k_token, &v_token)?;
             }
 
+            // #55: read the history straight out of the block pool (no gather copy, #48)
+            // and let `gqa_attention` fold the query heads into the KV groups — the old
+            // `k_all.repeat((factor, 1, 1))` materialized K/V × group_size per layer.
             let (k_all, v_all) =
-                kv_storage.gather_blocks(layer_idx, block_table.blocks(), total_tokens)?;
+                kv_storage.paged_kv_tokens(layer_idx, block_table.blocks(), total_tokens)?;
+            let (k_all, v_all) = (k_all.transpose(0, 1)?, v_all.transpose(0, 1)?);
 
-            let k_all = k_all.transpose(0, 1)?;
-            let v_all = v_all.transpose(0, 1)?;
-
-            let (k_all, v_all) = if num_q_heads > num_kv_heads {
-                let factor = num_q_heads / num_kv_heads;
-                (k_all.repeat((factor, 1, 1))?, v_all.repeat((factor, 1, 1))?)
-            } else {
-                (k_all, v_all)
-            };
-
-            let scale = 1.0 / (head_dim as f64).sqrt();
-            let mut scores = (self.matmul(&q, &k_all.t()?)? * scale)?;
-            if let Some(mask) = &causal_mask {
-                scores = scores.broadcast_add(mask)?;
-            }
-            let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
-            let attn_out = self.matmul(&attn_weights, &v_all)?;
+            let attn_out = self.gqa_attention(&q, &k_all, &v_all, causal_mask.as_ref())?;
 
             let attn_out = attn_out
                 .transpose(0, 1)?

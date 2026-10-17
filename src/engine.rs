@@ -531,10 +531,24 @@ impl Engine {
         seq.status = SequenceStatus::Waiting;
     }
 
+    /// Greedy (temperature 0) speculation: candidates are verified by argmax match.
     pub fn speculative_step(
         &mut self,
         request_id: u64,
         draft_candidates: &[u32],
+    ) -> Result<crate::speculative::VerificationResult, EngineError> {
+        self.speculative_step_sampled(request_id, draft_candidates, &[], SamplingParams::default())
+    }
+
+    /// Full speculation step. `draft_probs[i]` is the distribution the draft drew
+    /// `draft_candidates[i]` from — required when `sampling.temperature > 0`, where the
+    /// candidates are verified by rejection sampling instead of argmax match (#55).
+    pub fn speculative_step_sampled(
+        &mut self,
+        request_id: u64,
+        draft_candidates: &[u32],
+        draft_probs: &[Vec<f32>],
+        sampling: SamplingParams,
     ) -> Result<crate::speculative::VerificationResult, EngineError> {
         let seq_idx = self
             .sequences
@@ -564,6 +578,8 @@ impl Engine {
             &self.model,
             last_token,
             draft_candidates,
+            draft_probs,
+            sampling,
             start_pos,
             &mut seq_mut.block_table,
             &mut self.block_pool,
