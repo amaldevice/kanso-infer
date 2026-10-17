@@ -8,14 +8,18 @@
 //! pair agrees token-for-token.
 //!
 //! Measured (release, 2026-10-17, SmolLM2-360M/135M-Instruct Q8_0 on this Mac, α=0.884):
-//! the real pair lands at 0.85-0.99x, not the ticket's 1.3x. The draft-KV fix works — the
-//! draft agrees with the target 88% of the time, which a recompute/stale-cache draft cannot
-//! do — but the *round* economics do not: a 5-row target forward costs 43.6ms against
-//! 15.7ms for a single-row decode (weight reads are only partially amortized, the rest is
-//! per-row compute/dispatch), and the 135M draft costs 8.0ms per committed token, so
-//! `verify_row (8.7ms) + draft_row (8.0ms) > target_row (15.7ms)`. Closing that is the
-//! parent spec's story 1 (one batched forward per step, amortized weight reads — #45 and
-//! the Fase-1 kernels), not this ticket. The proxy below is what gates the fix here.
+//! before #45's batched forward landed on the integration branch the real pair landed at
+//! 0.84-0.99x; after merging it the same test reads 1.63-2.00x. The draft-KV fix is the
+//! same in both, so the difference is the baseline: #45 replaced the single-sequence decode
+//! path with the batched one, and batch-1 decode got slower (load was high, so this is not
+//! a trustworthy A/B). Neither number gates this ticket — see the cost analysis below.
+//!
+//! On the pre-#45 decode path the round economics do not close: a 5-row target forward costs
+//! 43.6ms against 15.7ms for a single-row decode (weight reads are only partially amortized,
+//! the rest is per-row compute/dispatch), and the 135M draft costs 8.0ms per committed token,
+//! so `verify_row (8.7ms) + draft_row (8.0ms) > target_row (15.7ms)`. Closing that is the
+//! parent spec's story 1 (one batched forward per step, amortized weight reads — #45 and the
+//! Fase-1 kernels), not this ticket. The proxy below is what gates the fix here.
 //!
 //! What the proxy does not cover is the real pair's acceptance; it is reported in the same
 //! run (set the two env vars) and asserted to stay out of chance level.
