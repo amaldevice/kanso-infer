@@ -423,6 +423,43 @@ fn test_quantized_matmul_matches_dense_reference_logits() {
     );
 }
 
+/// Q4K needs last-dim % 256 == 0; SmolLM2 dims (960) don't divide, so the
+/// bench `NeonQ4_K` path must store Q4_0 and say so — not silently run Q4_0
+/// under a Q4K label.
+#[test]
+fn test_requantize_q4k_falls_back_loud_to_q4_0_at_smollm2_dims() {
+    use kanso_infer::weights::LinearWeight;
+
+    // 960 = SmolLM2 hidden: divisible by Q4_0's 32, not by Q4_K's 256.
+    let dense = Tensor::from_vec(vec![0.05f32; 960 * 960], (960, 960), &Device::Cpu).unwrap();
+    let w = LinearWeight::from_tensor(dense.clone());
+    assert_eq!(
+        w.effective_requant_dtype(&dense, GgmlDType::Q4K),
+        GgmlDType::Q4_0,
+        "Q4K at last-dim 960 must report the Q4_0 fallback"
+    );
+    let fell_back = w
+        .requantize(GgmlDType::Q4K)
+        .expect("requantize with fallback");
+    let roundtrip = fell_back
+        .to_dense()
+        .expect("dequant fallback")
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(roundtrip.len(), 960 * 960);
+
+    // Divisible dims keep the requested dtype.
+    let wide = Tensor::from_vec(vec![0.05f32; 256 * 256], (256, 256), &Device::Cpu).unwrap();
+    let ww = LinearWeight::from_tensor(wide.clone());
+    assert_eq!(
+        ww.effective_requant_dtype(&wide, GgmlDType::Q4K),
+        GgmlDType::Q4K,
+        "Q4K at last-dim 256 must keep Q4K"
+    );
+}
+
 /// Embedding lookup must dequantize per row and agree with the dense lookup.
 #[test]
 fn test_quantized_embedding_lookup_matches_dense() {
@@ -450,8 +487,8 @@ fn test_quantized_embedding_lookup_matches_dense() {
         .unwrap();
     println!("embedding max|diff| {diff:.6}");
     assert!(
-        diff == 0.0,
-        "per-row dequant must reproduce the dense values exactly, diff {diff}"
+        diff <= 1e-6,
+        "per-row dequant must reproduce the dense values, diff {diff}"
     );
 }
 

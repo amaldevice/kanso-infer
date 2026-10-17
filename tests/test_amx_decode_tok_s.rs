@@ -53,14 +53,25 @@ fn decode_tok_s(model: &Model, steps: usize) -> f64 {
 
 #[test]
 fn test_decode_tok_s_amx_beats_cpu_at_smollm2_dimensions() {
+    if !kanso_infer::accelerate::amx::has_accelerate_support() {
+        eprintln!("SKIP (non-macOS): amx is a scalar fallback here, cannot beat cpu");
+        return;
+    }
     let mut model = Model::create_mock_tiny(HIDDEN, Q_HEADS, KV_HEADS, LAYERS, VOCAB)
         .expect("mock model at SmolLM2-360M dimensions");
 
-    model.set_backend(kanso_infer::Backend::Amx);
-    let amx_tok_s = decode_tok_s(&model, STEPS);
-
-    model.set_backend(kanso_infer::Backend::Cpu);
-    let cpu_tok_s = decode_tok_s(&model, STEPS);
+    // Median of 3 samples each: single wall-clock samples are flaky under load.
+    let mut amx = Vec::with_capacity(3);
+    let mut cpu = Vec::with_capacity(3);
+    for _ in 0..3 {
+        model.set_backend(kanso_infer::Backend::Amx);
+        amx.push(decode_tok_s(&model, STEPS));
+        model.set_backend(kanso_infer::Backend::Cpu);
+        cpu.push(decode_tok_s(&model, STEPS));
+    }
+    amx.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    cpu.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let (amx_tok_s, cpu_tok_s) = (amx[1], cpu[1]);
 
     println!("decode tok/s @ SmolLM2-360M dims: amx={amx_tok_s:.2}, cpu={cpu_tok_s:.2}");
     assert!(

@@ -14,9 +14,10 @@ use std::sync::Arc;
 /// is precisely about *not* turning them into F32 at load: decode at batch 1 is
 /// memory-bandwidth bound, so reading 1.06 bytes/param instead of 4 is a ~3.8x
 /// cut in bytes moved per token. `QMatMul` keeps the blocks resident and runs
-/// the matmul off that storage (NEON/dotprod kernels on aarch64, dequant-on-the-fly
-/// in the Metal GEMV kernels); the dense variants are used for synthetic/mock
-/// models, which are compared bit-for-bit by golden tests.
+/// the matmul off that storage (candle's own NEON/dotprod kernels); the repo's
+/// Metal kernels (`fused_llama_layer.metal`) are F32-only, so quantized Metal
+/// GEMV is candle's `QMatMul`, not repo kernels. The dense variants are used for
+/// synthetic/mock models, which are compared bit-for-bit by golden tests.
 #[derive(Clone)]
 pub struct LinearWeight(QMatMul);
 
@@ -78,19 +79,36 @@ impl LinearWeight {
     }
 
     /// Re-stores the same values in `dtype` GGML blocks (dense F32 round-trip).
+    ///
+    /// Returns the dtype actually stored: `dtype` when the last dim divides its
+    /// block size, else `Q4_0` (a GGML block may not straddle a row). The
+    /// fallback prints to stderr so a bench label naming `dtype` cannot silently
+    /// lie about what ran.
     pub fn requantize(&self, dtype: GgmlDType) -> Result<Self, EngineError> {
         let dense = self.to_dense()?;
-        let dtype = if dense
-            .dim(candle_core::D::Minus1)?
-            .is_multiple_of(dtype.block_size())
+        let effective = self.effective_requant_dtype(&dense, dtype);
+        if effective != dtype {
+            eprintln!(
+                "requantize: {dtype:?} needs last-dim % {} == 0, got {} — storing Q4_0 instead",
+                dtype.block_size(),
+                dense.dim(candle_core::D::Minus1)?,
+            );
+        }
+        Self::from_qtensor(QTensor::quantize(&dense, effective)?)
+    }
+
+    /// Dtype `requantize` will actually store for `dense` when asked for `dtype`.
+    pub fn effective_requant_dtype(&self, dense: &Tensor, dtype: GgmlDType) -> GgmlDType {
+        if dense
+            .dim(candle_core::D::Minus1)
+            .is_ok_and(|last| last.is_multiple_of(dtype.block_size()))
         {
             dtype
         } else {
             // A GGML block may not straddle a row: fall back to Q4_0 (32-wide
             // blocks) for the narrow matrices that Q4_K/Q8_K cannot represent.
             GgmlDType::Q4_0
-        };
-        Self::from_qtensor(QTensor::quantize(&dense, dtype)?)
+        }
     }
 
     /// Bytes actually held in RAM by this weight's storage.

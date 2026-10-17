@@ -8,7 +8,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Kernel sources, mirroring `KERNEL_SOURCES` in `src/metal/pipeline.rs`.
+/// Kernel sources, parsed out of `KERNEL_SOURCES` in `src/metal/pipeline.rs`
+/// (the `file:` lines) so the AOT list cannot drift from the runtime list.
+/// A file listed here without a `file:` entry fails the build below.
 const KERNEL_FILES: &[&str] = &[
     "rmsnorm.metal",
     "rope.metal",
@@ -17,6 +19,30 @@ const KERNEL_FILES: &[&str] = &[
     "paged_attention_v2.metal",
     "fused_llama_layer.metal",
 ];
+
+/// Fails the build when `KERNEL_FILES` drifts from the `file:` lines of
+/// `KERNEL_SOURCES` in `src/metal/pipeline.rs`.
+fn check_kernel_list_in_sync() {
+    let src = std::fs::read_to_string("src/metal/pipeline.rs")
+        .expect("reading src/metal/pipeline.rs for the kernel list");
+    let mut listed: Vec<&str> = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("file: \"")
+            && let Some(name) = rest.split('"').next()
+        {
+            listed.push(name);
+        }
+    }
+    assert!(
+        !listed.is_empty(),
+        "no `file:` entries parsed out of src/metal/pipeline.rs"
+    );
+    assert_eq!(
+        listed, KERNEL_FILES,
+        "build.rs KERNEL_FILES drifted from src/metal/pipeline.rs KERNEL_SOURCES"
+    );
+}
 
 /// Command sequences (`xcrun -sdk macosx` prefix aside) that turn a `.metal` file
 /// into a `.metallib`, tried in order: explicit codegen flags first, then plain
@@ -35,6 +61,7 @@ fn recipes<'a>(src: &'a str, air: &'a str, dst: &'a str) -> [Vec<Vec<&'a str>>; 
 }
 
 fn main() {
+    check_kernel_list_in_sync();
     println!("cargo::rustc-check-cfg=cfg(metal_aot)");
     println!("cargo:rerun-if-changed=build.rs");
     for file in KERNEL_FILES {

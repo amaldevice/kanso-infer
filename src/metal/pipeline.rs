@@ -7,6 +7,8 @@ use std::collections::HashMap;
 ///
 /// Absent when the build machine has no Metal compiler (Command Line Tools only):
 /// the pipeline cache then compiles each file from source exactly once.
+/// `aot::bytes` covers exactly the files in `KERNEL_SOURCES` (no drift: the
+/// build script fails the build if a `file:` line here has no metallib).
 #[cfg(metal_aot)]
 mod aot {
     pub fn bytes(file: &str) -> Option<&'static [u8]> {
@@ -51,6 +53,11 @@ struct KernelSource {
     kernels: &'static [(&'static str, &'static str)],
 }
 
+/// Single source of truth for the kernel list: `build.rs` AOT compilation and
+/// the `aot::bytes` match below both derive from this table, so adding a shader
+/// means touching this list only. (`build.rs` cannot `include!` this file — it
+/// runs before the crate exists — so it parses the `file:` lines out of it;
+/// see the `KERNEL_FILES` comment in `build.rs`.)
 const KERNEL_SOURCES: &[KernelSource] = &[
     KernelSource {
         file: "rmsnorm.metal",

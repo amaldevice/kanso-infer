@@ -446,6 +446,41 @@ mod paged_attention_v2_tests {
         );
     }
 
+    /// Empty context leaves every partition idle (all m = -inf) and the merge
+    /// computes exp(-inf - -inf) = NaN; the host must reject it instead.
+    #[test]
+    fn test_paged_attention_v2_rejects_empty_context() {
+        let ctx = MetalContext::new().expect("MetalContext initialization failed");
+
+        let params = PagedAttentionParams {
+            num_seqs: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 4,
+            block_size: 2,
+            max_num_blocks_per_seq: 2,
+            scale: 0.5,
+        };
+        let q = vec![1.0f32; 4];
+        let k_cache = vec![0.0f32; 16];
+        let v_cache = vec![0.0f32; 16];
+        let block_tables = vec![0u32, 1];
+
+        let result = gpu_paged_attention_v2(
+            &ctx,
+            &q,
+            &k_cache,
+            &v_cache,
+            &block_tables,
+            &[0u32],
+            &params,
+        );
+        assert!(
+            result.is_err(),
+            "context_len == 0 must fail loudly instead of merging to NaN"
+        );
+    }
+
     /// Ticket #51: the stage-2 merge only matters when >1 partition holds live tokens.
     #[test]
     fn test_paged_attention_v2_multi_partition_merge_parity() {

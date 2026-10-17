@@ -137,3 +137,53 @@ fn test_amx_matmul_no_weight_sized_copy_per_token() {
          {VOCAB}-element output size"
     );
 }
+
+/// 3D prefill path (`[B, M, K] x [B, K, N]`) must also avoid weight-sized
+/// copies, including the per-batch-transposed weight view. Also pins the
+/// `AMX_FALLBACK_COPIES` counter at zero on the happy path.
+#[test]
+fn test_amx_matmul_3d_no_weight_sized_copy() {
+    use kanso_infer::accelerate::amx::AMX_FALLBACK_COPIES;
+
+    const B: usize = 2;
+    const M: usize = 4;
+    const K: usize = 64;
+    const N: usize = 64;
+    let a = Tensor::from_vec(vec![0.1f32; B * M * K], (B, M, K), &Device::Cpu).unwrap();
+    let w = Tensor::from_vec(vec![0.05f32; B * N * K], (B, N, K), &Device::Cpu).unwrap();
+    // Per-batch transpose view, matching `linear`'s `.t()` weight usage.
+    let b = w.transpose(1, 2).unwrap();
+
+    let reference = a.matmul(&b).expect("reference 3d matmul");
+    let reference = reference.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let _ = amx_matmul(&a, &b).expect("warmup 3d matmul");
+
+    let weight_bytes = B * K * N * std::mem::size_of::<f32>();
+    let before = AMX_FALLBACK_COPIES.load(Ordering::SeqCst);
+    BYTES_ALLOCATED.store(0, Ordering::SeqCst);
+    COUNTING.store(true, Ordering::SeqCst);
+    let out = amx_matmul(&a, &b).expect("amx 3d matmul");
+    COUNTING.store(false, Ordering::SeqCst);
+    let allocated = BYTES_ALLOCATED.load(Ordering::SeqCst);
+    let after = AMX_FALLBACK_COPIES.load(Ordering::SeqCst);
+
+    let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(got.len(), reference.len());
+    for (idx, (g, r)) in got.iter().zip(reference.iter()).enumerate() {
+        assert!(
+            (g - r).abs() <= 1e-4 * r.abs().max(1.0),
+            "element {idx}: amx={g} reference={r}"
+        );
+    }
+    assert_eq!(
+        after, before,
+        "3D happy path must not take the get_f32_vec fallback copy"
+    );
+    println!(
+        "3d matmul [{B}x{M}x{K}] x [{B}x{K}x{N}].t(): allocated {allocated} bytes, weight is {weight_bytes} bytes"
+    );
+    assert!(
+        allocated < weight_bytes,
+        "amx_matmul allocated {allocated} bytes for a 3D step; that is a weight-sized ({weight_bytes} bytes) copy"
+    );
+}

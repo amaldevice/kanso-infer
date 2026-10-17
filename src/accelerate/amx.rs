@@ -219,9 +219,18 @@ pub fn fallback_gemv(m: usize, k: usize, a: &[f32], x: &[f32], y: &mut [f32]) {
     }
 }
 
+/// Fallback copies taken by `get_f32_vec` (the weight-sized path `amx_matmul`
+/// avoids on recognized layouts). A layout regression shows up here before it
+/// shows up in tok/s. Quantized weights never reach this path at all — see
+/// `Model::linear`, which only routes dense F32 through AMX.
+pub static AMX_FALLBACK_COPIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Fallback copy path: materializes a tensor into a contiguous row-major `Vec`.
 /// Only reached for layouts the GEMM entry points cannot consume in place.
 fn get_f32_vec(tensor: &Tensor) -> Result<Vec<f32>, EngineError> {
+    AMX_FALLBACK_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("amx_matmul: unrecognized layout, taking weight-sized fallback copy");
     Ok(tensor.flatten_all()?.to_vec1::<f32>()?)
 }
 

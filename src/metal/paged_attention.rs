@@ -308,6 +308,13 @@ pub fn gpu_paged_attention_v2(
             "paged attention: context_len {len} exceeds block table capacity {capacity}"
         )));
     }
+    // An empty context leaves every partition idle (all m = -inf), and the merge
+    // then computes exp(-inf - -inf) = NaN. Fail loudly instead of emitting NaN.
+    if context_lens.contains(&0) {
+        return Err(EngineError::Metal(
+            "paged attention: context_len must be non-zero (empty context merges to NaN)".into(),
+        ));
+    }
 
     let q_buf = ctx.alloc_buffer_with_data(q);
     let k_cache_buf = ctx.alloc_buffer_with_data(k_cache);

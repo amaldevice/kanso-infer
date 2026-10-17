@@ -171,6 +171,12 @@ pub struct FusedLayerWeights {
 /// Upload once at load, then call [`MetalWeights::decode_step`] per token: the step
 /// allocates nothing, re-uploads nothing, and submits exactly one command buffer for
 /// the whole fused RMSNorm + QKV + RoPE chain.
+///
+/// Harness-only path (review F1): production decode is `Model::forward_decode_step`
+/// (`crate::model`, candle tensors, full layer incl. attention + MLP). This resident path covers
+/// the QKV prologue only and is exercised by `tests/test_single_command_buffer.rs`
+/// plus the GEMV bandwidth bench — wiring it into production means a full Metal
+/// decode loop (attn/O/MLP buffers, `w_o`/`ffn_*` residency), which is its own ticket.
 pub struct MetalWeights {
     dims: FusedLayerDimensions,
     norm_weight: Buffer,
@@ -348,7 +354,6 @@ impl MetalWeights {
 }
 
 /// Dispatches the fused RMSNorm + RoPE compute kernel in threadgroup memory.
-#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_fused_rmsnorm_rope_buffer(
     ctx: &MetalContext,
     in_buf: &Buffer,
@@ -415,11 +420,13 @@ pub fn gpu_fused_rmsnorm_rope_buffer(
 
     let threads = FUSED_THREADS_PER_TG as u64;
 
-    // One threadgroup per patch of rotations, instead of the single threadgroup that
-    // left every other GPU core idle (ticket #50).
-    let rotations = (dim / 2) as u64;
+    // Single threadgroup: the kernel partitions its rotation loop over `tid`
+    // only (no `tg` index), so one threadgroup already covers the whole row
+    // and extra threadgroups would recompute it redundantly for zero speedup.
+    // (The GEMV kernels below *are* partitioned across TGs, one row pair per
+    // SIMD group; this RoPE-only helper is not on the fused decode path.)
     let threadgroup_count = MTLSize {
-        width: rotations.div_ceil(threads),
+        width: 1,
         height: 1,
         depth: 1,
     };
@@ -439,7 +446,6 @@ pub fn gpu_fused_rmsnorm_rope_buffer(
 }
 
 /// Fused RMSNorm + RoPE execution helper with host slices.
-#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_fused_rmsnorm_rope(
     ctx: &MetalContext,
     input: &[f32],
@@ -494,6 +500,11 @@ pub fn gpu_fused_rmsnorm_rope(
 }
 
 /// Dispatches a linear GEMV kernel for a single input vector.
+///
+/// The `linear_gemv_kernel` covers row pairs (`units = out_dim / 2`) and reads
+/// `float4` lanes (`n4 = in_dim / 4`): an odd `out_dim` would silently drop the
+/// last row and a non-multiple-of-4 `in_dim` would silently drop the tail, so
+/// both fail here instead of on the GPU.
 pub fn encode_linear_gemv(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &metal::ComputePipelineState,
@@ -503,6 +514,14 @@ pub fn encode_linear_gemv(
     in_dim: usize,
     out_dim: usize,
 ) {
+    assert!(
+        out_dim > 0 && out_dim.is_multiple_of(2),
+        "encode_linear_gemv: out_dim must be a non-zero even count (kernel covers row pairs), got {out_dim}"
+    );
+    assert!(
+        in_dim > 0 && in_dim.is_multiple_of(4),
+        "encode_linear_gemv: in_dim must be a non-zero multiple of 4 (kernel reads float4 lanes), got {in_dim}"
+    );
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(in_vec_buf), 0);
     encoder.set_buffer(1, Some(weight_buf), 0);
@@ -541,7 +560,6 @@ pub fn encode_linear_gemv(
 /// (ticket #50: the projection used to run on a single threadgroup).
 /// Public so callers can chain several projections into one command encoder, which is
 /// also how the GEMV bandwidth test isolates GPU time from host buffer upload.
-#[allow(clippy::too_many_arguments)] // one kernel binding surface per dispatch
 pub fn encode_fused_qkv_gemv(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &metal::ComputePipelineState,
@@ -622,7 +640,6 @@ pub fn encode_fused_qkv_gemv(
 ///
 /// Convenient for tests and one-shot calls; a decode loop should hold a
 /// [`MetalWeights`] from load time instead, so weights are not re-uploaded per step.
-#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_fused_layer_single_encoder(
     ctx: &MetalContext,
     hidden_in: &[f32],
@@ -641,7 +658,6 @@ pub fn gpu_fused_layer_single_encoder(
 /// Discrete multi-encoder execution that executes RMSNorm, QKV Linear GEMVs, and RoPE
 /// using separate command buffers / command encoders and CPU commit-and-wait stalls.
 /// Used as ground truth numerical and performance baseline.
-#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_discrete_layer_multi_encoder(
     ctx: &MetalContext,
     hidden_in: &[f32],
@@ -744,7 +760,6 @@ pub fn gpu_discrete_layer_multi_encoder(
 
 /// Pipeline encoder that chains multi-step kernels within a single command encoder
 /// using Metal memory barriers (`memory_barrier_with_resources`).
-#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_chained_pipeline_single_encoder(
     ctx: &MetalContext,
     hidden_in: &[f32],

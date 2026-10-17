@@ -115,7 +115,9 @@ impl Model {
     /// Projects `x` through a stored weight (`x @ W^T`).
     ///
     /// Quantized weights run off their own block storage; only dense weights take
-    /// the AMX GEMM path (#50), which needs materialized F32.
+    /// the AMX GEMM path, which needs materialized F32 (`as_dense_f32` is `None`
+    /// for quantized storage, so quantized decode bypasses AMX entirely — the
+    /// mock-dense tok/s test does not cover real GGUF weights).
     pub fn linear(&self, w: &LinearWeight, x: &Tensor) -> Result<Tensor, EngineError> {
         if matches!(self.backend, crate::hardware::Backend::Amx)
             && let Some(dense) = w.as_dense_f32()
