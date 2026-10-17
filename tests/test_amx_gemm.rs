@@ -1,4 +1,5 @@
-use kanso_infer::accelerate::amx::{amx_gemm, amx_gemv, has_accelerate_support};
+use candle_core::{Device, Tensor};
+use kanso_infer::accelerate::amx::{amx_gemm, amx_gemv, amx_matmul, has_accelerate_support};
 use kanso_infer::bench::create_engine_for_model_profile;
 use kanso_infer::model::Model;
 use std::time::Instant;
@@ -160,6 +161,71 @@ fn test_model_forward_amx_backend_support() {
             a,
             c,
             diff
+        );
+    }
+}
+
+/// The decode path feeds `amx_matmul` a `.t()` weight view; the matmul now consumes the
+/// weight's own storage via `CblasTrans` instead of copying it, so parity with the
+/// transposed-view reference must hold for non-square shapes.
+#[test]
+fn test_amx_matmul_transposed_weight_matches_candle() {
+    let (m, k, n) = (3usize, 37usize, 11usize);
+    let mut x = vec![0.0f32; m * k];
+    for (i, v) in x.iter_mut().enumerate() {
+        *v = ((i as f32) * 0.31).sin();
+    }
+    let mut w = vec![0.0f32; n * k];
+    for (i, v) in w.iter_mut().enumerate() {
+        *v = ((i as f32) * 0.19).cos() * 0.5;
+    }
+
+    let x = Tensor::from_vec(x, (m, k), &Device::Cpu).unwrap();
+    let w = Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap();
+    let w_t = w.t().unwrap();
+
+    let expected = x.matmul(&w_t).unwrap().flatten_all().unwrap();
+    let expected = expected.to_vec1::<f32>().unwrap();
+    let got = amx_matmul(&x, &w_t).unwrap().flatten_all().unwrap();
+    let got = got.to_vec1::<f32>().unwrap();
+
+    assert_eq!(got.len(), m * n);
+    for (idx, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (g - e).abs() <= 1e-4 * e.abs().max(1.0),
+            "transposed-weight mismatch at {idx}: amx={g} candle={e}"
+        );
+    }
+}
+
+/// Batched attention scores: `[B, M, K] x [B, K, N]` where the right operand is a
+/// per-batch transpose view of a `[B, N, K]` block.
+#[test]
+fn test_amx_matmul_batched_transposed_matches_candle() {
+    let (batch, m, k, n) = (2usize, 4usize, 9usize, 5usize);
+    let mut q = vec![0.0f32; batch * m * k];
+    for (i, v) in q.iter_mut().enumerate() {
+        *v = ((i as f32) * 0.13).sin();
+    }
+    let mut kk = vec![0.0f32; batch * n * k];
+    for (i, v) in kk.iter_mut().enumerate() {
+        *v = ((i as f32) * 0.27).cos();
+    }
+
+    let q = Tensor::from_vec(q, (batch, m, k), &Device::Cpu).unwrap();
+    let kk = Tensor::from_vec(kk, (batch, n, k), &Device::Cpu).unwrap();
+    let k_t = kk.transpose(1, 2).unwrap();
+
+    let expected = q.matmul(&k_t).unwrap().flatten_all().unwrap();
+    let expected = expected.to_vec1::<f32>().unwrap();
+    let got = amx_matmul(&q, &k_t).unwrap().flatten_all().unwrap();
+    let got = got.to_vec1::<f32>().unwrap();
+
+    assert_eq!(got.len(), batch * m * n);
+    for (idx, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (g - e).abs() <= 1e-4 * e.abs().max(1.0),
+            "batched mismatch at {idx}: amx={g} candle={e}"
         );
     }
 }

@@ -27,6 +27,11 @@ impl MetalPipelineCache {
                 "paged_attention_v2",
             ),
             (
+                shaders::PAGED_ATTENTION_V2_SHADER,
+                "paged_attention_v2_reduce_kernel",
+                "paged_attention_v2_reduce",
+            ),
+            (
                 shaders::FUSED_LLAMA_LAYER_SHADER,
                 "fused_rmsnorm_rope_kernel",
                 "fused_rmsnorm_rope",
