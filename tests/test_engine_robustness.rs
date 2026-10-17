@@ -112,3 +112,41 @@ fn test_eos_stops_sequence_and_frees_blocks_in_same_step() {
         "#56: EOS must return blocks to the pool in the same step"
     );
 }
+
+/// Ticket #61 F1: a client that hung up must not buy `max_tokens` more steps of engine
+/// work — `cancel_request` retires the sequence and returns its blocks to the pool.
+#[test]
+fn test_cancel_request_retires_sequence_and_frees_blocks() {
+    let mut engine = Engine::new_with_budget(mock(), 2, 16, 4, usize::MAX);
+    let keep = engine.add_request(vec![1, 2, 3, 4], 8);
+    let doomed = engine.add_request(vec![5, 6, 7, 8], 64);
+
+    let first = engine.step().expect("prefill step");
+    assert_eq!(first.len(), 2, "both requests prefill in one step");
+    assert!(engine.free_blocks_count() < 16, "sequences hold KV blocks");
+
+    assert!(engine.cancel_request(doomed), "live request must cancel");
+    assert!(
+        !engine.sequences.iter().any(|s| s.id == doomed),
+        "a cancelled request leaves the sequence vector"
+    );
+
+    // The survivor keeps decoding; the cancelled one never appears again.
+    let outputs = engine.step().expect("decode step");
+    assert!(
+        outputs.iter().all(|o| o.request_id == keep),
+        "cancelled request must not emit: {outputs:?}"
+    );
+
+    // Draining to the end returns every remaining block, so the cancel freed the doomed
+    // request's share rather than leaking it.
+    while engine.has_unfinished_requests() {
+        engine.step().expect("decode step");
+        engine.drain_finished();
+    }
+    assert_eq!(engine.free_blocks_count(), 16, "blocks leaked after cancel");
+    assert!(
+        !engine.cancel_request(doomed),
+        "cancelling twice is a no-op"
+    );
+}

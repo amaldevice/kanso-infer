@@ -1,7 +1,5 @@
 use clap::{Parser, Subcommand};
-use parking_lot::Mutex;
 use std::io::{self, Write};
-use std::sync::Arc;
 
 use kanso_infer::bench::create_engine_for_model_profile;
 use kanso_infer::chat::ChatSession;
@@ -353,7 +351,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             port,
             model,
             backend,
-            tokenizer: _,
+            tokenizer,
         } => {
             println!(
                 "Starting OpenAI-compatible server on http://localhost:{}...",
@@ -378,8 +376,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             model_instance.set_backend(backend);
             let engine = kanso_infer::engine::Engine::new(model_instance, 8, 128, 16);
 
-            let shared_engine = Arc::new(Mutex::new(engine));
-            let app = create_app(shared_engine);
+            // #46: the server tokenizes and detokenizes with the real tokenizer, so a
+            // missing one is a startup failure rather than silently wrong text.
+            let tokenizer = match kanso_infer::tokenizer::TokenizerWrapper::resolve(
+                tokenizer.as_deref(),
+                Some(&resolved_path),
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let app = create_app(engine, tokenizer);
 
             let addr = format!("0.0.0.0:{}", port);
             let listener = tokio::net::TcpListener::bind(&addr).await?;

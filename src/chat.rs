@@ -9,6 +9,20 @@ pub struct ChatMessage {
 }
 use crate::tokenizer::{StreamDecoder, TokenizerWrapper};
 
+/// ChatML rendering of a conversation, ending with the open assistant turn: the prompt
+/// template both the REPL and the HTTP server feed the model.
+pub fn format_chatml(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for msg in messages {
+        prompt.push_str(&format!(
+            "<|im_start|>{}\n{}<|im_end|>\n",
+            msg.role, msg.content
+        ));
+    }
+    prompt.push_str("<|im_start|>assistant\n");
+    prompt
+}
+
 pub struct ChatSession {
     pub engine: Engine,
     pub history: Vec<ChatMessage>,
@@ -52,14 +66,7 @@ impl ChatSession {
 
     /// Formats the conversation history into ChatML-style text and token IDs
     pub fn format_prompt(&self) -> (String, Vec<u32>) {
-        let mut prompt_text = String::new();
-        for msg in &self.history {
-            prompt_text.push_str(&format!(
-                "<|im_start|>{}\n{}<|im_end|>\n",
-                msg.role, msg.content
-            ));
-        }
-        prompt_text.push_str("<|im_start|>assistant\n");
+        let prompt_text = format_chatml(&self.history);
 
         let tokens: Vec<u32> = if let Some(tok) = &self.tokenizer {
             tok.encode(&prompt_text).unwrap_or_else(|_| {

@@ -9,8 +9,6 @@ use kanso_infer::bench::traffic::{
 use kanso_infer::engine::Engine;
 use kanso_infer::model::Model;
 use kanso_infer::server::create_app_with_queue_limit;
-use parking_lot::Mutex;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 #[test]
@@ -174,13 +172,18 @@ fn test_concurrency_sweep_rates_and_execution() {
 
 #[tokio::test]
 async fn test_graceful_http_429_backpressure_under_burst() {
-    let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     // Engine with max_running = 2 and small waiting queue limit of 1
-    let engine = Engine::new(model, 2, 20, 4);
-    let shared_engine = Arc::new(Mutex::new(engine));
+    let tokenizer = kanso_infer::tokenizer::TokenizerWrapper::resolve(None, None).unwrap();
+    // #46: the server tokenizes with the real tokenizer, so the mock vocab must cover
+    // every id it can emit.
+    let vocab_size = tokenizers::Tokenizer::from_file("tokenizer.json")
+        .unwrap()
+        .get_vocab_size(true);
+    let model = Model::create_mock_tiny(64, 4, 2, 2, vocab_size).unwrap();
+    let engine = Engine::new(model, 2, 32, 16);
 
     // Server with queue limit = 1: max 1 waiting request allowed, subsequent get 429
-    let app = create_app_with_queue_limit(shared_engine, Some(1));
+    let app = create_app_with_queue_limit(engine, tokenizer, Some(1));
 
     let make_request = || {
         let payload = serde_json::to_vec(&serde_json::json!({

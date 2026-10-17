@@ -1,7 +1,9 @@
+use candle_core::Tensor;
+
 use crate::error::EngineError;
 use crate::kv_cache::{BlockPool, BlockTable, KvStorage, PrefixCache};
 use crate::model::Model;
-use crate::sampler::sample_token;
+use crate::sampler::sample_logits;
 use crate::scheduler::{SamplingParams, Sequence, SequenceStatus};
 
 #[derive(Debug, Clone)]
@@ -9,63 +11,6 @@ pub struct StepOutput {
     pub request_id: u64,
     pub token_id: u32,
     pub is_finished: bool,
-}
-#[derive(Debug, Clone)]
-pub struct ScratchpadWorkspace {
-    pub max_batch: usize,
-    pub hidden_dim: usize,
-    pub intermediate_dim: usize,
-    pub vocab_size: usize,
-    pub hidden_states: Vec<f32>,
-    pub normed_states: Vec<f32>,
-    pub q_proj: Vec<f32>,
-    pub k_proj: Vec<f32>,
-    pub v_proj: Vec<f32>,
-    pub attn_out: Vec<f32>,
-    pub ffn_gate: Vec<f32>,
-    pub ffn_up: Vec<f32>,
-    pub ffn_down: Vec<f32>,
-    pub logits: Vec<f32>,
-}
-
-impl ScratchpadWorkspace {
-    pub fn new(
-        max_batch: usize,
-        hidden_dim: usize,
-        intermediate_dim: usize,
-        vocab_size: usize,
-    ) -> Self {
-        Self {
-            max_batch,
-            hidden_dim,
-            intermediate_dim,
-            vocab_size,
-            hidden_states: vec![0.0f32; max_batch * hidden_dim],
-            normed_states: vec![0.0f32; max_batch * hidden_dim],
-            q_proj: vec![0.0f32; max_batch * hidden_dim],
-            k_proj: vec![0.0f32; max_batch * hidden_dim],
-            v_proj: vec![0.0f32; max_batch * hidden_dim],
-            attn_out: vec![0.0f32; max_batch * hidden_dim],
-            ffn_gate: vec![0.0f32; max_batch * intermediate_dim],
-            ffn_up: vec![0.0f32; max_batch * intermediate_dim],
-            ffn_down: vec![0.0f32; max_batch * hidden_dim],
-            logits: vec![0.0f32; max_batch * vocab_size],
-        }
-    }
-
-    #[inline(always)]
-    pub fn clear(&mut self) {
-        self.hidden_states.fill(0.0);
-        self.normed_states.fill(0.0);
-        self.q_proj.fill(0.0);
-        self.k_proj.fill(0.0);
-        self.v_proj.fill(0.0);
-        self.attn_out.fill(0.0);
-        self.ffn_gate.fill(0.0);
-        self.ffn_up.fill(0.0);
-        self.ffn_down.fill(0.0);
-        self.logits.fill(0.0);
-    }
 }
 
 pub struct Engine {
@@ -79,7 +24,6 @@ pub struct Engine {
     pub current_step: usize,
     pub next_request_id: u64,
     pub kv_storage: KvStorage,
-    pub workspace: ScratchpadWorkspace,
     pub prefix_matched_tokens: usize,
     pub total_prompt_tokens_admitted: usize,
     pub prefix_cache_hits: usize,
@@ -108,13 +52,6 @@ impl Engine {
         )
         .expect("failed to initialize kv storage");
 
-        let workspace = ScratchpadWorkspace::new(
-            max_running,
-            model.config.hidden_size,
-            model.config.intermediate_size,
-            model.config.vocab_size,
-        );
-
         Self {
             model,
             block_pool: BlockPool::new(total_blocks),
@@ -126,7 +63,6 @@ impl Engine {
             current_step: 0,
             next_request_id: 1,
             kv_storage,
-            workspace,
             prefix_matched_tokens: 0,
             total_prompt_tokens_admitted: 0,
             prefix_cache_hits: 0,
@@ -215,13 +151,34 @@ impl Engine {
         self.sequences.iter().any(|s| !s.is_finished())
     }
 
+    /// One scheduling step: plan, run one batched forward for everything planned (#45),
+    /// commit the sampled tokens, retire finished sequences.
+    ///
+    /// "One model forward per step" describes this method on the serving path. Speculative
+    /// traffic does not ride it (ticket #61 F3): `SpeculativeEngine::step` calls
+    /// [`Engine::speculative_step_sampled`] instead, which verifies through
+    /// `forward_verify_tokens` and lets the draft spend a decode step per proposal.
     pub fn step(&mut self) -> Result<Vec<StepOutput>, EngineError> {
         self.current_step += 1;
         let mut outputs = Vec::new();
         let mut finished_indices = Vec::new();
         let mut remaining_budget = self.token_budget;
 
+        /// Work a sequence contributes to this step: its decode token, or the
+        /// prefill chunk that carries it closer to being decodable.
+        struct Planned {
+            idx: usize,
+            start_pos: usize,
+            tokens: Vec<u32>,
+            is_prefill: bool,
+        }
+
         // 1. Priority: Active decode requests execute without stalling
+        let mut planned: Vec<Planned> = Vec::new();
+        // Sequences already planned this step are never preemption victims: taking their
+        // blocks back would drop work the step's budget already paid for and leave the
+        // plan pointing at freed blocks (ticket #61 F11).
+        let mut planned_flags = vec![false; self.sequences.len()];
         for idx in 0..self.sequences.len() {
             let seq = &self.sequences[idx];
             if seq.status != SequenceStatus::Running
@@ -238,44 +195,20 @@ impl Engine {
             // short, blocks are taken from the lowest-priority (newest) sequence, which
             // then recomputes; if there is nothing left to take, this sequence waits a
             // step instead of decoding past the end of its block table.
-            if self.decode_needs_block(idx) && !self.ensure_blocks(idx, 1) {
+            if self.decode_needs_block(idx) && !self.ensure_blocks(idx, 1, &planned_flags) {
                 continue;
             }
 
-            let seq = &mut self.sequences[idx];
+            let seq = &self.sequences[idx];
             let last_token = *seq.generated_tokens.last().unwrap();
             let pos = seq.prompt_tokens.len() + seq.generated_tokens.len() - 1;
-            self.workspace.clear();
-            let logits = self.model.forward_decode_step_with_workspace(
-                last_token,
-                pos,
-                &seq.block_table,
-                &mut self.kv_storage,
-                Some(&mut self.workspace),
-            )?;
-
-            let next_token = sample_token(
-                &logits,
-                seq.sampling.temperature,
-                seq.sampling.top_p,
-                seq.sampling.seed,
-            )?;
-            seq.generated_tokens.push(next_token);
-            seq.block_table.advance_tokens(1);
-
-            // #56: EOS (any configured stop id) retires the sequence exactly like
-            // max_tokens, so its blocks return to the pool in this same step.
-            let is_finished = seq.is_done_after(next_token);
-            if is_finished {
-                seq.status = SequenceStatus::Finished;
-                finished_indices.push(idx);
-            }
-
-            outputs.push(StepOutput {
-                request_id: seq.id,
-                token_id: next_token,
-                is_finished,
+            planned.push(Planned {
+                idx,
+                start_pos: pos,
+                tokens: vec![last_token],
+                is_prefill: false,
             });
+            planned_flags[idx] = true;
 
             remaining_budget = remaining_budget.saturating_sub(1);
         }
@@ -360,56 +293,155 @@ impl Engine {
                 .div_ceil(self.block_size);
             let current_blocks = seq.block_table.blocks().len();
             if needed_blocks > current_blocks
-                && !self.ensure_blocks(idx, needed_blocks - current_blocks)
+                && !self.ensure_blocks(idx, needed_blocks - current_blocks, &planned_flags)
             {
                 continue;
             }
 
             let seq = &self.sequences[idx];
-            let chunk_tokens = &seq.prompt_tokens[start_pos..end_pos];
-            let logits = self.model.forward_prefill(
-                chunk_tokens,
+            planned.push(Planned {
+                idx,
                 start_pos,
-                &seq.block_table,
-                &mut self.kv_storage,
-            )?;
-
-            let seq = &mut self.sequences[idx];
-            seq.prefilled_tokens = end_pos;
-            seq.block_table.set_num_tokens(end_pos);
+                tokens: seq.prompt_tokens[start_pos..end_pos].to_vec(),
+                is_prefill: true,
+            });
+            planned_flags[idx] = true;
             remaining_budget = remaining_budget.saturating_sub(chunk_len);
+        }
 
-            // If prefill completed, sample the first generated token
-            if seq.prefilled_tokens == seq.prompt_tokens.len() {
-                let next_token = sample_token(
-                    &logits,
-                    seq.sampling.temperature,
-                    seq.sampling.top_p,
-                    seq.sampling.seed,
-                )?;
-                seq.generated_tokens.push(next_token);
-                seq.block_table.advance_tokens(1);
+        // Preemption skips planned sequences, so every entry above still points at a
+        // running sequence with its blocks (ticket #61 F11).
+        debug_assert!(planned.iter().all(|p| {
+            let seq = &self.sequences[p.idx];
+            seq.status == SequenceStatus::Running && !seq.is_finished()
+        }));
 
-                // #56: EOS retires the sequence in this same step.
-                let is_finished = seq.is_done_after(next_token);
-                if is_finished {
-                    seq.status = SequenceStatus::Finished;
-                    finished_indices.push(idx);
+        // 4. One batched forward for everything planned above: decode tokens and
+        // prefill chunks ride the same GEMM sweep, so the weights are read once.
+        let logits = if planned.is_empty() {
+            None
+        } else {
+            let mut tokens = Vec::new();
+            let mut positions = Vec::new();
+            let mut slot_mapping = Vec::new();
+            let mut block_tables = Vec::with_capacity(planned.len());
+            let mut context_lens = Vec::with_capacity(planned.len());
+            let mut query_lens = Vec::with_capacity(planned.len());
+            for p in &planned {
+                let table = self.sequences[p.idx].block_table.blocks();
+                for (i, &token) in p.tokens.iter().enumerate() {
+                    let pos = p.start_pos + i;
+                    let block_idx = pos / self.block_size;
+                    let block = *table.get(block_idx).ok_or_else(|| {
+                        EngineError::Model(format!(
+                            "Position {} requires block index {} but block table only has {} blocks",
+                            pos,
+                            block_idx,
+                            table.len()
+                        ))
+                    })?;
+                    tokens.push(token);
+                    positions.push(pos);
+                    slot_mapping.push(block * self.block_size + pos % self.block_size);
                 }
+                block_tables.push(table.to_vec());
+                context_lens.push(p.start_pos + p.tokens.len());
+                query_lens.push(p.tokens.len());
+            }
+            Some(self.model.forward_batch(
+                &tokens,
+                &positions,
+                &slot_mapping,
+                &mut self.kv_storage,
+                &block_tables,
+                &context_lens,
+                &query_lens,
+            )?)
+        };
 
-                outputs.push(StepOutput {
-                    request_id: seq.id,
-                    token_id: next_token,
-                    is_finished,
-                });
+        // 5. Commit stage: sample each planned sequence's next token from its logits row
+        // and advance it — in plan order, so decode outputs precede prefill completions.
+        //
+        // Only rows that actually sample are gathered, and they cross to the host in one
+        // transfer (ticket #61 F11): a partial prefill chunk's row is discarded, and one
+        // `to_vec1` per sequence cost one device read per sequence.
+        let sampling_rows: Vec<u32> = planned
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                !p.is_prefill
+                    || p.start_pos + p.tokens.len() == self.sequences[p.idx].prompt_tokens.len()
+            })
+            .map(|(row, _)| row as u32)
+            .collect();
+        let sampling_rows_count = sampling_rows.len();
+        let logits_host: Option<Vec<Vec<f32>>> = match &logits {
+            Some(l) => {
+                let rows =
+                    Tensor::from_vec(sampling_rows, (sampling_rows_count,), &self.model.device)?;
+                Some(l.index_select(&rows, 0)?.to_vec2::<f32>()?)
+            }
+            None => None,
+        };
 
-                // Insert prompt prefix into prefix cache
+        let mut sample_row = 0usize;
+        for p in planned.iter() {
+            let seq = &mut self.sequences[p.idx];
+
+            if p.is_prefill {
+                let end_pos = p.start_pos + p.tokens.len();
+                seq.prefilled_tokens = end_pos;
+                seq.block_table.set_num_tokens(end_pos);
+                // A partial chunk produces no token; only a completed prompt samples.
+                if end_pos != seq.prompt_tokens.len() {
+                    continue;
+                }
+            }
+
+            let row_logits = logits_host
+                .as_ref()
+                .and_then(|rows| rows.get(sample_row))
+                .ok_or_else(|| {
+                    EngineError::Model(format!(
+                        "step: sequence {} has no logits row {sample_row} to sample from",
+                        seq.id
+                    ))
+                })?;
+            let next_token = sample_logits(
+                row_logits,
+                seq.sampling.temperature,
+                seq.sampling.top_p,
+                seq.sampling.seed,
+            )?;
+            sample_row += 1;
+            seq.generated_tokens.push(next_token);
+            seq.block_table.advance_tokens(1);
+
+            // #56: EOS (any configured stop id) retires the sequence exactly like
+            // max_tokens, so its blocks return to the pool in this same step.
+            let is_finished = seq.is_done_after(next_token);
+            if is_finished {
+                seq.status = SequenceStatus::Finished;
+                finished_indices.push(p.idx);
+            }
+
+            outputs.push(StepOutput {
+                request_id: seq.id,
+                token_id: next_token,
+                is_finished,
+            });
+        }
+
+        // Insert completed prompts into the prefix cache.
+        for p in planned.iter().filter(|p| p.is_prefill) {
+            let seq = &self.sequences[p.idx];
+            if seq.prefilled_tokens == seq.prompt_tokens.len() {
                 self.prefix_cache
                     .insert_prefix(&seq.prompt_tokens, seq.block_table.blocks());
             }
         }
 
-        // 4. Retirement stage: Free KV blocks for finished sequences
+        // 6. Retirement stage: Free KV blocks for finished sequences
         for idx in finished_indices {
             let seq = &mut self.sequences[idx];
             for &blk in seq.block_table.blocks() {
@@ -430,6 +462,21 @@ impl Engine {
         before - self.sequences.len()
     }
 
+    /// Retires a request whose caller is gone (client disconnect, ticket #61 F1): its KV
+    /// blocks go back to the pool now instead of after `max_tokens` more steps of work
+    /// nobody reads. `false` = no such request is live.
+    pub fn cancel_request(&mut self, request_id: u64) -> bool {
+        let Some(seq) = self.sequences.iter_mut().find(|s| s.id == request_id) else {
+            return false;
+        };
+        for &blk in seq.block_table.blocks() {
+            self.block_pool.free(blk);
+        }
+        seq.status = SequenceStatus::Finished;
+        self.drain_finished();
+        true
+    }
+
     /// Would the next decoded token spill past the sequence's allocated blocks?
     fn decode_needs_block(&self, idx: usize) -> bool {
         let table = &self.sequences[idx].block_table;
@@ -440,9 +487,12 @@ impl Engine {
     /// lowest-priority (newest) running sequence when the pool is short — that victim is
     /// preempted and recomputes later. `false` = there was nothing left to take, so the
     /// caller must defer the sequence instead of running it outside its block table.
-    fn ensure_blocks(&mut self, idx: usize, want: usize) -> bool {
+    ///
+    /// `planned` marks the sequences this step has already planned (ticket #61 F11): they
+    /// are not valid victims, because the step's budget was already spent on their forward.
+    fn ensure_blocks(&mut self, idx: usize, want: usize, planned: &[bool]) -> bool {
         while self.block_pool.free_blocks_count() < want {
-            if !self.preempt_lowest_priority_after(idx) {
+            if !self.preempt_lowest_priority_after(idx, planned) {
                 return false;
             }
         }
@@ -459,10 +509,13 @@ impl Engine {
         true
     }
 
-    /// Picks the newest running sequence after `idx` (lowest priority) and preempts it.
-    fn preempt_lowest_priority_after(&mut self, idx: usize) -> bool {
+    /// Picks the newest running sequence after `idx` (lowest priority) that this step has
+    /// not planned yet and preempts it.
+    fn preempt_lowest_priority_after(&mut self, idx: usize, planned: &[bool]) -> bool {
         let victim = (idx + 1..self.sequences.len()).rev().find(|&j| {
-            self.sequences[j].status == SequenceStatus::Running && !self.sequences[j].is_finished()
+            !planned[j]
+                && self.sequences[j].status == SequenceStatus::Running
+                && !self.sequences[j].is_finished()
         });
         match victim {
             Some(v) => {
@@ -490,10 +543,31 @@ impl Engine {
         seq.status = SequenceStatus::Waiting;
     }
 
+    /// Greedy (temperature 0) speculation: candidates are verified by argmax match.
     pub fn speculative_step(
         &mut self,
         request_id: u64,
         draft_candidates: &[u32],
+    ) -> Result<crate::speculative::VerificationResult, EngineError> {
+        self.speculative_step_sampled(request_id, draft_candidates, &[], SamplingParams::default())
+    }
+
+    /// Full speculation step. `draft_probs[i]` is the distribution the draft drew
+    /// `draft_candidates[i]` from — required when `sampling.temperature > 0`, where the
+    /// candidates are verified by rejection sampling instead of argmax match (#55).
+    ///
+    /// Deliberately outside the "one batched forward per step" claim (#45, ticket #61 F3):
+    /// the candidates are verified by one `forward_verify_tokens` over the `[current,
+    /// candidates...]` block (not `forward_batch`), and the draft paid one
+    /// `forward_decode_step` per proposal before this call. Batching the verifier with the
+    /// step's other sequences is the open work; until then the counter
+    /// `Model::forward_batch_calls` does not move for speculative traffic, by design.
+    pub fn speculative_step_sampled(
+        &mut self,
+        request_id: u64,
+        draft_candidates: &[u32],
+        draft_probs: &[Vec<f32>],
+        sampling: SamplingParams,
     ) -> Result<crate::speculative::VerificationResult, EngineError> {
         let seq_idx = self
             .sequences
@@ -523,6 +597,8 @@ impl Engine {
             &self.model,
             last_token,
             draft_candidates,
+            draft_probs,
+            sampling,
             start_pos,
             &mut seq_mut.block_table,
             &mut self.block_pool,

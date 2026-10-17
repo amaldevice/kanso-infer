@@ -21,3 +21,21 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test
+
+  # The throughput gates are wall-clock measurements: at opt-level 0 candle's per-op
+  # overhead swamps the amortization they measure, so the tests are `#[ignore]`d in debug
+  # builds (reported as ignored, never as a pass under a lowered floor) and run here
+  # (ticket #61 F5).
+  release-gates:
+    name: release-only gates (batch-8 4x, speculative 1.3x)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build (release)
+        run: cargo build --release --tests
+      - name: batched-forward gate
+        run: cargo test --release --test test_batched_forward
+      - name: speculative speedup gate
+        run: cargo test --release --test test_speculative_draft_kv
