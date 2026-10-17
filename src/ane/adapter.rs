@@ -1,5 +1,5 @@
 use crate::error::EngineError;
-use crate::weights::LayerWeights;
+use crate::weights::{LayerWeights, LinearWeight};
 use candle_core::{Device, Tensor};
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -52,9 +52,9 @@ pub struct CpuFallbackAneAdapter {
     pub layer_index: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
-    pub ffn_gate: Tensor,
-    pub ffn_up: Tensor,
-    pub ffn_down: Tensor,
+    pub ffn_gate: LinearWeight,
+    pub ffn_up: LinearWeight,
+    pub ffn_down: LinearWeight,
     pub backend: crate::hardware::Backend,
     pub device: Device,
 }
@@ -65,9 +65,9 @@ impl CpuFallbackAneAdapter {
         layer_index: usize,
         hidden_size: usize,
         intermediate_size: usize,
-        ffn_gate: Tensor,
-        ffn_up: Tensor,
-        ffn_down: Tensor,
+        ffn_gate: LinearWeight,
+        ffn_up: LinearWeight,
+        ffn_down: LinearWeight,
         backend: crate::hardware::Backend,
         device: Device,
     ) -> Self {
@@ -98,7 +98,7 @@ impl CpuFallbackAneAdapter {
             weights.ffn_up.clone(),
             weights.ffn_down.clone(),
             backend,
-            weights.ffn_gate.device().clone(),
+            weights.ffn_gate.device(),
         )
     }
 
@@ -123,27 +123,23 @@ impl AneLayerAdapter for CpuFallbackAneAdapter {
         let seq_len = input.len() / self.hidden_size;
         let x = Tensor::from_slice(input, (seq_len, self.hidden_size), &self.device)?;
 
-        let is_amx = matches!(self.backend, crate::hardware::Backend::Amx)
+        let amx = matches!(self.backend, crate::hardware::Backend::Amx)
             && crate::accelerate::amx::has_accelerate_support();
-
-        let (gate, up) = if is_amx {
-            let g = crate::accelerate::amx::amx_matmul(&x, &self.ffn_gate.t()?)?;
-            let u = crate::accelerate::amx::amx_matmul(&x, &self.ffn_up.t()?)?;
-            (g, u)
-        } else {
-            let g = x.matmul(&self.ffn_gate.t()?)?;
-            let u = x.matmul(&self.ffn_up.t()?)?;
-            (g, u)
+        // AMX GEMM only takes dense F32; quantized weights keep their own kernels.
+        let project = |w: &LinearWeight, x: &Tensor| -> Result<Tensor, EngineError> {
+            match w.as_dense_f32() {
+                Some(dense) if amx => crate::accelerate::amx::amx_matmul(x, &dense.t()?),
+                _ => w.forward(x),
+            }
         };
+
+        let gate = project(&self.ffn_gate, &x)?;
+        let up = project(&self.ffn_up, &x)?;
 
         let silu_gate = candle_nn::ops::silu(&gate)?;
         let ffn_hidden = (silu_gate * up)?;
 
-        let out = if is_amx {
-            crate::accelerate::amx::amx_matmul(&ffn_hidden, &self.ffn_down.t()?)?
-        } else {
-            ffn_hidden.matmul(&self.ffn_down.t()?)?
-        };
+        let out = project(&self.ffn_down, &ffn_hidden)?;
 
         let flat = out.flatten_all()?.to_vec1::<f32>()?;
         Ok(flat)
@@ -352,10 +348,8 @@ impl HybridExecutionPipeline {
         // 1. Attention Norm
         let normed = model.rmsnorm(hidden, &layer.attn_norm)?;
 
-        // 2. Linear Q, K, V
-        let q = model.matmul(&normed, &layer.attn_q.t()?)?;
-        let k = model.matmul(&normed, &layer.attn_k.t()?)?;
-        let v = model.matmul(&normed, &layer.attn_v.t()?)?;
+        // 2. Linear Q, K, V (quantized storage; Q/K in rotate-half head order)
+        let (q, k, v) = model.project_qkv(layer, &normed)?;
 
         let head_dim = model.config.head_dim();
         let num_q_heads = model.config.num_attention_heads;
@@ -387,7 +381,7 @@ impl HybridExecutionPipeline {
         let attn_out = attn_out
             .transpose(0, 1)?
             .reshape((seq_len, num_q_heads * head_dim))?;
-        let attn_proj = model.matmul(&attn_out, &layer.attn_output.t()?)?;
+        let attn_proj = model.linear(&layer.attn_output, &attn_out)?;
 
         // 3. Residual connection
         let hidden = (hidden + attn_proj)?;

@@ -2,7 +2,7 @@ use crate::config::{ModelArchitecture, ModelConfig};
 use crate::engine::ScratchpadWorkspace;
 use crate::error::EngineError;
 use crate::kv_cache::{BlockTable, KvStorage};
-use crate::weights::{LayerWeights, ModelWeights};
+use crate::weights::{LayerWeights, LinearWeight, ModelWeights};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -80,20 +80,8 @@ impl Model {
     /// Moves every weight tensor plus the device tag onto `device`.
     /// Needed for the honest Metal path: GGUF loads on CPU, then moves whole.
     pub fn to_device(&mut self, device: &Device) -> Result<(), EngineError> {
-        for layer in &mut self.weights.layers {
-            layer.attn_q = layer.attn_q.to_device(device)?;
-            layer.attn_k = layer.attn_k.to_device(device)?;
-            layer.attn_v = layer.attn_v.to_device(device)?;
-            layer.attn_output = layer.attn_output.to_device(device)?;
-            layer.attn_norm = layer.attn_norm.to_device(device)?;
-            layer.ffn_gate = layer.ffn_gate.to_device(device)?;
-            layer.ffn_up = layer.ffn_up.to_device(device)?;
-            layer.ffn_down = layer.ffn_down.to_device(device)?;
-            layer.ffn_norm = layer.ffn_norm.to_device(device)?;
-        }
-        self.weights.embed_tokens = self.weights.embed_tokens.to_device(device)?;
-        self.weights.norm = self.weights.norm.to_device(device)?;
-        self.weights.lm_head = self.weights.lm_head.to_device(device)?;
+        // Quantized blocks are rebuilt on the target device, not expanded to F32.
+        self.weights = self.weights.to_device(device)?;
         self.device = device.clone();
         Ok(())
     }
@@ -116,12 +104,56 @@ impl Model {
         if let Some(pipeline) = &self.hybrid_pipeline {
             pipeline.forward_layer_mlp(layer_idx, ffn_normed)
         } else {
-            let gate = self.matmul(ffn_normed, &layer.ffn_gate.t()?)?;
-            let up = self.matmul(ffn_normed, &layer.ffn_up.t()?)?;
+            let gate = self.linear(&layer.ffn_gate, ffn_normed)?;
+            let up = self.linear(&layer.ffn_up, ffn_normed)?;
             let silu_gate = candle_nn::ops::silu(&gate)?;
             let ffn_hidden = (silu_gate * up)?;
-            self.matmul(&ffn_hidden, &layer.ffn_down.t()?)
+            self.linear(&layer.ffn_down, &ffn_hidden)
         }
+    }
+
+    /// Projects `x` through a stored weight (`x @ W^T`).
+    ///
+    /// Quantized weights run off their own block storage; only dense weights take
+    /// the AMX GEMM path (#50), which needs materialized F32.
+    pub fn linear(&self, w: &LinearWeight, x: &Tensor) -> Result<Tensor, EngineError> {
+        if matches!(self.backend, crate::hardware::Backend::Amx)
+            && let Some(dense) = w.as_dense_f32()
+        {
+            return crate::accelerate::amx::amx_matmul(x, &dense.t()?);
+        }
+        w.forward(x)
+    }
+
+    /// Dequantizes an embedding row per token id instead of the whole table.
+    pub fn embed(&self, ids: &Tensor) -> Result<Tensor, EngineError> {
+        self.weights.embed_tokens.embed(ids)
+    }
+
+    /// Q/K/V projections for `normed`, with Q/K put into rotate-half head order.
+    ///
+    /// The GGUF layout permutation belongs to the weights (`QkPerm`), so every
+    /// path that projects Q/K shares this helper and none of them can drift.
+    pub fn project_qkv(
+        &self,
+        layer: &LayerWeights,
+        normed: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor), EngineError> {
+        let (q_perm, k_perm) = match &self.weights.qk_perm {
+            Some(p) => (Some(&p.q), Some(&p.k)),
+            None => (None, None),
+        };
+        let q = self.linear(&layer.attn_q, normed)?;
+        let k = self.linear(&layer.attn_k, normed)?;
+        let q = match q_perm {
+            Some(idx) => q.index_select(idx, 1)?,
+            None => q,
+        };
+        let k = match k_perm {
+            Some(idx) => k.index_select(idx, 1)?,
+            None => k,
+        };
+        Ok((q, k, self.linear(&layer.attn_v, normed)?))
     }
 
     pub fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor, EngineError> {
@@ -154,24 +186,46 @@ impl Model {
         let mut layers = Vec::new();
         for _ in 0..num_layers {
             let layer = LayerWeights {
-                attn_q: randn(vec![num_attention_heads * head_dim, hidden_size])?,
-                attn_k: randn(vec![num_kv_heads * head_dim, hidden_size])?,
-                attn_v: randn(vec![num_kv_heads * head_dim, hidden_size])?,
-                attn_output: randn(vec![hidden_size, num_attention_heads * head_dim])?,
+                attn_q: LinearWeight::from_tensor(randn(vec![
+                    num_attention_heads * head_dim,
+                    hidden_size,
+                ])?),
+                attn_k: LinearWeight::from_tensor(randn(vec![
+                    num_kv_heads * head_dim,
+                    hidden_size,
+                ])?),
+                attn_v: LinearWeight::from_tensor(randn(vec![
+                    num_kv_heads * head_dim,
+                    hidden_size,
+                ])?),
+                attn_output: LinearWeight::from_tensor(randn(vec![
+                    hidden_size,
+                    num_attention_heads * head_dim,
+                ])?),
                 attn_norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
-                ffn_gate: randn(vec![intermediate_size, hidden_size])?,
-                ffn_up: randn(vec![intermediate_size, hidden_size])?,
-                ffn_down: randn(vec![hidden_size, intermediate_size])?,
+                ffn_gate: LinearWeight::from_tensor(randn(vec![intermediate_size, hidden_size])?),
+                ffn_up: LinearWeight::from_tensor(randn(vec![intermediate_size, hidden_size])?),
+                ffn_down: LinearWeight::from_tensor(randn(vec![hidden_size, intermediate_size])?),
                 ffn_norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
             };
             layers.push(layer);
         }
 
         let weights = ModelWeights {
-            embed_tokens: mock_randn_tensor(&mut rng, &dev, vec![vocab_size, hidden_size])?,
+            embed_tokens: LinearWeight::from_tensor(mock_randn_tensor(
+                &mut rng,
+                &dev,
+                vec![vocab_size, hidden_size],
+            )?),
             layers,
             norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
-            lm_head: mock_randn_tensor(&mut rng, &dev, vec![vocab_size, hidden_size])?,
+            lm_head: LinearWeight::from_tensor(mock_randn_tensor(
+                &mut rng,
+                &dev,
+                vec![vocab_size, hidden_size],
+            )?),
+            // Synthetic weights are generated directly in rotate-half order.
+            qk_perm: None,
         };
 
         let config = ModelConfig {
@@ -207,24 +261,46 @@ impl Model {
         let mut layers = Vec::new();
         for _ in 0..num_layers {
             let layer = LayerWeights {
-                attn_q: randn(vec![num_attention_heads * head_dim, hidden_size])?,
-                attn_k: randn(vec![num_kv_heads * head_dim, hidden_size])?,
-                attn_v: randn(vec![num_kv_heads * head_dim, hidden_size])?,
-                attn_output: randn(vec![hidden_size, num_attention_heads * head_dim])?,
+                attn_q: LinearWeight::from_tensor(randn(vec![
+                    num_attention_heads * head_dim,
+                    hidden_size,
+                ])?),
+                attn_k: LinearWeight::from_tensor(randn(vec![
+                    num_kv_heads * head_dim,
+                    hidden_size,
+                ])?),
+                attn_v: LinearWeight::from_tensor(randn(vec![
+                    num_kv_heads * head_dim,
+                    hidden_size,
+                ])?),
+                attn_output: LinearWeight::from_tensor(randn(vec![
+                    hidden_size,
+                    num_attention_heads * head_dim,
+                ])?),
                 attn_norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
-                ffn_gate: randn(vec![intermediate_size, hidden_size])?,
-                ffn_up: randn(vec![intermediate_size, hidden_size])?,
-                ffn_down: randn(vec![hidden_size, intermediate_size])?,
+                ffn_gate: LinearWeight::from_tensor(randn(vec![intermediate_size, hidden_size])?),
+                ffn_up: LinearWeight::from_tensor(randn(vec![intermediate_size, hidden_size])?),
+                ffn_down: LinearWeight::from_tensor(randn(vec![hidden_size, intermediate_size])?),
                 ffn_norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
             };
             layers.push(layer);
         }
 
         let weights = ModelWeights {
-            embed_tokens: mock_randn_tensor(&mut rng, &dev, vec![vocab_size, hidden_size])?,
+            embed_tokens: LinearWeight::from_tensor(mock_randn_tensor(
+                &mut rng,
+                &dev,
+                vec![vocab_size, hidden_size],
+            )?),
             layers,
             norm: Tensor::ones((hidden_size,), DType::F32, &dev)?,
-            lm_head: mock_randn_tensor(&mut rng, &dev, vec![vocab_size, hidden_size])?,
+            lm_head: LinearWeight::from_tensor(mock_randn_tensor(
+                &mut rng,
+                &dev,
+                vec![vocab_size, hidden_size],
+            )?),
+            // Synthetic weights are generated directly in rotate-half order.
+            qk_perm: None,
         };
 
         let mut cfg = config.clone();
@@ -321,7 +397,7 @@ impl Model {
 
         // Embedding lookup
         let token_ids = Tensor::from_slice(tokens, (seq_len,), &self.device)?;
-        let mut hidden = self.weights.embed_tokens.index_select(&token_ids, 0)?;
+        let mut hidden = self.embed(&token_ids)?;
 
         let head_dim = self.config.head_dim();
         let num_q_heads = self.config.num_attention_heads;
@@ -354,9 +430,7 @@ impl Model {
             let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
 
             // Linear Q, K, V: [seq_len, hidden_size] @ W^T -> [seq_len, out_features]
-            let q = self.matmul(&normed, &layer.attn_q.t()?)?;
-            let k = self.matmul(&normed, &layer.attn_k.t()?)?;
-            let v = self.matmul(&normed, &layer.attn_v.t()?)?;
+            let (q, k, v) = self.project_qkv(layer, &normed)?;
 
             let q = q.reshape((seq_len, num_q_heads, head_dim))?;
             let k = k.reshape((seq_len, num_kv_heads, head_dim))?;
@@ -370,7 +444,7 @@ impl Model {
             let attn_out = attn_out
                 .transpose(0, 1)?
                 .reshape((seq_len, num_q_heads * head_dim))?;
-            let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
+            let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
 
             // Residual connection
             hidden = (hidden + attn_proj)?;
@@ -387,7 +461,7 @@ impl Model {
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
 
         // LM Head projection for all tokens: [seq_len, hidden_size] @ W_head^T -> [seq_len, vocab_size]
-        let logits = self.matmul(&final_normed, &self.weights.lm_head.t()?)?;
+        let logits = self.linear(&self.weights.lm_head, &final_normed)?;
         Ok(logits)
     }
 
@@ -414,7 +488,7 @@ impl Model {
         }
 
         let token_ids = Tensor::from_slice(tokens, (chunk_len,), &self.device)?;
-        let mut hidden = self.weights.embed_tokens.index_select(&token_ids, 0)?;
+        let mut hidden = self.embed(&token_ids)?;
 
         let head_dim = self.config.head_dim();
         let num_q_heads = self.config.num_attention_heads;
@@ -451,9 +525,7 @@ impl Model {
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
 
-            let q = self.matmul(&normed, &layer.attn_q.t()?)?;
-            let k = self.matmul(&normed, &layer.attn_k.t()?)?;
-            let v = self.matmul(&normed, &layer.attn_v.t()?)?;
+            let (q, k, v) = self.project_qkv(layer, &normed)?;
 
             let q = q.reshape((chunk_len, num_q_heads, head_dim))?;
             let k = k.reshape((chunk_len, num_kv_heads, head_dim))?;
@@ -487,7 +559,7 @@ impl Model {
             let attn_out = attn_out
                 .transpose(0, 1)?
                 .reshape((chunk_len, num_q_heads * head_dim))?;
-            let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
+            let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
 
             hidden = (hidden + attn_proj)?;
 
@@ -498,7 +570,7 @@ impl Model {
 
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
         let last_hidden = final_normed.i(chunk_len - 1)?.unsqueeze(0)?;
-        let logits = self.matmul(&last_hidden, &self.weights.lm_head.t()?)?;
+        let logits = self.linear(&self.weights.lm_head, &last_hidden)?;
         Ok(logits)
     }
 
@@ -526,7 +598,7 @@ impl Model {
 
         // Embedding lookup for single token: [1, hidden_size]
         let token_ids = Tensor::from_slice(&[token], (1,), &self.device)?;
-        let mut hidden = self.weights.embed_tokens.index_select(&token_ids, 0)?;
+        let mut hidden = self.embed(&token_ids)?;
 
         let block_size = kv_storage.block_size;
         let block_idx = pos / block_size;
@@ -551,9 +623,7 @@ impl Model {
             let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
 
             // Linear Q, K, V for single token
-            let q = self.matmul(&normed, &layer.attn_q.t()?)?;
-            let k = self.matmul(&normed, &layer.attn_k.t()?)?;
-            let v = self.matmul(&normed, &layer.attn_v.t()?)?;
+            let (q, k, v) = self.project_qkv(layer, &normed)?;
 
             let q = q.reshape((1, num_q_heads, head_dim))?;
             let k = k.reshape((1, num_kv_heads, head_dim))?;
@@ -584,7 +654,7 @@ impl Model {
             let attn_out = attn_out
                 .transpose(0, 1)?
                 .reshape((1, num_q_heads * head_dim))?;
-            let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
+            let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
 
             // Residual connection
             hidden = (hidden + attn_proj)?;
@@ -601,7 +671,7 @@ impl Model {
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
 
         // LM Head projection: [1, vocab_size]
-        let logits = self.matmul(&final_normed, &self.weights.lm_head.t()?)?;
+        let logits = self.linear(&self.weights.lm_head, &final_normed)?;
 
         if let Some(ws) = workspace
             && let Ok(flat) = logits.flatten_all()
@@ -677,7 +747,7 @@ impl Model {
         let total_tokens = start_pos + seq_len;
 
         let token_ids = Tensor::from_slice(tokens, (seq_len,), &self.device)?;
-        let mut hidden = self.weights.embed_tokens.index_select(&token_ids, 0)?;
+        let mut hidden = self.embed(&token_ids)?;
 
         let causal_mask = if seq_len > 1 || total_tokens > 1 {
             let mut mask_data = vec![0.0f32; seq_len * total_tokens];
@@ -701,9 +771,7 @@ impl Model {
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
 
-            let q = self.matmul(&normed, &layer.attn_q.t()?)?;
-            let k = self.matmul(&normed, &layer.attn_k.t()?)?;
-            let v = self.matmul(&normed, &layer.attn_v.t()?)?;
+            let (q, k, v) = self.project_qkv(layer, &normed)?;
 
             let q = q
                 .reshape((seq_len, num_q_heads, head_dim))?
@@ -754,7 +822,7 @@ impl Model {
             let attn_out = attn_out
                 .transpose(0, 1)?
                 .reshape((seq_len, num_q_heads * head_dim))?;
-            let attn_proj = self.matmul(&attn_out, &layer.attn_output.t()?)?;
+            let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
             hidden = (hidden + attn_proj)?;
 
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
@@ -763,7 +831,7 @@ impl Model {
         }
 
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
-        let logits = self.matmul(&final_normed, &self.weights.lm_head.t()?)?;
+        let logits = self.linear(&self.weights.lm_head, &final_normed)?;
         Ok(logits)
     }
 }
