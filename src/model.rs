@@ -10,7 +10,7 @@ pub struct Model {
     pub weights: ModelWeights,
     pub config: ModelConfig,
     pub device: Device,
-    pub backend: String,
+    pub backend: crate::hardware::Backend,
     pub hybrid_pipeline: Option<crate::ane::HybridExecutionPipeline>,
 }
 
@@ -52,7 +52,7 @@ impl Model {
             weights,
             config,
             device,
-            backend: crate::hardware::DEFAULT_BACKEND.to_string(),
+            backend: crate::hardware::Backend::default(),
             hybrid_pipeline: None,
         }
     }
@@ -69,12 +69,33 @@ impl Model {
         Ok(Self::new(weights, config, device))
     }
 
-    pub fn backend(&self) -> &str {
-        &self.backend
+    pub fn backend(&self) -> crate::hardware::Backend {
+        self.backend
     }
 
-    pub fn set_backend(&mut self, backend: impl Into<String>) {
-        self.backend = backend.into();
+    pub fn set_backend(&mut self, backend: crate::hardware::Backend) {
+        self.backend = backend;
+    }
+
+    /// Moves every weight tensor plus the device tag onto `device`.
+    /// Needed for the honest Metal path: GGUF loads on CPU, then moves whole.
+    pub fn to_device(&mut self, device: &Device) -> Result<(), EngineError> {
+        for layer in &mut self.weights.layers {
+            layer.attn_q = layer.attn_q.to_device(device)?;
+            layer.attn_k = layer.attn_k.to_device(device)?;
+            layer.attn_v = layer.attn_v.to_device(device)?;
+            layer.attn_output = layer.attn_output.to_device(device)?;
+            layer.attn_norm = layer.attn_norm.to_device(device)?;
+            layer.ffn_gate = layer.ffn_gate.to_device(device)?;
+            layer.ffn_up = layer.ffn_up.to_device(device)?;
+            layer.ffn_down = layer.ffn_down.to_device(device)?;
+            layer.ffn_norm = layer.ffn_norm.to_device(device)?;
+        }
+        self.weights.embed_tokens = self.weights.embed_tokens.to_device(device)?;
+        self.weights.norm = self.weights.norm.to_device(device)?;
+        self.weights.lm_head = self.weights.lm_head.to_device(device)?;
+        self.device = device.clone();
+        Ok(())
     }
 
     pub fn set_hybrid_pipeline(&mut self, pipeline: crate::ane::HybridExecutionPipeline) {
@@ -104,8 +125,14 @@ impl Model {
     }
 
     pub fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor, EngineError> {
-        if self.backend.eq_ignore_ascii_case("amx") {
+        if matches!(self.backend, crate::hardware::Backend::Amx) {
             crate::accelerate::amx::amx_matmul(a, b)
+        } else if matches!(self.backend, crate::hardware::Backend::Metal) {
+            // Candle's MLX GEMM only accepts contiguous (or simply
+            // transposed) operands; double-transposed views like
+            // `transpose(0,1).t()` from the GQA path are rejected, so
+            // normalize first. No-op copy when already contiguous.
+            Ok(a.contiguous()?.matmul(&b.contiguous()?)?)
         } else {
             Ok(a.matmul(b)?)
         }
@@ -279,7 +306,7 @@ impl Model {
             scores = masked.reshape((n_kv_heads, group_size * q_len, ctx_len))?;
         }
 
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores.contiguous()?)?;
         let attn_out = self.matmul(&probs, v)?; // [n_kv_heads, group_size * q_len, head_dim]
 
         // Reshape back to [n_heads, q_len, head_dim]

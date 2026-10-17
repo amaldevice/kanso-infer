@@ -55,7 +55,7 @@ pub struct CpuFallbackAneAdapter {
     pub ffn_gate: Tensor,
     pub ffn_up: Tensor,
     pub ffn_down: Tensor,
-    pub backend: String,
+    pub backend: crate::hardware::Backend,
     pub device: Device,
 }
 
@@ -68,7 +68,7 @@ impl CpuFallbackAneAdapter {
         ffn_gate: Tensor,
         ffn_up: Tensor,
         ffn_down: Tensor,
-        backend: impl Into<String>,
+        backend: crate::hardware::Backend,
         device: Device,
     ) -> Self {
         Self {
@@ -78,7 +78,7 @@ impl CpuFallbackAneAdapter {
             ffn_gate,
             ffn_up,
             ffn_down,
-            backend: backend.into(),
+            backend,
             device,
         }
     }
@@ -88,7 +88,7 @@ impl CpuFallbackAneAdapter {
         weights: &LayerWeights,
         hidden_size: usize,
         intermediate_size: usize,
-        backend: impl Into<String>,
+        backend: crate::hardware::Backend,
     ) -> Self {
         Self::new(
             layer_index,
@@ -102,8 +102,8 @@ impl CpuFallbackAneAdapter {
         )
     }
 
-    pub fn set_backend(&mut self, backend: impl Into<String>) {
-        self.backend = backend.into();
+    pub fn set_backend(&mut self, backend: crate::hardware::Backend) {
+        self.backend = backend;
     }
 }
 
@@ -123,7 +123,7 @@ impl AneLayerAdapter for CpuFallbackAneAdapter {
         let seq_len = input.len() / self.hidden_size;
         let x = Tensor::from_slice(input, (seq_len, self.hidden_size), &self.device)?;
 
-        let is_amx = self.backend.eq_ignore_ascii_case("amx")
+        let is_amx = matches!(self.backend, crate::hardware::Backend::Amx)
             && crate::accelerate::amx::has_accelerate_support();
 
         let (gate, up) = if is_amx {
@@ -154,7 +154,7 @@ impl AneLayerAdapter for CpuFallbackAneAdapter {
     }
 
     fn backend_name(&self) -> &str {
-        if self.backend.eq_ignore_ascii_case("amx") {
+        if matches!(self.backend, crate::hardware::Backend::Amx) {
             "amx_cpu"
         } else {
             "cpu"
@@ -189,7 +189,7 @@ impl CoreMlAneAdapter {
         hidden_size: usize,
         intermediate_size: usize,
         weights: &LayerWeights,
-        backend_fallback: impl Into<String>,
+        backend_fallback: crate::hardware::Backend,
     ) -> Self {
         let ane_supported = has_ane_support();
         let fallback = CpuFallbackAneAdapter::from_layer_weights(
@@ -263,18 +263,18 @@ pub struct HybridSyncStats {
 /// Hybrid scheduling pipeline executing attention on Metal/AMX while delegating
 /// MLP feedforward computation to the Core ML / ANE adapter.
 pub struct HybridExecutionPipeline {
-    pub attention_backend: String,
+    pub attention_backend: crate::hardware::Backend,
     pub adapters: Vec<Box<dyn AneLayerAdapter>>,
     stats: Mutex<HybridSyncStats>,
 }
 
 impl HybridExecutionPipeline {
     pub fn new(
-        attention_backend: impl Into<String>,
+        attention_backend: crate::hardware::Backend,
         adapters: Vec<Box<dyn AneLayerAdapter>>,
     ) -> Self {
         Self {
-            attention_backend: attention_backend.into(),
+            attention_backend,
             adapters,
             stats: Mutex::new(HybridSyncStats::default()),
         }
@@ -282,7 +282,7 @@ impl HybridExecutionPipeline {
 
     /// Construct a hybrid execution pipeline from an existing Model.
     pub fn from_model(model: &crate::model::Model) -> Self {
-        let attention_backend = model.backend().to_string();
+        let attention_backend = model.backend();
         let hidden_size = model.config.hidden_size;
         let intermediate_size = model.config.intermediate_size;
 
@@ -294,7 +294,7 @@ impl HybridExecutionPipeline {
                 hidden_size,
                 intermediate_size,
                 layer,
-                &attention_backend,
+                attention_backend,
             );
             adapters.push(Box::new(adapter));
         }

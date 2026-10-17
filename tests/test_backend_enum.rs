@@ -31,10 +31,7 @@ fn test_metal_device_is_honest_gpu() {
         "metal backend must resolve to a GPU device, got {device:?}"
     );
     assert_eq!(kanso_infer::hardware::device_label(&device), "Metal GPU");
-    assert_eq!(
-        kanso_infer::hardware::device_label(&Device::Cpu),
-        "CPU"
-    );
+    assert_eq!(kanso_infer::hardware::device_label(&Device::Cpu), "CPU");
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -81,8 +78,7 @@ fn test_metal_cpu_parity_mock() {
 #[cfg(target_os = "macos")]
 #[test]
 fn test_metal_cpu_parity_real_model() {
-    let Ok(path) =
-        kanso_infer::weights::resolve_model_path("smollm2-360m-instruct-q8_0.gguf")
+    let Ok(path) = kanso_infer::weights::resolve_model_path("smollm2-360m-instruct-q8_0.gguf")
     else {
         return;
     };
