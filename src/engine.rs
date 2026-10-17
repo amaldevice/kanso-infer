@@ -1,3 +1,5 @@
+use candle_core::IndexOp;
+
 use crate::error::EngineError;
 use crate::kv_cache::{BlockPool, BlockTable, KvStorage, PrefixCache};
 use crate::model::Model;
@@ -79,7 +81,6 @@ pub struct Engine {
     pub current_step: usize,
     pub next_request_id: u64,
     pub kv_storage: KvStorage,
-    pub workspace: ScratchpadWorkspace,
     pub prefix_matched_tokens: usize,
     pub total_prompt_tokens_admitted: usize,
     pub prefix_cache_hits: usize,
@@ -108,13 +109,6 @@ impl Engine {
         )
         .expect("failed to initialize kv storage");
 
-        let workspace = ScratchpadWorkspace::new(
-            max_running,
-            model.config.hidden_size,
-            model.config.intermediate_size,
-            model.config.vocab_size,
-        );
-
         Self {
             model,
             block_pool: BlockPool::new(total_blocks),
@@ -126,7 +120,6 @@ impl Engine {
             current_step: 0,
             next_request_id: 1,
             kv_storage,
-            workspace,
             prefix_matched_tokens: 0,
             total_prompt_tokens_admitted: 0,
             prefix_cache_hits: 0,
@@ -221,7 +214,17 @@ impl Engine {
         let mut finished_indices = Vec::new();
         let mut remaining_budget = self.token_budget;
 
+        /// Work a sequence contributes to this step: its decode token, or the
+        /// prefill chunk that carries it closer to being decodable.
+        struct Planned {
+            idx: usize,
+            start_pos: usize,
+            tokens: Vec<u32>,
+            is_prefill: bool,
+        }
+
         // 1. Priority: Active decode requests execute without stalling
+        let mut planned: Vec<Planned> = Vec::new();
         for idx in 0..self.sequences.len() {
             let seq = &self.sequences[idx];
             if seq.status != SequenceStatus::Running
@@ -242,39 +245,14 @@ impl Engine {
                 continue;
             }
 
-            let seq = &mut self.sequences[idx];
+            let seq = &self.sequences[idx];
             let last_token = *seq.generated_tokens.last().unwrap();
             let pos = seq.prompt_tokens.len() + seq.generated_tokens.len() - 1;
-            self.workspace.clear();
-            let logits = self.model.forward_decode_step_with_workspace(
-                last_token,
-                pos,
-                &seq.block_table,
-                &mut self.kv_storage,
-                Some(&mut self.workspace),
-            )?;
-
-            let next_token = sample_token(
-                &logits,
-                seq.sampling.temperature,
-                seq.sampling.top_p,
-                seq.sampling.seed,
-            )?;
-            seq.generated_tokens.push(next_token);
-            seq.block_table.advance_tokens(1);
-
-            // #56: EOS (any configured stop id) retires the sequence exactly like
-            // max_tokens, so its blocks return to the pool in this same step.
-            let is_finished = seq.is_done_after(next_token);
-            if is_finished {
-                seq.status = SequenceStatus::Finished;
-                finished_indices.push(idx);
-            }
-
-            outputs.push(StepOutput {
-                request_id: seq.id,
-                token_id: next_token,
-                is_finished,
+            planned.push(Planned {
+                idx,
+                start_pos: pos,
+                tokens: vec![last_token],
+                is_prefill: false,
             });
 
             remaining_budget = remaining_budget.saturating_sub(1);
@@ -366,50 +344,113 @@ impl Engine {
             }
 
             let seq = &self.sequences[idx];
-            let chunk_tokens = &seq.prompt_tokens[start_pos..end_pos];
-            let logits = self.model.forward_prefill(
-                chunk_tokens,
+            planned.push(Planned {
+                idx,
                 start_pos,
-                &seq.block_table,
-                &mut self.kv_storage,
-            )?;
-
-            let seq = &mut self.sequences[idx];
-            seq.prefilled_tokens = end_pos;
-            seq.block_table.set_num_tokens(end_pos);
+                tokens: seq.prompt_tokens[start_pos..end_pos].to_vec(),
+                is_prefill: true,
+            });
             remaining_budget = remaining_budget.saturating_sub(chunk_len);
+        }
 
-            // If prefill completed, sample the first generated token
-            if seq.prefilled_tokens == seq.prompt_tokens.len() {
-                let next_token = sample_token(
-                    &logits,
-                    seq.sampling.temperature,
-                    seq.sampling.top_p,
-                    seq.sampling.seed,
-                )?;
-                seq.generated_tokens.push(next_token);
-                seq.block_table.advance_tokens(1);
+        // A sequence the block allocator preempted while planning a later one has no
+        // usable blocks any more — drop it rather than forward into freed memory. It
+        // keeps its position in the queue and is replanned next step.
+        planned.retain(|p| self.sequences[p.idx].status == SequenceStatus::Running);
 
-                // #56: EOS retires the sequence in this same step.
-                let is_finished = seq.is_done_after(next_token);
-                if is_finished {
-                    seq.status = SequenceStatus::Finished;
-                    finished_indices.push(idx);
+        // 4. One batched forward for everything planned above: decode tokens and
+        // prefill chunks ride the same GEMM sweep, so the weights are read once.
+        let logits = if planned.is_empty() {
+            None
+        } else {
+            let mut tokens = Vec::new();
+            let mut positions = Vec::new();
+            let mut slot_mapping = Vec::new();
+            let mut block_tables = Vec::with_capacity(planned.len());
+            let mut context_lens = Vec::with_capacity(planned.len());
+            let mut query_lens = Vec::with_capacity(planned.len());
+            for p in &planned {
+                let table = self.sequences[p.idx].block_table.blocks();
+                for (i, &token) in p.tokens.iter().enumerate() {
+                    let pos = p.start_pos + i;
+                    let block_idx = pos / self.block_size;
+                    let block = *table.get(block_idx).ok_or_else(|| {
+                        EngineError::Model(format!(
+                            "Position {} requires block index {} but block table only has {} blocks",
+                            pos,
+                            block_idx,
+                            table.len()
+                        ))
+                    })?;
+                    tokens.push(token);
+                    positions.push(pos);
+                    slot_mapping.push(block * self.block_size + pos % self.block_size);
                 }
+                block_tables.push(table.to_vec());
+                context_lens.push(p.start_pos + p.tokens.len());
+                query_lens.push(p.tokens.len());
+            }
+            Some(self.model.forward_batch(
+                &tokens,
+                &positions,
+                &slot_mapping,
+                &mut self.kv_storage,
+                &block_tables,
+                &context_lens,
+                &query_lens,
+            )?)
+        };
 
-                outputs.push(StepOutput {
-                    request_id: seq.id,
-                    token_id: next_token,
-                    is_finished,
-                });
+        // 5. Commit stage: sample each planned sequence's next token from its logits row
+        // and advance it — in plan order, so decode outputs precede prefill completions.
+        for (row, p) in planned.iter().enumerate() {
+            let seq = &mut self.sequences[p.idx];
 
-                // Insert prompt prefix into prefix cache
+            if p.is_prefill {
+                let end_pos = p.start_pos + p.tokens.len();
+                seq.prefilled_tokens = end_pos;
+                seq.block_table.set_num_tokens(end_pos);
+                // A partial chunk produces no token; only a completed prompt samples.
+                if end_pos != seq.prompt_tokens.len() {
+                    continue;
+                }
+            }
+
+            let seq_logits = logits.as_ref().unwrap().i(row)?.unsqueeze(0)?;
+            let next_token = sample_token(
+                &seq_logits,
+                seq.sampling.temperature,
+                seq.sampling.top_p,
+                seq.sampling.seed,
+            )?;
+            seq.generated_tokens.push(next_token);
+            seq.block_table.advance_tokens(1);
+
+            // #56: EOS (any configured stop id) retires the sequence exactly like
+            // max_tokens, so its blocks return to the pool in this same step.
+            let is_finished = seq.is_done_after(next_token);
+            if is_finished {
+                seq.status = SequenceStatus::Finished;
+                finished_indices.push(p.idx);
+            }
+
+            outputs.push(StepOutput {
+                request_id: seq.id,
+                token_id: next_token,
+                is_finished,
+            });
+        }
+
+        // Insert completed prompts into the prefix cache.
+        for p in planned.iter().filter(|p| p.is_prefill) {
+            let seq = &self.sequences[p.idx];
+            if seq.prefilled_tokens == seq.prompt_tokens.len() {
                 self.prefix_cache
                     .insert_prefix(&seq.prompt_tokens, seq.block_table.blocks());
             }
         }
 
-        // 4. Retirement stage: Free KV blocks for finished sequences
+        // 6. Retirement stage: Free KV blocks for finished sequences
         for idx in finished_indices {
             let seq = &mut self.sequences[idx];
             for &blk in seq.block_table.blocks() {
