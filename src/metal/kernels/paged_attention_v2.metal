@@ -1,9 +1,21 @@
 #include <metal_stdlib>
 using namespace metal;
 
-constant uint TILE_SIZE = 16;
-constant uint MAX_HEAD_DIM = 128;
-constant uint MAX_ITEMS_PER_THREAD = 4; // 4 * 32 = 128
+// Ticket #51: PagedAttention v2 = split the context across partitions (kernel 1)
+// and merge the partitions (kernel 2), the layout vLLM uses. One SIMD group
+// (32 lanes) owns one (partition, seq, kv_head) triple: lanes split the QK dot
+// product of a head, the online softmax keeps per-head (m, d) in registers, and
+// every query head sharing a KV head is served by the same group so the KV head
+// is read once per token instead of once per query head.
+//
+// MAX_ITEMS and MAX_GROUP are mirrored by MAX_HEAD_DIM / MAX_KV_GROUP_SIZE in
+// src/metal/paged_attention.rs, which rejects anything that does not fit.
+constant uint SIMD_WIDTH = 32;
+// One lane owns q[lane + i*SIMD_WIDTH] -> head_dim up to SIMD_WIDTH * MAX_ITEMS.
+constant uint MAX_ITEMS = 8;
+// Query heads per KV head (GQA group) unrolled into registers per SIMD group.
+constant uint MAX_GROUP = 8;
+constant float NEG_INF = -1e30f;
 
 struct PagedAttentionParams {
     uint num_seqs;
@@ -15,18 +27,139 @@ struct PagedAttentionParams {
     float scale;
 };
 
+// Stage 1: online-softmax attention over one context partition of one (seq, kv_head).
+// Emits the unnormalized accumulator plus the (m, d) statistics the merge kernel needs.
 kernel void paged_attention_v2_kernel(
-    device const float*                q            [[buffer(0)]],
-    device const float*                k_cache      [[buffer(1)]],
-    device const float*                v_cache      [[buffer(2)]],
-    device const uint*                 block_tables [[buffer(3)]],
-    device const uint*                 context_lens [[buffer(4)]],
-    device float*                      out          [[buffer(5)]],
-    constant PagedAttentionParams&     params       [[buffer(6)]],
-    uint2                              tg_pos       [[threadgroup_position_in_grid]],
-    uint2                              t_pos        [[thread_position_in_threadgroup]]
+    device const float*            q             [[buffer(0)]],
+    device const float*            k_cache       [[buffer(1)]],
+    device const float*            v_cache       [[buffer(2)]],
+    device const uint*             block_tables  [[buffer(3)]],
+    device const uint*             context_lens  [[buffer(4)]],
+    device float*                  partial_out   [[buffer(5)]],
+    device float2*                 partial_stats [[buffer(6)]],
+    constant PagedAttentionParams& params        [[buffer(7)]],
+    constant uint&                 num_partitions [[buffer(8)]],
+    constant uint&                 partition_size [[buffer(9)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]], // (partition, seq, kv_head)
+    uint lane [[thread_index_in_simdgroup]]
 ) {
-    uint tid = t_pos.x;
+    uint part_idx = tg_pos.x;
+    uint seq_idx = tg_pos.y;
+    uint kv_head = tg_pos.z;
+
+    if (seq_idx >= params.num_seqs || kv_head >= params.num_kv_heads) {
+        return;
+    }
+
+    uint head_dim = params.head_dim;
+    uint group_size = params.num_heads / params.num_kv_heads;
+
+    float q_lane[MAX_GROUP][MAX_ITEMS];
+    float acc[MAX_GROUP][MAX_ITEMS];
+    float m_g[MAX_GROUP];
+    float d_g[MAX_GROUP];
+
+    for (uint g = 0; g < MAX_GROUP; g++) {
+        m_g[g] = NEG_INF;
+        d_g[g] = 0.0f;
+        for (uint i = 0; i < MAX_ITEMS; i++) {
+            q_lane[g][i] = 0.0f;
+            acc[g][i] = 0.0f;
+        }
+    }
+
+    // This lane's slice of every query head in the group, loaded once.
+    for (uint g = 0; g < MAX_GROUP; g++) {
+        if (g < group_size) {
+            uint h = kv_head * group_size + g;
+            device const float* q_head = q + (seq_idx * params.num_heads + h) * head_dim;
+            for (uint i = 0; i < MAX_ITEMS; i++) {
+                uint d = lane + i * SIMD_WIDTH;
+                if (d < head_dim) {
+                    q_lane[g][i] = q_head[d];
+                }
+            }
+        }
+    }
+
+    // Token window of this partition, clamped to what the block table can address.
+    uint capacity = params.max_num_blocks_per_seq * params.block_size;
+    uint limit = min(context_lens[seq_idx], capacity);
+    uint t_start = min(part_idx * partition_size, limit);
+    uint t_end = min(t_start + partition_size, limit);
+
+    uint kv_head_dim = params.num_kv_heads * head_dim;
+    uint block_stride = params.block_size * kv_head_dim;
+    uint head_offset = kv_head * head_dim;
+    device const uint* seq_tables = block_tables + seq_idx * params.max_num_blocks_per_seq;
+
+    for (uint t = t_start; t < t_end; t++) {
+        uint phys = seq_tables[t / params.block_size];
+        uint kv_base = phys * block_stride + (t % params.block_size) * kv_head_dim + head_offset;
+
+        // One K/V head per token, shared by every query head in the group.
+        float k_lane[MAX_ITEMS];
+        float v_lane[MAX_ITEMS];
+        for (uint i = 0; i < MAX_ITEMS; i++) {
+            uint d = lane + i * SIMD_WIDTH;
+            bool in_range = d < head_dim;
+            k_lane[i] = in_range ? k_cache[kv_base + d] : 0.0f;
+            v_lane[i] = in_range ? v_cache[kv_base + d] : 0.0f;
+        }
+
+        for (uint g = 0; g < MAX_GROUP; g++) {
+            if (g < group_size) {
+                float dot = 0.0f;
+                for (uint i = 0; i < MAX_ITEMS; i++) {
+                    dot += q_lane[g][i] * k_lane[i];
+                }
+                float score = simd_sum(dot) * params.scale;
+
+                // simd_sum broadcasts the score, so m/d are identical in every lane;
+                // only the accumulator stays per lane.
+                float m_new = max(m_g[g], score);
+                float alpha = exp(m_g[g] - m_new); // 0 for the first token of the group
+                float w = exp(score - m_new);
+                d_g[g] = d_g[g] * alpha + w;
+                for (uint i = 0; i < MAX_ITEMS; i++) {
+                    acc[g][i] = acc[g][i] * alpha + w * v_lane[i];
+                }
+                m_g[g] = m_new;
+            }
+        }
+    }
+
+    // Every (seq, head, partition) slot is written, including idle partitions,
+    // so the merge kernel never reads uninitialized memory.
+    for (uint g = 0; g < MAX_GROUP; g++) {
+        if (g < group_size) {
+            uint h = kv_head * group_size + g;
+            uint slot = (seq_idx * params.num_heads + h) * num_partitions + part_idx;
+            device float* dst = partial_out + slot * head_dim;
+            for (uint i = 0; i < MAX_ITEMS; i++) {
+                uint d = lane + i * SIMD_WIDTH;
+                if (d < head_dim) {
+                    dst[d] = acc[g][i];
+                }
+            }
+            if (lane == 0) {
+                partial_stats[slot] = float2(m_g[g], d_g[g]);
+            }
+        }
+    }
+}
+
+// Stage 2: merge partitions for one (seq, head). out = sum_p acc_p * exp(m_p - M)
+// over sum_p d_p * exp(m_p - M), with M the max over partitions.
+kernel void paged_attention_v2_reduce_kernel(
+    device const float*            partial_out   [[buffer(0)]],
+    device const float2*           partial_stats [[buffer(1)]],
+    device float*                  out           [[buffer(2)]],
+    constant PagedAttentionParams& params        [[buffer(3)]],
+    constant uint&                 num_partitions [[buffer(4)]],
+    uint2 tg_pos [[threadgroup_position_in_grid]], // (head, seq)
+    uint lane [[thread_index_in_simdgroup]]
+) {
     uint head_idx = tg_pos.x;
     uint seq_idx = tg_pos.y;
 
@@ -34,121 +167,39 @@ kernel void paged_attention_v2_kernel(
         return;
     }
 
-    uint context_len = context_lens[seq_idx];
-    uint kv_group_size = params.num_heads / params.num_kv_heads;
-    uint kv_head_idx = head_idx / kv_group_size;
+    uint head_dim = params.head_dim;
+    uint base = (seq_idx * params.num_heads + head_idx) * num_partitions;
 
-    // Threadgroup shared memory for K and V tiles, online softmax statistics, and exponential weights
-    threadgroup float s_k[TILE_SIZE * MAX_HEAD_DIM];
-    threadgroup float s_v[TILE_SIZE * MAX_HEAD_DIM];
-    threadgroup float s_scores[TILE_SIZE];
-    threadgroup float s_exp[TILE_SIZE]; // exp(s - m)
-    threadgroup float m_prev;
-    threadgroup float d_prev;
-    threadgroup float alpha;
-
-    // Store Q in local registers / variables
-    float q_local[MAX_HEAD_DIM];
-    uint q_offset = (seq_idx * params.num_heads + head_idx) * params.head_dim;
-    for (uint d = 0; d < params.head_dim && d < MAX_HEAD_DIM; d++) {
-        q_local[d] = q[q_offset + d];
+    float m_max = NEG_INF;
+    for (uint p = 0; p < num_partitions; p++) {
+        m_max = max(m_max, partial_stats[base + p].x);
     }
 
-    // Initialize online softmax state
-    if (tid == 0) {
-        m_prev = -1e30f;
-        d_prev = 0.0f;
-        alpha = 1.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Thread-local register accumulator for output dimensions
-    float acc[MAX_ITEMS_PER_THREAD];
-    for (uint i = 0; i < MAX_ITEMS_PER_THREAD; i++) {
+    float denom = 0.0f;
+    float acc[MAX_ITEMS];
+    for (uint i = 0; i < MAX_ITEMS; i++) {
         acc[i] = 0.0f;
     }
 
-    // Process historical context tokens in tiles of TILE_SIZE (32)
-    for (uint tile_start = 0; tile_start < context_len; tile_start += TILE_SIZE) {
-        uint tile_tokens = min(TILE_SIZE, context_len - tile_start);
-
-        // 1. Cooperatively gather K and V tiles into threadgroup memory
-        uint total_elements = tile_tokens * params.head_dim;
-        for (uint i = tid; i < total_elements; i += 32) {
-            uint t = i / params.head_dim;
-            uint d = i % params.head_dim;
-
-            uint token_idx = tile_start + t;
-            uint b_idx = token_idx / params.block_size;
-            uint b_offset = token_idx % params.block_size;
-            uint phys_block = block_tables[seq_idx * params.max_num_blocks_per_seq + b_idx];
-
-            uint kv_offset = phys_block * (params.block_size * params.num_kv_heads * params.head_dim)
-                           + b_offset * (params.num_kv_heads * params.head_dim)
-                           + kv_head_idx * params.head_dim
-                           + d;
-
-            s_k[t * params.head_dim + d] = k_cache[kv_offset];
-            s_v[t * params.head_dim + d] = v_cache[kv_offset];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // 2. Tiled matrix multiplication: S_t = (Q . K_t) * scale
-        if (tid < tile_tokens) {
-            float dot = 0.0f;
-            uint k_base = tid * params.head_dim;
-            for (uint d = 0; d < params.head_dim; d++) {
-                dot += q_local[d] * s_k[k_base + d];
-            }
-            s_scores[tid] = dot * params.scale;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // 2. Online softmax update (m_prev, d_prev, exp(s - m)) in threadgroup memory
-        if (tid == 0) {
-            float local_m = -1e30f;
-            for (uint t = 0; t < tile_tokens; t++) {
-                local_m = max(local_m, s_scores[t]);
-            }
-
-            float m_new = max(m_prev, local_m);
-            float a = (m_prev <= -1e29f) ? 0.0f : exp(m_prev - m_new);
-            alpha = a;
-
-            float local_d = 0.0f;
-            for (uint t = 0; t < tile_tokens; t++) {
-                float ex = exp(s_scores[t] - m_new);
-                s_exp[t] = ex; // exp(s - m)
-                local_d += ex;
-            }
-
-            d_prev = d_prev * a + local_d;
-            m_prev = m_new;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // 3. Accumulate V using threadgroup exp(s - m) weights directly into register accumulator
-        float cur_alpha = alpha;
-        for (uint item = 0; item < MAX_ITEMS_PER_THREAD; item++) {
-            uint d = tid + item * 32;
-            if (d < params.head_dim) {
-                float v_sum = 0.0f;
-                for (uint t = 0; t < tile_tokens; t++) {
-                    v_sum += s_exp[t] * s_v[t * params.head_dim + d];
-                }
-                acc[item] = acc[item] * cur_alpha + v_sum;
+    for (uint p = 0; p < num_partitions; p++) {
+        float2 stat = partial_stats[base + p];
+        float w = exp(stat.x - m_max); // 0 for idle partitions (m = -inf), d = 0 too
+        denom += w * stat.y;
+        device const float* src = partial_out + (base + p) * head_dim;
+        for (uint i = 0; i < MAX_ITEMS; i++) {
+            uint d = lane + i * SIMD_WIDTH;
+            if (d < head_dim) {
+                acc[i] += w * src[d];
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // 4. Normalize and write final context activations to global memory out buffer
-    float final_d = d_prev;
-    for (uint item = 0; item < MAX_ITEMS_PER_THREAD; item++) {
-        uint d = tid + item * 32;
-        if (d < params.head_dim) {
-            uint out_idx = (seq_idx * params.num_heads + head_idx) * params.head_dim + d;
-            out[out_idx] = (final_d > 0.0f) ? (acc[item] / final_d) : 0.0f;
+    float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;
+    device float* dst = out + (seq_idx * params.num_heads + head_idx) * head_dim;
+    for (uint i = 0; i < MAX_ITEMS; i++) {
+        uint d = lane + i * SIMD_WIDTH;
+        if (d < head_dim) {
+            dst[d] = acc[i] * inv_denom;
         }
     }
 }
