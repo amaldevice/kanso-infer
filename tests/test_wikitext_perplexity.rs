@@ -152,7 +152,7 @@ fn test_backend_perplexity_parity_cpu_amx_neon_metal() {
         let b = report
             .backends
             .iter()
-            .find(|x| x.backend.eq_ignore_ascii_case(name))
+            .find(|x| x.backend.to_string().eq_ignore_ascii_case(name))
             .unwrap_or_else(|| panic!("backend {} missing in report", name));
 
         assert!(

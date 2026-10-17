@@ -19,4 +19,4 @@ pub mod speculative;
 pub mod tokenizer;
 pub mod weights;
 
-pub use hardware::{Backend, DEFAULT_BACKEND, device_label};
+pub use hardware::{Backend, device_label};

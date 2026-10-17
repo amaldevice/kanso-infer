@@ -249,7 +249,7 @@ pub fn calculate_perplexity_quantized(
 /// Evaluation record for an individual backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendPpl {
-    pub backend: String,
+    pub backend: crate::hardware::Backend,
     pub perplexity: f64,
     pub delta_vs_fp32: f64,
 }
@@ -306,7 +306,7 @@ pub fn compare_backends_perplexity(
         let ppl = calculate_perplexity(&model, tokens, stride)?;
         let delta = ppl - baseline_ppl;
         backends.push(BackendPpl {
-            backend: b.to_string(),
+            backend: b,
             perplexity: ppl,
             delta_vs_fp32: delta,
         });
