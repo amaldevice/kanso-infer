@@ -64,7 +64,8 @@ impl Model {
 
     /// Batched forward passes issued so far (#45 acceptance hook).
     pub fn forward_calls(&self) -> u64 {
-        self.forward_calls.load(std::sync::atomic::Ordering::Relaxed)
+        self.forward_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Loads a model directly from a real GGUF file.
@@ -845,5 +846,265 @@ impl Model {
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
         let logits = self.linear(&self.weights.lm_head, &final_normed)?;
         Ok(logits)
+    }
+
+    /// One batched forward for a whole engine step (#45).
+    ///
+    /// `tokens`, `positions` and `slot_mapping` are the step's new tokens flattened
+    /// across every sequence — decode tokens and prefill-chunk tokens in any mix.
+    /// `slot_mapping[i] = physical_block * block_size + offset` is where token `i`'s
+    /// K/V is scattered in `kv_storage`; `block_tables[s]`/`context_lens[s]`/
+    /// `query_lens[s]` describe sequence `s`: its physical block list, the KV length
+    /// it attends once this batch is written, and how many of the flattened tokens
+    /// are its own (contiguous, ascending positions).
+    ///
+    /// Every linear runs once over the `[T, hidden]` stack, so the weights are read
+    /// once per step rather than once per sequence. Attention reads each sequence's
+    /// context straight from its physical blocks — in one padded pass when every
+    /// sequence contributes a single decode token, per sequence otherwise.
+    /// Returns logits `[num_seqs, vocab]`: one row per sequence's last new token.
+    #[allow(clippy::too_many_arguments)] // #45: the issue's flat-batch signature
+    pub fn forward_batch(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        slot_mapping: &[usize],
+        kv_storage: &mut KvStorage,
+        block_tables: &[Vec<usize>],
+        context_lens: &[usize],
+        query_lens: &[usize],
+    ) -> Result<Tensor, EngineError> {
+        self.forward_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let num_seqs = block_tables.len();
+        let total: usize = query_lens.iter().sum();
+        if num_seqs == 0 {
+            return Err(EngineError::Model("forward_batch: empty batch".to_string()));
+        }
+        if total == 0
+            || tokens.len() != total
+            || positions.len() != total
+            || slot_mapping.len() != total
+            || context_lens.len() != num_seqs
+            || query_lens.len() != num_seqs
+        {
+            return Err(EngineError::Model(format!(
+                "forward_batch: shape mismatch (tokens {}, positions {}, slots {}, seqs {}, \
+                 context_lens {}, query_lens {}, total tokens {})",
+                tokens.len(),
+                positions.len(),
+                slot_mapping.len(),
+                num_seqs,
+                context_lens.len(),
+                query_lens.len(),
+                total
+            )));
+        }
+
+        let head_dim = self.config.head_dim();
+        let num_q_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+
+        let token_ids = Tensor::from_slice(tokens, (total,), &self.device)?;
+        let mut hidden = self.embed(&token_ids)?;
+
+        let (cos, sin) = self.rope_cos_sin(positions)?;
+        let cos = cos.reshape((total, 1, head_dim / 2))?;
+        let sin = sin.reshape((total, 1, head_dim / 2))?;
+
+        // Each sequence's slice of the flattened batch, plus its offset causal mask
+        // (query i of sequence s sits at absolute position `positions[offset + i]`).
+        // Pure decode batches attend in one padded pass and need no mask at all.
+        let pure_decode = query_lens.iter().all(|&q_len| q_len == 1);
+        let mut offsets = Vec::with_capacity(num_seqs);
+        let mut masks: Vec<Option<Tensor>> = Vec::with_capacity(num_seqs);
+        let mut offset = 0usize;
+        for s in 0..num_seqs {
+            let q_len = query_lens[s];
+            let ctx_len = context_lens[s];
+            if q_len == 0 || ctx_len == 0 {
+                return Err(EngineError::Model(format!(
+                    "forward_batch: sequence {} has query_len {} / context_len {}",
+                    s, q_len, ctx_len
+                )));
+            }
+            let start_pos = positions[offset];
+            offsets.push(offset);
+            masks.push(if !pure_decode && (q_len > 1 || ctx_len > 1) {
+                let mut mask_data = vec![0.0f32; q_len * ctx_len];
+                for i in 0..q_len {
+                    let allowed_key_limit = start_pos + i;
+                    for j in 0..ctx_len {
+                        if j > allowed_key_limit {
+                            mask_data[i * ctx_len + j] = -1e9f32;
+                        }
+                    }
+                }
+                Some(Tensor::from_vec(
+                    mask_data,
+                    (1, 1, q_len, ctx_len),
+                    &self.device,
+                )?)
+            } else {
+                None
+            });
+            offset += q_len;
+        }
+
+        for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
+            let (q, k, v) = self.project_qkv(layer, &normed)?;
+
+            let q = q.reshape((total, num_q_heads, head_dim))?;
+            let k = k.reshape((total, num_kv_heads, head_dim))?;
+            let v = v.reshape((total, num_kv_heads, head_dim))?;
+
+            let q = self.rope_apply(&q, &cos, &sin)?;
+            let k = self.rope_apply(&k, &cos, &sin)?;
+
+            // Scatter this step's K/V into the physical blocks the scheduler mapped.
+            kv_storage.write_kv_slots(layer_idx, slot_mapping, &k, &v)?;
+
+            let attn_out = if pure_decode {
+                // One query token per sequence: the whole batch attends in a single
+                // padded GEMM instead of one attention pass per sequence (which is
+                // what per-op overhead makes expensive at small batch sizes).
+                // ponytail: each sequence is padded to the longest context in the batch,
+                // so ragged batches waste lanes; a varlen kernel drops the padding.
+                self.batch_decode_attention(&q, kv_storage, layer_idx, block_tables, context_lens)?
+            } else {
+                // Steps that mix prefill chunks with decode tokens attend per sequence
+                // instead (those steps are latency- not throughput-critical).
+                // ponytail: per-sequence attention costs one gather + a dozen ops per
+                // sequence; a varlen/paged kernel over the whole batch removes that.
+                let mut attn_rows = Vec::with_capacity(num_seqs);
+                for s in 0..num_seqs {
+                    let q_s = q.narrow(0, offsets[s], query_lens[s])?.transpose(0, 1)?;
+                    let (k_all, v_all) =
+                        kv_storage.gather_blocks(layer_idx, &block_tables[s], context_lens[s])?;
+                    let attn = self.gqa_attention(
+                        &q_s,
+                        &k_all.transpose(0, 1)?,
+                        &v_all.transpose(0, 1)?,
+                        masks[s].as_ref(),
+                    )?;
+                    attn_rows.push(
+                        attn.transpose(0, 1)?
+                            .reshape((query_lens[s], num_q_heads * head_dim))?,
+                    );
+                }
+                Tensor::cat(&attn_rows.iter().collect::<Vec<_>>(), 0)?
+            };
+            let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
+            hidden = (hidden + attn_proj)?;
+
+            let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
+            let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
+            hidden = (hidden + ffn_out)?;
+        }
+
+        let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
+
+        // Only each sequence's last new token needs logits (that is the token the
+        // caller samples; partial prefill chunks discard theirs).
+        let last_indices: Vec<u32> = (0..num_seqs)
+            .map(|s| (offsets[s] + query_lens[s] - 1) as u32)
+            .collect();
+        let last_indices = Tensor::from_vec(last_indices, (num_seqs,), &self.device)?;
+        let last_hidden = final_normed.index_select(&last_indices, 0)?;
+        self.linear(&self.weights.lm_head, &last_hidden)
+    }
+
+    /// Attention for a whole decode batch in a handful of tensor ops.
+    ///
+    /// Every sequence contributes exactly one query token (`q` is
+    /// `[num_seqs, num_q_heads, head_dim]`, row `s` = sequence `s`). Each sequence's
+    /// context is gathered from its own physical blocks and padded to the longest
+    /// context in the batch — padding lanes repeat a real block and are masked out
+    /// with `-1e9`, so they contribute exactly zero to the softmax.
+    /// Returns `[num_seqs, num_q_heads * head_dim]`.
+    fn batch_decode_attention(
+        &self,
+        q: &Tensor,
+        kv_storage: &KvStorage,
+        layer_idx: usize,
+        block_tables: &[Vec<usize>],
+        context_lens: &[usize],
+    ) -> Result<Tensor, EngineError> {
+        let head_dim = self.config.head_dim();
+        let num_q_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let group = num_q_heads / num_kv_heads;
+        let num_seqs = block_tables.len();
+        let block_size = kv_storage.block_size;
+
+        let max_blocks = context_lens
+            .iter()
+            .map(|&ctx| ctx.div_ceil(block_size))
+            .max()
+            .unwrap_or(1);
+        let padded_ctx = max_blocks * block_size;
+
+        let mut indices = Vec::with_capacity(num_seqs * max_blocks);
+        let mut mask_data = vec![0.0f32; num_seqs * num_kv_heads * padded_ctx];
+        for s in 0..num_seqs {
+            let blocks = &block_tables[s];
+            let needed = context_lens[s].div_ceil(block_size).max(1);
+            if blocks.len() < needed {
+                return Err(EngineError::Model(format!(
+                    "forward_batch: sequence {} attends {} tokens but its block table has \
+                     {} of the {} blocks needed",
+                    s,
+                    context_lens[s],
+                    blocks.len(),
+                    needed
+                )));
+            }
+            for b in 0..max_blocks {
+                indices.push(blocks[b.min(needed - 1)] as u32);
+            }
+            for g in 0..num_kv_heads {
+                let row = (s * num_kv_heads + g) * padded_ctx;
+                for j in context_lens[s]..padded_ctx {
+                    mask_data[row + j] = -1e9f32;
+                }
+            }
+        }
+
+        let indices = Tensor::from_vec(indices, (num_seqs * max_blocks,), &self.device)?;
+        // The two GEMMs below are 3D (batch = sequence x KV head), which keeps them on
+        // the accelerated path instead of the 4D fallback. Both right-hand sides have to
+        // be contiguous: candle's CPU kernel rejects a permuted one outright.
+        let k = kv_storage.kv_k[layer_idx]
+            .index_select(&indices, 0)?
+            .reshape((num_seqs, padded_ctx, num_kv_heads, head_dim))?
+            .permute((0, 2, 3, 1))?
+            .contiguous()?
+            .reshape((num_seqs * num_kv_heads, head_dim, padded_ctx))?;
+        let v = kv_storage.kv_v[layer_idx]
+            .index_select(&indices, 0)?
+            .reshape((num_seqs, padded_ctx, num_kv_heads, head_dim))?
+            .permute((0, 2, 1, 3))?
+            .contiguous()?
+            .reshape((num_seqs * num_kv_heads, padded_ctx, head_dim))?;
+
+        let q = q
+            .reshape((num_seqs, num_kv_heads, group, head_dim))?
+            .reshape((num_seqs * num_kv_heads, group, head_dim))?;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let scores = (self.matmul(&q, &k)? * scale)?;
+        let mask = Tensor::from_vec(
+            mask_data,
+            (num_seqs * num_kv_heads, 1, padded_ctx),
+            &self.device,
+        )?;
+        let scores = scores.broadcast_add(&mask)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores.contiguous()?)?;
+        let out = self.matmul(&probs, &v)?;
+
+        // out is [num_seqs, num_kv_heads, group, head_dim], which flattens to the
+        // query-head order this model uses everywhere (`head = kv_head * group + group_i`).
+        Ok(out.reshape((num_seqs, num_q_heads * head_dim))?)
     }
 }
