@@ -446,6 +446,80 @@ mod paged_attention_v2_tests {
         );
     }
 
+    /// Ticket #51: the stage-2 merge only matters when >1 partition holds live tokens.
+    #[test]
+    fn test_paged_attention_v2_multi_partition_merge_parity() {
+        let ctx = MetalContext::new().expect("MetalContext initialization failed");
+
+        let num_seqs = 1usize;
+        let num_heads = 8usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 128usize;
+        let block_size = 16usize;
+        let max_num_blocks_per_seq = 40usize; // capacity 640 -> 3 partitions, context spans all
+        let num_blocks = 44usize;
+        let context_lens = vec![600u32];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let params = PagedAttentionParams {
+            num_seqs: num_seqs as u32,
+            num_heads: num_heads as u32,
+            num_kv_heads: num_kv_heads as u32,
+            head_dim: head_dim as u32,
+            block_size: block_size as u32,
+            max_num_blocks_per_seq: max_num_blocks_per_seq as u32,
+            scale,
+        };
+
+        let mut q = vec![0.0f32; num_seqs * num_heads * head_dim];
+        for (i, v) in q.iter_mut().enumerate() {
+            *v = ((i % 17) as f32 - 8.0) * 0.125;
+        }
+        let total_kv = num_blocks * block_size * num_kv_heads * head_dim;
+        let mut k_cache = vec![0.0f32; total_kv];
+        let mut v_cache = vec![0.0f32; total_kv];
+        for i in 0..total_kv {
+            k_cache[i] = ((i % 19) as f32 - 9.0) * 0.1;
+            v_cache[i] = ((i % 23) as f32 - 11.0) * 0.15;
+        }
+        // Non-contiguous mapping: logical block b -> physical (7 * b + 3) % num_blocks.
+        let block_tables: Vec<u32> = (0..max_num_blocks_per_seq as u32)
+            .map(|b| (7 * b + 3) % num_blocks as u32)
+            .collect();
+
+        let cpu_out = cpu_paged_attention(
+            &q,
+            &k_cache,
+            &v_cache,
+            &block_tables,
+            &context_lens,
+            &params,
+        );
+        let gpu_out = gpu_paged_attention_v2(
+            &ctx,
+            &q,
+            &k_cache,
+            &v_cache,
+            &block_tables,
+            &context_lens,
+            &params,
+        )
+        .expect("GPU paged attention v2 dispatch failed");
+
+        assert_eq!(gpu_out.len(), cpu_out.len());
+        for i in 0..cpu_out.len() {
+            let diff = (gpu_out[i] - cpu_out[i]).abs();
+            assert!(
+                diff <= 1e-4,
+                "merge parity mismatch at idx={}: gpu={}, cpu={}, diff={}",
+                i,
+                gpu_out[i],
+                cpu_out[i],
+                diff
+            );
+        }
+    }
+
     #[test]
     fn test_fused_paged_attention_v2_vram_flat_scaling() {
         let ctx = MetalContext::new().expect("MetalContext initialization failed");
