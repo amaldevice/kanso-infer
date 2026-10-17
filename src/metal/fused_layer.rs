@@ -70,16 +70,12 @@ pub fn gemv_threadgroup_geometry(out_dim: usize) -> (u64, u64) {
     )
 }
 
-/// Slice-shape contract of the layer entry points: the kernels index these buffers
+/// Slice-shape contract of the host weights: the kernels index these buffers
 /// blindly from `dims`, so a slice of the wrong length is an out-of-bounds GPU read
 /// or write.
-fn validate_layer_inputs(
+fn validate_weight_shapes(
     dims: &FusedLayerDimensions,
     weights: &FusedLayerWeights,
-    hidden_in: &[f32],
-    cos_table: &[f32],
-    sin_table: &[f32],
-    pos: usize,
 ) -> Result<(), EngineError> {
     dims.validate()?;
 
@@ -97,11 +93,36 @@ fn validate_layer_inputs(
         }
     };
 
-    expect("hidden_in", hidden_in.len(), dims.hidden_dim)?;
     expect("norm_weight", weights.norm_weight.len(), dims.hidden_dim)?;
     expect("w_q", weights.w_q.len(), q_dim * dims.hidden_dim)?;
     expect("w_k", weights.w_k.len(), kv_dim * dims.hidden_dim)?;
     expect("w_v", weights.w_v.len(), kv_dim * dims.hidden_dim)?;
+    Ok(())
+}
+
+/// Slice-shape contract of the layer entry points, which take host slices for the
+/// step input and the rotary tables on every call.
+fn validate_layer_inputs(
+    dims: &FusedLayerDimensions,
+    weights: &FusedLayerWeights,
+    hidden_in: &[f32],
+    cos_table: &[f32],
+    sin_table: &[f32],
+    pos: usize,
+) -> Result<(), EngineError> {
+    validate_weight_shapes(dims, weights)?;
+
+    let q_dim = dims.q_dim();
+    let kv_dim = dims.kv_dim();
+    if hidden_in.len() != dims.hidden_dim {
+        return Err(EngineError::Metal(format!(
+            "hidden_in has {} elements, expected {} for hidden_dim {} \
+             (q_dim {q_dim}, kv_dim {kv_dim})",
+            hidden_in.len(),
+            dims.hidden_dim,
+            dims.hidden_dim
+        )));
+    }
 
     let table_len = (pos + 1) * (dims.head_dim / 2);
     for (name, table) in [("cos_table", cos_table), ("sin_table", sin_table)] {
@@ -116,6 +137,23 @@ fn validate_layer_inputs(
     Ok(())
 }
 
+/// Read `len` floats back out of a shared (zero-copy) device buffer.
+fn read_f32(buf: &Buffer, len: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; len];
+    unsafe {
+        std::ptr::copy_nonoverlapping(buf.contents() as *const f32, out.as_mut_ptr(), len);
+    }
+    out
+}
+
+/// Stage host floats into a shared device buffer without reallocating it.
+fn write_f32(buf: &Buffer, data: &[f32]) {
+    debug_assert!(buf.length() as usize >= std::mem::size_of_val(data));
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents() as *mut f32, data.len());
+    }
+}
+
 /// Q, K, V output triple returned by fused/discrete layer helpers.
 pub type FusedQkvTriple = (Vec<f32>, Vec<f32>, Vec<f32>);
 
@@ -126,6 +164,187 @@ pub struct FusedLayerWeights {
     pub w_q: Vec<f32>,
     pub w_k: Vec<f32>,
     pub w_v: Vec<f32>,
+}
+
+/// Device-resident weights, tables and scratch for one layer (ticket #49).
+///
+/// Upload once at load, then call [`MetalWeights::decode_step`] per token: the step
+/// allocates nothing, re-uploads nothing, and submits exactly one command buffer for
+/// the whole fused RMSNorm + QKV + RoPE chain.
+pub struct MetalWeights {
+    dims: FusedLayerDimensions,
+    norm_weight: Buffer,
+    w_q: Buffer,
+    w_k: Buffer,
+    w_v: Buffer,
+    cos: Buffer,
+    sin: Buffer,
+    /// Elements per rotary table, used to bound the `pos` a step may ask for.
+    table_len: usize,
+    in_buf: Buffer,
+    q_out: Buffer,
+    k_out: Buffer,
+    v_out: Buffer,
+    weight_uploads: usize,
+}
+
+impl MetalWeights {
+    /// Upload the host weights and rotary tables into device buffers once.
+    pub fn upload(
+        ctx: &MetalContext,
+        dims: &FusedLayerDimensions,
+        weights: &FusedLayerWeights,
+        cos_table: &[f32],
+        sin_table: &[f32],
+    ) -> Result<Self, EngineError> {
+        validate_weight_shapes(dims, weights)?;
+        if cos_table.len() != sin_table.len() {
+            return Err(EngineError::Metal(format!(
+                "cos/sin tables must have equal length, got cos={} sin={}",
+                cos_table.len(),
+                sin_table.len()
+            )));
+        }
+        if cos_table.len() < dims.head_dim / 2 {
+            return Err(EngineError::Metal(format!(
+                "rotary tables hold {} elements, need at least {} for head_dim {}",
+                cos_table.len(),
+                dims.head_dim / 2,
+                dims.head_dim
+            )));
+        }
+
+        // Weight and table uploads are counted so a test can prove they happen once
+        // at load rather than per decode step.
+        let mut weight_uploads = 0usize;
+        let mut upload = |data: &[f32]| -> Buffer {
+            weight_uploads += 1;
+            ctx.alloc_buffer_with_data(data)
+        };
+        let norm_weight = upload(&weights.norm_weight);
+        let w_q = upload(&weights.w_q);
+        let w_k = upload(&weights.w_k);
+        let w_v = upload(&weights.w_v);
+        let cos = upload(cos_table);
+        let sin = upload(sin_table);
+
+        Ok(Self {
+            dims: *dims,
+            norm_weight,
+            w_q,
+            w_k,
+            w_v,
+            cos,
+            sin,
+            table_len: cos_table.len(),
+            in_buf: ctx.alloc_buffer::<f32>(dims.hidden_dim),
+            q_out: ctx.alloc_buffer::<f32>(dims.q_dim()),
+            k_out: ctx.alloc_buffer::<f32>(dims.kv_dim()),
+            v_out: ctx.alloc_buffer::<f32>(dims.kv_dim()),
+            weight_uploads,
+        })
+    }
+
+    /// Buffer uploads performed at load (weights and rotary tables).
+    pub fn weight_uploads(&self) -> usize {
+        self.weight_uploads
+    }
+
+    /// One layer decode step: stage the input row, encode RMSNorm + QKV projection +
+    /// RoPE into a single command buffer, and return Q, K, V.
+    pub fn decode_step(
+        &self,
+        ctx: &MetalContext,
+        hidden_in: &[f32],
+        pos: usize,
+        eps: f32,
+    ) -> Result<FusedQkvTriple, EngineError> {
+        if hidden_in.len() != self.dims.hidden_dim {
+            return Err(EngineError::Metal(format!(
+                "hidden_in has {} elements, expected {} for hidden_dim {}",
+                hidden_in.len(),
+                self.dims.hidden_dim,
+                self.dims.hidden_dim
+            )));
+        }
+        let needed = (pos + 1) * (self.dims.head_dim / 2);
+        if needed > self.table_len {
+            return Err(EngineError::Metal(format!(
+                "rotary tables hold {} elements, pos {pos} needs {needed}",
+                self.table_len
+            )));
+        }
+
+        let q_dim = self.dims.q_dim();
+        let kv_dim = self.dims.kv_dim();
+        write_f32(&self.in_buf, hidden_in);
+
+        let pipeline = ctx.pipelines.get("fused_rmsnorm_qkv_rope").ok_or_else(|| {
+            EngineError::Metal("Pipeline 'fused_rmsnorm_qkv_rope' not found in cache".into())
+        })?;
+
+        let command_buffer = ctx.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        // Q and K are RoPE-rotated on the fly (row pairs are rotation pairs), V is not.
+        // All three write disjoint outputs and only read shared inputs, so no barrier is
+        // needed between them inside this encoder.
+        encode_fused_qkv_gemv(
+            encoder,
+            pipeline,
+            &self.in_buf,
+            &self.norm_weight,
+            &self.w_q,
+            &self.cos,
+            &self.sin,
+            &self.q_out,
+            &self.dims,
+            q_dim,
+            pos,
+            eps,
+            true,
+        );
+        encode_fused_qkv_gemv(
+            encoder,
+            pipeline,
+            &self.in_buf,
+            &self.norm_weight,
+            &self.w_k,
+            &self.cos,
+            &self.sin,
+            &self.k_out,
+            &self.dims,
+            kv_dim,
+            pos,
+            eps,
+            true,
+        );
+        encode_fused_qkv_gemv(
+            encoder,
+            pipeline,
+            &self.in_buf,
+            &self.norm_weight,
+            &self.w_v,
+            &self.cos,
+            &self.sin,
+            &self.v_out,
+            &self.dims,
+            kv_dim,
+            pos,
+            eps,
+            false,
+        );
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        Ok((
+            read_f32(&self.q_out, q_dim),
+            read_f32(&self.k_out, kv_dim),
+            read_f32(&self.v_out, kv_dim),
+        ))
+    }
 }
 
 /// Dispatches the fused RMSNorm + RoPE compute kernel in threadgroup memory.
@@ -159,7 +378,7 @@ pub fn gpu_fused_rmsnorm_rope_buffer(
         EngineError::Metal("Pipeline 'fused_rmsnorm_rope' not found in cache".into())
     })?;
 
-    let command_buffer = ctx.queue.new_command_buffer();
+    let command_buffer = ctx.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(pipeline);
 
@@ -398,9 +617,11 @@ pub fn encode_fused_qkv_gemv(
     );
 }
 
-/// Single-encoder deep Metal fusion pipeline for a compact transformer layer.
-/// Fuses RMSNorm, QKV Linear projection, and RoPE within a single MTLComputeCommandEncoder.
-/// Internal memory barriers and threadgroup memory eliminate multi-pass CPU command buffer commit stalls.
+/// Slice-based single-encoder layer entry point: uploads the weights, runs one
+/// decode step and returns Q, K, V.
+///
+/// Convenient for tests and one-shot calls; a decode loop should hold a
+/// [`MetalWeights`] from load time instead, so weights are not re-uploaded per step.
 #[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_fused_layer_single_encoder(
     ctx: &MetalContext,
@@ -413,97 +634,8 @@ pub fn gpu_fused_layer_single_encoder(
     eps: f32,
 ) -> Result<FusedQkvTriple, EngineError> {
     validate_layer_inputs(dims, weights, hidden_in, cos_table, sin_table, pos)?;
-
-    let q_dim = dims.q_dim();
-    let kv_dim = dims.kv_dim();
-
-    let in_buf = ctx.alloc_buffer_with_data(hidden_in);
-    let norm_w_buf = ctx.alloc_buffer_with_data(&weights.norm_weight);
-    let w_q_buf = ctx.alloc_buffer_with_data(&weights.w_q);
-    let w_k_buf = ctx.alloc_buffer_with_data(&weights.w_k);
-    let w_v_buf = ctx.alloc_buffer_with_data(&weights.w_v);
-    let cos_buf = ctx.alloc_buffer_with_data(cos_table);
-    let sin_buf = ctx.alloc_buffer_with_data(sin_table);
-
-    let q_out_buf = ctx.alloc_buffer::<f32>(q_dim);
-    let k_out_buf = ctx.alloc_buffer::<f32>(kv_dim);
-    let v_out_buf = ctx.alloc_buffer::<f32>(kv_dim);
-
-    let pipeline = ctx.pipelines.get("fused_rmsnorm_qkv_rope").ok_or_else(|| {
-        EngineError::Metal("Pipeline 'fused_rmsnorm_qkv_rope' not found in cache".into())
-    })?;
-
-    let command_buffer = ctx.queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-
-    // Q and K are RoPE-rotated on the fly (row pairs are rotation pairs), V is not.
-    // All three write disjoint outputs and only read shared inputs, so no barrier is
-    // needed between them inside this encoder.
-    encode_fused_qkv_gemv(
-        encoder,
-        pipeline,
-        &in_buf,
-        &norm_w_buf,
-        &w_q_buf,
-        &cos_buf,
-        &sin_buf,
-        &q_out_buf,
-        dims,
-        q_dim,
-        pos,
-        eps,
-        true,
-    );
-    encode_fused_qkv_gemv(
-        encoder,
-        pipeline,
-        &in_buf,
-        &norm_w_buf,
-        &w_k_buf,
-        &cos_buf,
-        &sin_buf,
-        &k_out_buf,
-        dims,
-        kv_dim,
-        pos,
-        eps,
-        true,
-    );
-    encode_fused_qkv_gemv(
-        encoder,
-        pipeline,
-        &in_buf,
-        &norm_w_buf,
-        &w_v_buf,
-        &cos_buf,
-        &sin_buf,
-        &v_out_buf,
-        dims,
-        kv_dim,
-        pos,
-        eps,
-        false,
-    );
-
-    encoder.end_encoding();
-
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
-
-    let mut q_out = vec![0.0f32; q_dim];
-    let mut k_out = vec![0.0f32; kv_dim];
-    let mut v_out = vec![0.0f32; kv_dim];
-
-    unsafe {
-        let ptr_q = q_out_buf.contents() as *const f32;
-        let ptr_k = k_out_buf.contents() as *const f32;
-        let ptr_v = v_out_buf.contents() as *const f32;
-        std::ptr::copy_nonoverlapping(ptr_q, q_out.as_mut_ptr(), q_dim);
-        std::ptr::copy_nonoverlapping(ptr_k, k_out.as_mut_ptr(), kv_dim);
-        std::ptr::copy_nonoverlapping(ptr_v, v_out.as_mut_ptr(), kv_dim);
-    }
-
-    Ok((q_out, k_out, v_out))
+    MetalWeights::upload(ctx, dims, weights, cos_table, sin_table)?
+        .decode_step(ctx, hidden_in, pos, eps)
 }
 
 /// Discrete multi-encoder execution that executes RMSNorm, QKV Linear GEMVs, and RoPE
@@ -557,7 +689,7 @@ pub fn gpu_discrete_layer_multi_encoder(
         .get("linear_gemv")
         .ok_or_else(|| EngineError::Metal("Pipeline 'linear_gemv' not found in cache".into()))?;
 
-    let cmd2 = ctx.queue.new_command_buffer();
+    let cmd2 = ctx.new_command_buffer();
     let enc2 = cmd2.new_compute_command_encoder();
     encode_linear_gemv(
         enc2,
@@ -656,7 +788,7 @@ pub fn gpu_chained_pipeline_single_encoder(
         .get("rope")
         .ok_or_else(|| EngineError::Metal("Pipeline 'rope' not found in cache".into()))?;
 
-    let command_buffer = ctx.queue.new_command_buffer();
+    let command_buffer = ctx.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
 
     // 1. RMSNorm

@@ -211,7 +211,7 @@ pub fn gpu_paged_attention_v2_buffer(
     // float2 per (seq, head, partition): running max m and running denominator d.
     let partial_stats_buf = ctx.alloc_buffer::<[f32; 2]>(slots);
 
-    let command_buffer = ctx.queue.new_command_buffer();
+    let command_buffer = ctx.new_command_buffer();
 
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(stage1);
