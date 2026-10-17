@@ -320,6 +320,132 @@ mod paged_attention_v2_tests {
         }
     }
 
+    /// Ticket #51 acceptance: parity across head_dim {64, 128, 256} x GQA ratio {1, 4, 5, 8}.
+    /// head_dim > 128 used to read `q_local`/`s_k` out of bounds silently.
+    #[test]
+    fn test_paged_attention_v2_parity_matrix() {
+        let ctx = MetalContext::new().expect("MetalContext initialization failed");
+
+        for &head_dim in &[64usize, 128, 256] {
+            for &group_size in &[1usize, 4, 5, 8] {
+                let num_seqs = 2usize;
+                let num_kv_heads = 2usize;
+                let num_heads = num_kv_heads * group_size;
+                let block_size = 16usize;
+                let max_num_blocks_per_seq = 4usize;
+                let num_blocks = 10usize;
+                let context_lens = vec![37u32, 16u32];
+                let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+                let params = PagedAttentionParams {
+                    num_seqs: num_seqs as u32,
+                    num_heads: num_heads as u32,
+                    num_kv_heads: num_kv_heads as u32,
+                    head_dim: head_dim as u32,
+                    block_size: block_size as u32,
+                    max_num_blocks_per_seq: max_num_blocks_per_seq as u32,
+                    scale,
+                };
+
+                let mut q = vec![0.0f32; num_seqs * num_heads * head_dim];
+                for (i, v) in q.iter_mut().enumerate() {
+                    *v = ((i % 17) as f32 - 8.0) * 0.125;
+                }
+
+                let total_kv = num_blocks * block_size * num_kv_heads * head_dim;
+                let mut k_cache = vec![0.0f32; total_kv];
+                let mut v_cache = vec![0.0f32; total_kv];
+                for i in 0..total_kv {
+                    k_cache[i] = ((i % 19) as f32 - 9.0) * 0.1;
+                    v_cache[i] = ((i % 23) as f32 - 11.0) * 0.15;
+                }
+
+                // Non-contiguous physical block mapping (seq 1 only needs its first block).
+                let block_tables = vec![5u32, 2, 7, 0, 3, 9, 1, 6];
+
+                let cpu_out = cpu_paged_attention(
+                    &q,
+                    &k_cache,
+                    &v_cache,
+                    &block_tables,
+                    &context_lens,
+                    &params,
+                );
+                let gpu_out = gpu_paged_attention_v2(
+                    &ctx,
+                    &q,
+                    &k_cache,
+                    &v_cache,
+                    &block_tables,
+                    &context_lens,
+                    &params,
+                )
+                .expect("GPU paged attention v2 dispatch failed");
+
+                assert_eq!(gpu_out.len(), cpu_out.len());
+                for i in 0..cpu_out.len() {
+                    let diff = (gpu_out[i] - cpu_out[i]).abs();
+                    assert!(
+                        diff <= 1e-4,
+                        "parity mismatch at head_dim={}, kv_group={}, idx={}: gpu={}, cpu={}, diff={}",
+                        head_dim,
+                        group_size,
+                        i,
+                        gpu_out[i],
+                        cpu_out[i],
+                        diff
+                    );
+                }
+            }
+        }
+    }
+
+    /// Ticket #51: head_dim beyond the kernel's register capacity must be rejected by the host.
+    #[test]
+    fn test_paged_attention_v2_rejects_over_max_head_dim() {
+        let ctx = MetalContext::new().expect("MetalContext initialization failed");
+
+        let num_seqs = 1usize;
+        let num_heads = 1usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 384usize;
+        let block_size = 16usize;
+        let max_num_blocks_per_seq = 4usize;
+
+        let params = PagedAttentionParams {
+            num_seqs: num_seqs as u32,
+            num_heads: num_heads as u32,
+            num_kv_heads: num_kv_heads as u32,
+            head_dim: head_dim as u32,
+            block_size: block_size as u32,
+            max_num_blocks_per_seq: max_num_blocks_per_seq as u32,
+            scale: 1.0f32 / (head_dim as f32).sqrt(),
+        };
+
+        let q = vec![0.1f32; num_seqs * num_heads * head_dim];
+        let kv_len = num_seqs * max_num_blocks_per_seq * block_size * num_kv_heads * head_dim;
+        let k_cache = vec![0.1f32; kv_len];
+        let v_cache = vec![0.1f32; kv_len];
+        let block_tables = vec![0u32, 1, 2, 3];
+        let context_lens = vec![8u32];
+
+        let result = gpu_paged_attention_v2(
+            &ctx,
+            &q,
+            &k_cache,
+            &v_cache,
+            &block_tables,
+            &context_lens,
+            &params,
+        );
+        assert!(
+            result.is_err(),
+            "head_dim={} exceeds the kernel limit and must fail loudly, got {:?}",
+            head_dim,
+            result.map(|v| v.len())
+        );
+    }
+
     #[test]
     fn test_fused_paged_attention_v2_vram_flat_scaling() {
         let ctx = MetalContext::new().expect("MetalContext initialization failed");
