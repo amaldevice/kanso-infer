@@ -3,8 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::EngineError;
 use crate::model::Model;
-use crate::quant::q4_k::{BlockQ4_K, QK_K};
-use crate::quant::q8_0::{BlockQ8_0, QK8_0};
+use candle_core::quantized::GgmlDType;
 
 /// Computes the cross-entropy negative log-likelihood (NLL) loss for next-token prediction.
 ///
@@ -43,94 +42,6 @@ pub enum QuantKernel {
     Int8Kv,
 }
 
-/// Quantizes and dequantizes an f32 weight tensor using Q8_0 blocks (32-element chunks).
-pub fn quantize_tensor_q8_0(tensor: &Tensor) -> Result<Tensor, EngineError> {
-    let shape = tensor.shape();
-    let flat = tensor.flatten_all()?.to_vec1::<f32>()?;
-    let len = flat.len();
-    if len % QK8_0 != 0 {
-        return Ok(tensor.clone());
-    }
-    let mut dequant = vec![0.0f32; len];
-    for (i, chunk) in flat.as_chunks::<QK8_0>().0.iter().enumerate() {
-        let block = BlockQ8_0::from_f32_slice(chunk);
-        let out_chunk: &mut [f32; QK8_0] = (&mut dequant[i * QK8_0..(i + 1) * QK8_0])
-            .try_into()
-            .unwrap();
-        block.dequantize(out_chunk);
-    }
-    Ok(Tensor::from_vec(dequant, shape, tensor.device())?)
-}
-
-/// Quantizes and dequantizes an f32 weight tensor using Q4_K representation.
-pub fn quantize_tensor_q4_k(tensor: &Tensor) -> Result<Tensor, EngineError> {
-    let shape = tensor.shape();
-    let flat = tensor.flatten_all()?.to_vec1::<f32>()?;
-    let len = flat.len();
-
-    let mut dequant = vec![0.0f32; len];
-
-    if len % QK_K == 0 {
-        for (b_idx, chunk) in flat.as_chunks::<QK_K>().0.iter().enumerate() {
-            let mut amax = 0.0f32;
-            for &x in chunk {
-                let ax = x.abs();
-                if ax > amax {
-                    amax = ax;
-                }
-            }
-
-            let d = if amax > 0.0 {
-                amax / (15.0 * 63.0)
-            } else {
-                0.0
-            };
-            let scales = [15u8, 15, 15, 15, 0, 0, 0, 0, 15, 15, 15, 15];
-            let mut qs = [0u8; QK_K / 2];
-
-            let d1 = d * 15.0;
-            let id1 = if d1 > 0.0 { 1.0 / d1 } else { 0.0 };
-
-            for j in 0..(QK_K / 2) {
-                let v0 = (chunk[j] * id1).round().clamp(0.0, 15.0) as u8;
-                let v1 = (chunk[j + QK_K / 2] * id1).round().clamp(0.0, 15.0) as u8;
-                qs[j] = (v0 & 0x0F) | ((v1 & 0x0F) << 4);
-            }
-
-            let block = BlockQ4_K {
-                d,
-                dmin: 0.0,
-                scales,
-                qs,
-            };
-            let out_chunk: &mut [f32; QK_K] = (&mut dequant[b_idx * QK_K..(b_idx + 1) * QK_K])
-                .try_into()
-                .unwrap();
-            block.dequantize(out_chunk);
-        }
-    } else {
-        // Fallback for sub-256 dimensions: chunk by 32 with 4-bit quantization
-        for (c_idx, chunk) in flat.chunks(32).enumerate() {
-            let mut amax = 0.0f32;
-            for &x in chunk {
-                let ax = x.abs();
-                if ax > amax {
-                    amax = ax;
-                }
-            }
-            let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
-            let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-            let base = c_idx * 32;
-            for (i, &x) in chunk.iter().enumerate() {
-                let q = (x * inv_scale).round().clamp(-8.0, 7.0);
-                dequant[base + i] = q * scale;
-            }
-        }
-    }
-
-    Ok(Tensor::from_vec(dequant, shape, tensor.device())?)
-}
-
 /// Applies INT8 symmetric quantization to Key/Value intermediate activation tensors.
 fn quantize_int8_kv_tensor(t: &Tensor) -> Result<Tensor, EngineError> {
     let shape = t.shape();
@@ -156,58 +67,38 @@ fn quantize_int8_kv_tensor(t: &Tensor) -> Result<Tensor, EngineError> {
 }
 
 /// Forwards a token slice through the model under specified quantization mode.
+///
+/// Weight modes re-store the model's weights in real GGML blocks (`Q8_0`, `Q4_K`)
+/// and run the quantized matmul path; `Fp32` is the dense baseline, i.e. what
+/// #47 removed from the GGUF load path. `Int8Kv` keeps dense weights but rounds
+/// the K/V activations, which is a different experiment and orthogonal to #47.
 pub fn forward_tokens_with_quant(
     model: &Model,
     tokens: &[u32],
     quant: QuantKernel,
 ) -> Result<Tensor, EngineError> {
+    let with_weights = |weights: crate::weights::ModelWeights| {
+        let mut m = Model::new(weights, model.config.clone(), model.device.clone());
+        m.set_backend(model.backend);
+        m
+    };
+
     match quant {
-        QuantKernel::Fp32 => model.forward_tokens(tokens),
+        QuantKernel::Fp32 => with_weights(model.weights.to_dense()?).forward_tokens(tokens),
         QuantKernel::NeonQ8_0 => {
-            let mut q_model = Model::new(
-                model.weights.clone(),
-                model.config.clone(),
-                model.device.clone(),
-            );
-            q_model.set_backend(model.backend());
-            for layer in &mut q_model.weights.layers {
-                layer.attn_q = quantize_tensor_q8_0(&layer.attn_q)?;
-                layer.attn_k = quantize_tensor_q8_0(&layer.attn_k)?;
-                layer.attn_v = quantize_tensor_q8_0(&layer.attn_v)?;
-                layer.attn_output = quantize_tensor_q8_0(&layer.attn_output)?;
-                layer.ffn_gate = quantize_tensor_q8_0(&layer.ffn_gate)?;
-                layer.ffn_up = quantize_tensor_q8_0(&layer.ffn_up)?;
-                layer.ffn_down = quantize_tensor_q8_0(&layer.ffn_down)?;
-            }
-            q_model.forward_tokens(tokens)
+            with_weights(model.weights.requantize(GgmlDType::Q8_0)?).forward_tokens(tokens)
         }
         QuantKernel::NeonQ4_K => {
-            let mut q_model = Model::new(
-                model.weights.clone(),
-                model.config.clone(),
-                model.device.clone(),
-            );
-            q_model.set_backend(model.backend());
-            for layer in &mut q_model.weights.layers {
-                layer.attn_q = quantize_tensor_q4_k(&layer.attn_q)?;
-                layer.attn_k = quantize_tensor_q4_k(&layer.attn_k)?;
-                layer.attn_v = quantize_tensor_q4_k(&layer.attn_v)?;
-                layer.attn_output = quantize_tensor_q4_k(&layer.attn_output)?;
-                layer.ffn_gate = quantize_tensor_q4_k(&layer.ffn_gate)?;
-                layer.ffn_up = quantize_tensor_q4_k(&layer.ffn_up)?;
-                layer.ffn_down = quantize_tensor_q4_k(&layer.ffn_down)?;
-            }
-            q_model.forward_tokens(tokens)
+            with_weights(model.weights.requantize(GgmlDType::Q4K)?).forward_tokens(tokens)
         }
         QuantKernel::Int8Kv => {
-            // Forward pass with INT8 quantized key/value projections
             let seq_len = tokens.len();
             if seq_len == 0 {
                 return Err(EngineError::Model("Empty input tokens".to_string()));
             }
 
             let token_ids = Tensor::from_slice(tokens, (seq_len,), &model.device)?;
-            let mut hidden = model.weights.embed_tokens.index_select(&token_ids, 0)?;
+            let mut hidden = model.embed(&token_ids)?;
 
             let head_dim = model.config.head_dim();
             let num_q_heads = model.config.num_attention_heads;
@@ -233,13 +124,11 @@ pub fn forward_tokens_with_quant(
 
             for layer in &model.weights.layers {
                 let normed = model.rmsnorm(&hidden, &layer.attn_norm)?;
-                let q = model.matmul(&normed, &layer.attn_q.t()?)?;
-                let k_fp32 = model.matmul(&normed, &layer.attn_k.t()?)?;
-                let v_fp32 = model.matmul(&normed, &layer.attn_v.t()?)?;
+                let (q, k, v) = model.project_qkv(layer, &normed)?;
 
                 // Simulate INT8 quantization on KV projections
-                let k = quantize_int8_kv_tensor(&k_fp32)?;
-                let v = quantize_int8_kv_tensor(&v_fp32)?;
+                let k = quantize_int8_kv_tensor(&k)?;
+                let v = quantize_int8_kv_tensor(&v)?;
 
                 let q = q
                     .reshape((seq_len, num_q_heads, head_dim))?
@@ -271,21 +160,18 @@ pub fn forward_tokens_with_quant(
                 let attn_out = attn_out
                     .transpose(0, 1)?
                     .reshape((seq_len, num_q_heads * head_dim))?;
-                let attn_proj = model.matmul(&attn_out, &layer.attn_output.t()?)?;
-                hidden = (hidden + attn_proj)?;
+                hidden = (hidden + model.linear(&layer.attn_output, &attn_out)?)?;
 
                 let ffn_normed = model.rmsnorm(&hidden, &layer.ffn_norm)?;
-                let gate = model.matmul(&ffn_normed, &layer.ffn_gate.t()?)?;
-                let up = model.matmul(&ffn_normed, &layer.ffn_up.t()?)?;
+                let gate = model.linear(&layer.ffn_gate, &ffn_normed)?;
+                let up = model.linear(&layer.ffn_up, &ffn_normed)?;
                 let silu_gate = candle_nn::ops::silu(&gate)?;
                 let ffn_hidden = (silu_gate * up)?;
-                let ffn_out = model.matmul(&ffn_hidden, &layer.ffn_down.t()?)?;
-                hidden = (hidden + ffn_out)?;
+                hidden = (hidden + model.linear(&layer.ffn_down, &ffn_hidden)?)?;
             }
 
             let final_normed = model.rmsnorm(&hidden, &model.weights.norm)?;
-            let logits = model.matmul(&final_normed, &model.weights.lm_head.t()?)?;
-            Ok(logits)
+            model.linear(&model.weights.lm_head, &final_normed)
         }
     }
 }
@@ -363,7 +249,7 @@ pub fn calculate_perplexity_quantized(
 /// Evaluation record for an individual backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendPpl {
-    pub backend: String,
+    pub backend: crate::hardware::Backend,
     pub perplexity: f64,
     pub delta_vs_fp32: f64,
 }
@@ -404,25 +290,30 @@ pub fn compare_backends_perplexity(
     };
 
     // 1. FP32 Baseline (CPU)
-    model.set_backend("cpu");
+    model.set_backend(crate::hardware::Backend::Cpu);
     let baseline_ppl = calculate_perplexity(&model, tokens, stride)?;
 
     // 2. Hardware Backends Evaluation
-    let backend_names = ["cpu", "amx", "neon", "metal"];
+    let backend_names = [
+        crate::hardware::Backend::Cpu,
+        crate::hardware::Backend::Amx,
+        crate::hardware::Backend::Neon,
+        crate::hardware::Backend::Metal,
+    ];
     let mut backends = Vec::new();
-    for &b_name in &backend_names {
-        model.set_backend(b_name);
+    for &b in &backend_names {
+        model.set_backend(b);
         let ppl = calculate_perplexity(&model, tokens, stride)?;
         let delta = ppl - baseline_ppl;
         backends.push(BackendPpl {
-            backend: b_name.to_string(),
+            backend: b,
             perplexity: ppl,
             delta_vs_fp32: delta,
         });
     }
 
     // Reset backend to cpu for quantization evals
-    model.set_backend("cpu");
+    model.set_backend(crate::hardware::Backend::Cpu);
 
     // 3. Quantized Kernels Evaluation
     let quant_configs = [

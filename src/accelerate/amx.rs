@@ -1,5 +1,5 @@
 use crate::error::EngineError;
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, Layout, Storage, Tensor};
 
 #[cfg(target_os = "macos")]
 #[link(name = "Accelerate", kind = "framework")]
@@ -219,12 +219,148 @@ pub fn fallback_gemv(m: usize, k: usize, a: &[f32], x: &[f32], y: &mut [f32]) {
     }
 }
 
-/// Helper to extract CPU f32 slice if contiguous, or clone into Vec.
+/// Fallback copies taken by `get_f32_vec` (the weight-sized path `amx_matmul`
+/// avoids on recognized layouts). A layout regression shows up here before it
+/// shows up in tok/s. Quantized weights never reach this path at all — see
+/// `Model::linear`, which only routes dense F32 through AMX.
+pub static AMX_FALLBACK_COPIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Fallback copy path: materializes a tensor into a contiguous row-major `Vec`.
+/// Only reached for layouts the GEMM entry points cannot consume in place.
 fn get_f32_vec(tensor: &Tensor) -> Result<Vec<f32>, EngineError> {
+    AMX_FALLBACK_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("amx_matmul: unrecognized layout, taking weight-sized fallback copy");
     Ok(tensor.flatten_all()?.to_vec1::<f32>()?)
 }
 
+/// The `rows * cols` f32 elements backing a row-major `[rows, cols]` tensor, borrowed
+/// from its own storage. `None` when the layout would need a reshuffle.
+fn contiguous_block<'a>(
+    data: &'a [f32],
+    layout: &Layout,
+    rows: usize,
+    cols: usize,
+) -> Option<&'a [f32]> {
+    if !layout.is_contiguous() {
+        return None;
+    }
+    let start = layout.start_offset();
+    let end = start.checked_add(rows.checked_mul(cols)?)?;
+    data.get(start..end)
+}
+
+/// The `rows * cols` elements of a `[rows, cols]` tensor that is the *view* transpose of
+/// a contiguous `[cols, rows]` block — what `.t()` on a loaded `[out, in]` weight
+/// produces. The elements come back in `[cols, rows]` order for `amx_gemm_b_trans`.
+fn transposed_block<'a>(
+    data: &'a [f32],
+    layout: &Layout,
+    rows: usize,
+    cols: usize,
+) -> Option<&'a [f32]> {
+    // Shape [rows, cols] read off a contiguous [cols, rows] block: stride (1, rows).
+    if layout.stride() != [1, rows] {
+        return None;
+    }
+    let start = layout.start_offset();
+    let end = start.checked_add(rows.checked_mul(cols)?)?;
+    data.get(start..end)
+}
+
+/// 2D GEMM straight out of the operands' storage. `a` must be contiguous `[m, k]`;
+/// `b` may be contiguous `[k, n]` or the transposed view of a contiguous `[n, k]` block.
+fn gemm_2d_in_place(
+    a: &Tensor,
+    b: &Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Option<Result<Tensor, EngineError>> {
+    let (a_guard, a_layout) = a.storage_and_layout();
+    let (b_guard, b_layout) = b.storage_and_layout();
+    let Storage::Cpu(a_storage) = &*a_guard else {
+        return None;
+    };
+    let Storage::Cpu(b_storage) = &*b_guard else {
+        return None;
+    };
+    let a_data = a_storage.as_slice::<f32>().ok()?;
+    let b_data = b_storage.as_slice::<f32>().ok()?;
+
+    let a_block = contiguous_block(a_data, a_layout, m, k)?;
+    let mut c = vec![0.0f32; m * n];
+    match (
+        contiguous_block(b_data, b_layout, k, n),
+        transposed_block(b_data, b_layout, k, n),
+    ) {
+        (Some(b_block), _) => amx_gemm(m, n, k, a_block, b_block, &mut c),
+        (None, Some(b_block)) => amx_gemm_b_trans(m, n, k, a_block, b_block, &mut c),
+        (None, None) => return None,
+    }
+    Some(Tensor::from_vec(c, (m, n), &Device::Cpu).map_err(EngineError::from))
+}
+
+/// 3D GEMM straight out of the operands' storage, one `[m, k] x [k, n]` block per batch.
+/// `a` must be contiguous `[batch, m, k]`; `b` is `[batch, k, n]` either contiguous or
+/// the per-batch transpose of a contiguous `[batch, n, k]` block.
+fn gemm_3d_in_place(
+    a: &Tensor,
+    b: &Tensor,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Option<Result<Tensor, EngineError>> {
+    let (a_guard, a_layout) = a.storage_and_layout();
+    let (b_guard, b_layout) = b.storage_and_layout();
+    let Storage::Cpu(a_storage) = &*a_guard else {
+        return None;
+    };
+    let Storage::Cpu(b_storage) = &*b_guard else {
+        return None;
+    };
+    let a_data = a_storage.as_slice::<f32>().ok()?;
+    let b_data = b_storage.as_slice::<f32>().ok()?;
+
+    if !a_layout.is_contiguous() {
+        return None;
+    }
+    let b_transposed = if b_layout.is_contiguous() {
+        false
+    } else if b_layout.stride() == [k * n, 1, k] {
+        true
+    } else {
+        return None;
+    };
+
+    let a_start = a_layout.start_offset();
+    let b_start = b_layout.start_offset();
+    let a_end = a_start.checked_add(batch.checked_mul(m)?.checked_mul(k)?)?;
+    let b_end = b_start.checked_add(batch.checked_mul(k)?.checked_mul(n)?)?;
+    if a_end > a_data.len() || b_end > b_data.len() {
+        return None;
+    }
+
+    let mut c = vec![0.0f32; batch * m * n];
+    for i in 0..batch {
+        let a_block = &a_data[a_start + i * m * k..a_start + (i + 1) * m * k];
+        let b_block = &b_data[b_start + i * k * n..b_start + (i + 1) * k * n];
+        let c_block = &mut c[i * m * n..(i + 1) * m * n];
+        if b_transposed {
+            amx_gemm_b_trans(m, n, k, a_block, b_block, c_block);
+        } else {
+            amx_gemm(m, n, k, a_block, b_block, c_block);
+        }
+    }
+    Some(Tensor::from_vec(c, (batch, m, n), &Device::Cpu).map_err(EngineError::from))
+}
+
 /// AMX-accelerated matrix multiplication for Candle Tensors.
+///
+/// Consumes the operands' existing storage: a `.t()` weight view is handed to
+/// `amx_gemm_b_trans` (`C = A * W^T` via `CblasTrans`) instead of being materialized, so
+/// a decode step allocates only its own `[m, n]` output.
 pub fn amx_matmul(a: &Tensor, b: &Tensor) -> Result<Tensor, EngineError> {
     if a.dtype() != DType::F32
         || b.dtype() != DType::F32
@@ -234,16 +370,20 @@ pub fn amx_matmul(a: &Tensor, b: &Tensor) -> Result<Tensor, EngineError> {
         return Ok(a.matmul(b)?);
     }
 
+    // No-op (storage is shared) when the activations are already row-major.
+    let a = a.contiguous()?;
     let a_dims = a.dims();
     let b_dims = b.dims();
 
     // 2D x 2D: [M, K] x [K, N] -> [M, N]
     if a_dims.len() == 2 && b_dims.len() == 2 && a_dims[1] == b_dims[0] {
-        let m = a_dims[0];
-        let k = a_dims[1];
-        let n = b_dims[1];
+        let (m, k, n) = (a_dims[0], a_dims[1], b_dims[1]);
 
-        let a_data = get_f32_vec(a)?;
+        if let Some(out) = gemm_2d_in_place(&a, b, m, n, k) {
+            return out;
+        }
+
+        let a_data = get_f32_vec(&a)?;
         let b_data = get_f32_vec(b)?;
         let mut c_data = vec![0.0f32; m * n];
 
@@ -253,16 +393,18 @@ pub fn amx_matmul(a: &Tensor, b: &Tensor) -> Result<Tensor, EngineError> {
 
     // 3D x 3D: [B, M, K] x [B, K, N] -> [B, M, N]
     if a_dims.len() == 3 && b_dims.len() == 3 && a_dims[0] == b_dims[0] && a_dims[2] == b_dims[1] {
-        let b_batch = a_dims[0];
-        let m = a_dims[1];
-        let k = a_dims[2];
-        let n = b_dims[2];
+        let batch = a_dims[0];
+        let (m, k, n) = (a_dims[1], a_dims[2], b_dims[2]);
 
-        let a_data = get_f32_vec(a)?;
+        if let Some(out) = gemm_3d_in_place(&a, b, batch, m, n, k) {
+            return out;
+        }
+
+        let a_data = get_f32_vec(&a)?;
         let b_data = get_f32_vec(b)?;
-        let mut c_data = vec![0.0f32; b_batch * m * n];
+        let mut c_data = vec![0.0f32; batch * m * n];
 
-        for i in 0..b_batch {
+        for i in 0..batch {
             let a_off = i * m * k;
             let b_off = i * k * n;
             let c_off = i * m * n;
@@ -275,7 +417,7 @@ pub fn amx_matmul(a: &Tensor, b: &Tensor) -> Result<Tensor, EngineError> {
                 &mut c_data[c_off..c_off + m * n],
             );
         }
-        return Ok(Tensor::from_vec(c_data, (b_batch, m, n), &Device::Cpu)?);
+        return Ok(Tensor::from_vec(c_data, (batch, m, n), &Device::Cpu)?);
     }
 
     // Fallback to candle matmul for any higher dims or broadcasting

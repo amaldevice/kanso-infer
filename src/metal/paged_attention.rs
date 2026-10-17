@@ -2,6 +2,13 @@ use crate::error::EngineError;
 use crate::metal::context::MetalContext;
 use metal::{Buffer, MTLSize};
 
+/// Tokens handled per context partition by the stage-1 kernel (vLLM's PARTITION_SIZE).
+const PARTITION_SIZE: u32 = 256;
+/// SIMD_WIDTH * MAX_ITEMS in kernels/paged_attention_v2.metal.
+const MAX_HEAD_DIM: u32 = 256;
+/// MAX_GROUP in kernels/paged_attention_v2.metal.
+const MAX_KV_GROUP_SIZE: u32 = 8;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PagedAttentionParams {
@@ -12,6 +19,64 @@ pub struct PagedAttentionParams {
     pub block_size: u32,
     pub max_num_blocks_per_seq: u32,
     pub scale: f32,
+}
+
+/// Context partitions the stage-1 grid is launched with: one per `PARTITION_SIZE`
+/// tokens the largest context of this batch can address. Idle partitions cost one
+/// empty SIMD group each and contribute nothing to the merge.
+pub fn paged_attention_num_partitions(params: &PagedAttentionParams) -> u32 {
+    let capacity = params
+        .max_num_blocks_per_seq
+        .saturating_mul(params.block_size);
+    capacity.div_ceil(PARTITION_SIZE).max(1)
+}
+
+/// Host-side bounds: anything the kernel cannot represent must fail here instead of
+/// silently reading past the end of its per-lane registers (ticket #51).
+fn validate_paged_attention_params(
+    params: &PagedAttentionParams,
+    num_partitions: u32,
+) -> Result<(), EngineError> {
+    let invalid = |msg: String| Err(EngineError::Metal(msg));
+
+    if params.num_seqs == 0 || params.num_heads == 0 || params.num_kv_heads == 0 {
+        return invalid(format!("paged attention: empty shape {params:?}"));
+    }
+    if !params.num_heads.is_multiple_of(params.num_kv_heads) {
+        return invalid(format!(
+            "paged attention: num_heads {} not divisible by num_kv_heads {}",
+            params.num_heads, params.num_kv_heads
+        ));
+    }
+    let group_size = params.num_heads / params.num_kv_heads;
+    if group_size > MAX_KV_GROUP_SIZE {
+        return invalid(format!(
+            "paged attention: GQA group size {group_size} exceeds kernel limit {MAX_KV_GROUP_SIZE}"
+        ));
+    }
+    if params.head_dim == 0 || params.head_dim > MAX_HEAD_DIM {
+        return invalid(format!(
+            "paged attention: head_dim {} outside kernel range 1..={MAX_HEAD_DIM}",
+            params.head_dim
+        ));
+    }
+    if params.block_size == 0 || params.max_num_blocks_per_seq == 0 {
+        return invalid(format!(
+            "paged attention: block_size {} / max_num_blocks_per_seq {} must be non-zero",
+            params.block_size, params.max_num_blocks_per_seq
+        ));
+    }
+    // The kernel indexes partials with 32-bit element offsets.
+    let partial_elements = params.num_seqs as u64
+        * params.num_heads as u64
+        * num_partitions as u64
+        * params.head_dim as u64;
+    if partial_elements > (1 << 31) {
+        return invalid(format!(
+            "paged attention: {partial_elements} partial elements exceed 32-bit kernel indexing"
+        ));
+    }
+    Ok(())
 }
 
 /// Reference CPU implementation of paged attention with GQA and non-contiguous physical blocks.
@@ -111,7 +176,9 @@ pub fn cpu_paged_attention(
     out
 }
 
-/// Dispatches fused PagedAttention v2 Metal kernel with online softmax in threadgroup memory.
+/// Dispatches PagedAttention v2: stage 1 splits the context over partitions, stage 2
+/// merges them. Partition scratch is allocated here because the caller-facing buffers
+/// are only q/k/v/tables/lens/out; both passes share one command buffer.
 #[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
 pub fn gpu_paged_attention_v2_buffer(
     ctx: &MetalContext,
@@ -123,40 +190,94 @@ pub fn gpu_paged_attention_v2_buffer(
     out_buf: &Buffer,
     params: &PagedAttentionParams,
 ) -> Result<(), EngineError> {
-    let pipeline = ctx
+    let stage1 = ctx
         .pipelines
         .get("paged_attention_v2")
         .ok_or_else(|| EngineError::Metal("Pipeline paged_attention_v2 not found".into()))?;
+    let reduce = ctx
+        .pipelines
+        .get("paged_attention_v2_reduce")
+        .ok_or_else(|| EngineError::Metal("Pipeline paged_attention_v2_reduce not found".into()))?;
 
-    let command_buffer = ctx.queue.new_command_buffer();
+    let num_partitions = paged_attention_num_partitions(params);
+    validate_paged_attention_params(params, num_partitions)?;
+
+    let num_seqs = params.num_seqs as usize;
+    let num_heads = params.num_heads as usize;
+    let head_dim = params.head_dim as usize;
+    let slots = num_seqs * num_heads * num_partitions as usize;
+
+    let partial_out_buf = ctx.alloc_buffer::<f32>(slots * head_dim);
+    // float2 per (seq, head, partition): running max m and running denominator d.
+    let partial_stats_buf = ctx.alloc_buffer::<[f32; 2]>(slots);
+
+    let command_buffer = ctx.new_command_buffer();
+
     let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(pipeline);
-
+    encoder.set_compute_pipeline_state(stage1);
     encoder.set_buffer(0, Some(q_buf), 0);
     encoder.set_buffer(1, Some(k_cache_buf), 0);
     encoder.set_buffer(2, Some(v_cache_buf), 0);
     encoder.set_buffer(3, Some(block_tables_buf), 0);
     encoder.set_buffer(4, Some(context_lens_buf), 0);
-    encoder.set_buffer(5, Some(out_buf), 0);
-
+    encoder.set_buffer(5, Some(&partial_out_buf), 0);
+    encoder.set_buffer(6, Some(&partial_stats_buf), 0);
     encoder.set_bytes(
-        6,
+        7,
         std::mem::size_of::<PagedAttentionParams>() as u64,
         params as *const _ as *const _,
     );
+    encoder.set_bytes(
+        8,
+        std::mem::size_of::<u32>() as u64,
+        &num_partitions as *const u32 as *const _,
+    );
+    encoder.set_bytes(
+        9,
+        std::mem::size_of::<u32>() as u64,
+        &PARTITION_SIZE as *const u32 as *const _,
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: num_partitions as u64,
+            height: params.num_seqs as u64,
+            depth: params.num_kv_heads as u64,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.end_encoding();
 
-    let threadgroup_count = MTLSize {
-        width: params.num_heads as u64,
-        height: params.num_seqs as u64,
-        depth: 1,
-    };
-    let threadgroup_size = MTLSize {
-        width: 32,
-        height: 1,
-        depth: 1,
-    };
-
-    encoder.dispatch_thread_groups(threadgroup_count, threadgroup_size);
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(reduce);
+    encoder.set_buffer(0, Some(&partial_out_buf), 0);
+    encoder.set_buffer(1, Some(&partial_stats_buf), 0);
+    encoder.set_buffer(2, Some(out_buf), 0);
+    encoder.set_bytes(
+        3,
+        std::mem::size_of::<PagedAttentionParams>() as u64,
+        params as *const _ as *const _,
+    );
+    encoder.set_bytes(
+        4,
+        std::mem::size_of::<u32>() as u64,
+        &num_partitions as *const u32 as *const _,
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: num_heads as u64,
+            height: params.num_seqs as u64,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
     encoder.end_encoding();
 
     command_buffer.commit();
@@ -179,6 +300,21 @@ pub fn gpu_paged_attention_v2(
     let num_heads = params.num_heads as usize;
     let head_dim = params.head_dim as usize;
     let total_out_elements = num_seqs * num_heads * head_dim;
+
+    // Contexts longer than the block table can address would read outside the block pool.
+    let capacity = params.max_num_blocks_per_seq * params.block_size;
+    if let Some(&len) = context_lens.iter().find(|&&len| len > capacity) {
+        return Err(EngineError::Metal(format!(
+            "paged attention: context_len {len} exceeds block table capacity {capacity}"
+        )));
+    }
+    // An empty context leaves every partition idle (all m = -inf), and the merge
+    // then computes exp(-inf - -inf) = NaN. Fail loudly instead of emitting NaN.
+    if context_lens.contains(&0) {
+        return Err(EngineError::Metal(
+            "paged attention: context_len must be non-zero (empty context merges to NaN)".into(),
+        ));
+    }
 
     let q_buf = ctx.alloc_buffer_with_data(q);
     let k_cache_buf = ctx.alloc_buffer_with_data(k_cache);

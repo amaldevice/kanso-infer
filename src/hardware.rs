@@ -1,12 +1,86 @@
+use candle_core::Device;
 use serde::{Deserialize, Serialize};
 
-/// Default execution backend for current platform:
-/// Defaults to "metal" on macOS (Apple Silicon GPU), and "cpu" on other operating systems.
-pub const DEFAULT_BACKEND: &str = if cfg!(target_os = "macos") {
-    "metal"
-} else {
-    "cpu"
-};
+/// Execution backend selected via `--backend`. Parsed once by clap;
+/// an unknown string fails CLI parsing instead of silently running CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Backend {
+    Cpu,
+    Metal,
+    Neon,
+    Amx,
+}
+
+impl Default for Backend {
+    /// "metal" on macOS (Apple Silicon GPU), "cpu" elsewhere.
+    fn default() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Metal
+        } else {
+            Self::Cpu
+        }
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Cpu => "cpu",
+            Self::Metal => "metal",
+            Self::Neon => "neon",
+            Self::Amx => "amx",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl std::str::FromStr for Backend {
+    type Err = crate::error::EngineError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "cpu" => Ok(Self::Cpu),
+            "metal" => Ok(Self::Metal),
+            "neon" => Ok(Self::Neon),
+            "amx" => Ok(Self::Amx),
+            other => Err(crate::error::EngineError::Config(format!(
+                "unknown backend '{other}' (expected one of: cpu, metal, neon, amx)"
+            ))),
+        }
+    }
+}
+
+impl Backend {
+    /// Resolves the candle device this backend really executes on.
+    /// Metal goes to the GPU via `Device::new_metal(0)`; every other
+    /// backend runs on CPU (NEON/AMX are CPU SIMD paths).
+    pub fn device(&self) -> Result<Device, crate::error::EngineError> {
+        match self {
+            Self::Metal => {
+                #[cfg(target_os = "macos")]
+                {
+                    Ok(Device::new_metal(0)?)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Err(crate::error::EngineError::Metal(
+                        "metal backend requires macOS".to_string(),
+                    ))
+                }
+            }
+            Self::Cpu | Self::Neon | Self::Amx => Ok(Device::Cpu),
+        }
+    }
+}
+
+/// Honest one-line label for the device tensors actually live on.
+/// Print this at startup, not the raw CLI string.
+pub fn device_label(device: &Device) -> &'static str {
+    match device {
+        Device::Cpu => "CPU",
+        Device::Metal(_) => "Metal GPU",
+        Device::Cuda(_) => "CUDA GPU",
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareInfo {

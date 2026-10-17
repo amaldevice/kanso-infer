@@ -3,7 +3,6 @@ use parking_lot::Mutex;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use kanso_infer::DEFAULT_BACKEND;
 use kanso_infer::bench::create_engine_for_model_profile;
 use kanso_infer::chat::ChatSession;
 use kanso_infer::server::create_app;
@@ -29,9 +28,9 @@ enum Commands {
         #[arg(short, long)]
         model: String,
 
-        /// Hardware backend: cpu, metal, neon, amx
-        #[arg(long, default_value = DEFAULT_BACKEND)]
-        backend: String,
+        /// Hardware backend: cpu, metal, neon, amx (unknown values are rejected)
+        #[arg(long, default_value_t = kanso_infer::Backend::default())]
+        backend: kanso_infer::Backend,
 
         /// Maximum tokens to generate
         #[arg(long, default_value_t = 32)]
@@ -60,9 +59,9 @@ enum Commands {
         #[arg(short, long)]
         model: String,
 
-        /// Hardware backend: cpu, metal, neon, amx
-        #[arg(long, default_value = DEFAULT_BACKEND)]
-        backend: String,
+        /// Hardware backend: cpu, metal, neon, amx (unknown values are rejected)
+        #[arg(long, default_value_t = kanso_infer::Backend::default())]
+        backend: kanso_infer::Backend,
 
         /// Optional custom system prompt
         #[arg(long, default_value = "You are a helpful and concise assistant.")]
@@ -87,9 +86,9 @@ enum Commands {
         #[arg(short, long)]
         model: String,
 
-        /// Hardware backend: cpu, metal, neon, amx
-        #[arg(long, default_value = DEFAULT_BACKEND)]
-        backend: String,
+        /// Hardware backend: cpu, metal, neon, amx (unknown values are rejected)
+        #[arg(long, default_value_t = kanso_infer::Backend::default())]
+        backend: kanso_infer::Backend,
 
         /// Path to tokenizer.json (optional, auto-resolved from working directory or HF cache)
         #[arg(long)]
@@ -117,9 +116,9 @@ enum Commands {
         #[arg(long, default_value_t = 64)]
         gen_len: usize,
 
-        /// Hardware backend: cpu, metal, neon, amx
-        #[arg(long, default_value = DEFAULT_BACKEND)]
-        backend: String,
+        /// Hardware backend: cpu, metal, neon, amx (unknown values are rejected)
+        #[arg(long, default_value_t = kanso_infer::Backend::default())]
+        backend: kanso_infer::Backend,
 
         /// KV cache block size
         #[arg(long, default_value_t = 16)]
@@ -182,14 +181,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     std::process::exit(1);
                 }
             };
+            let device = backend.device()?;
             println!(
-                "Loading model from '{}' on backend '{}'...",
+                "Loading model from '{}' on backend '{}' (device: {})...",
                 resolved_path.display(),
-                backend
+                backend,
+                kanso_infer::device_label(&device)
             );
-            let mut model_instance =
-                kanso_infer::model::Model::load_gguf(&resolved_path, candle_core::Device::Cpu)?;
-            model_instance.set_backend(&backend);
+            let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, device)?;
+            model_instance.set_backend(backend);
             let total_blocks = (128 + max_tokens).div_ceil(16) * prompt.len().max(1);
             let mut engine =
                 kanso_infer::engine::Engine::new(model_instance, 8, total_blocks.max(32), 16);
@@ -287,14 +287,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     std::process::exit(1);
                 }
             };
+            let device = backend.device()?;
             println!(
-                "Loading model from '{}' on backend '{}'...",
+                "Loading model from '{}' on backend '{}' (device: {})...",
                 resolved_path.display(),
-                backend
+                backend,
+                kanso_infer::device_label(&device)
             );
-            let mut model_instance =
-                kanso_infer::model::Model::load_gguf(&resolved_path, candle_core::Device::Cpu)?;
-            model_instance.set_backend(&backend);
+            let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, device)?;
+            model_instance.set_backend(backend);
             let total_blocks = (256 + max_tokens).div_ceil(16) * 4;
             let engine =
                 kanso_infer::engine::Engine::new(model_instance, 4, total_blocks.max(64), 16);
@@ -366,14 +367,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     std::process::exit(1);
                 }
             };
+            let device = backend.device()?;
             println!(
-                "Loading model from '{}' on backend '{}'...",
+                "Loading model from '{}' on backend '{}' (device: {})...",
                 resolved_path.display(),
-                backend
+                backend,
+                kanso_infer::device_label(&device)
             );
-            let mut model_instance =
-                kanso_infer::model::Model::load_gguf(&resolved_path, candle_core::Device::Cpu)?;
-            model_instance.set_backend(&backend);
+            let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, device)?;
+            model_instance.set_backend(backend);
             let engine = kanso_infer::engine::Engine::new(model_instance, 8, 128, 16);
 
             let shared_engine = Arc::new(Mutex::new(engine));
@@ -428,7 +430,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .unwrap_or(prompt_len + gen_len);
                 let mut engine = create_engine_for_model_profile(
                     &model_type,
-                    &backend,
+                    backend,
                     trace.len(),
                     max_tokens,
                     block_size,
@@ -452,7 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let max_tokens = prompt_len + gen_len;
                     let mut engine = create_engine_for_model_profile(
                         &model_type,
-                        &backend,
+                        backend,
                         b,
                         max_tokens,
                         block_size,

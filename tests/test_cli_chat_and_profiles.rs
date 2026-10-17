@@ -54,13 +54,25 @@ fn test_chat_session_multi_turn_history() {
 
 #[test]
 fn test_bench_engine_creation_with_model_profile() {
-    let engine_smol =
-        kanso_infer::bench::create_engine_for_model_profile("smollm2", "cpu", 2, 64, 16, 4)
-            .unwrap();
+    let engine_smol = kanso_infer::bench::create_engine_for_model_profile(
+        "smollm2",
+        kanso_infer::Backend::Cpu,
+        2,
+        64,
+        16,
+        4,
+    )
+    .unwrap();
     assert_eq!(engine_smol.model.config.hidden_size, 960);
 
-    let engine_granite_h =
-        kanso_infer::bench::create_engine_for_model_profile("granite-h", "cpu", 2, 64, 16, 4)
-            .unwrap();
+    let engine_granite_h = kanso_infer::bench::create_engine_for_model_profile(
+        "granite-h",
+        kanso_infer::Backend::Cpu,
+        2,
+        64,
+        16,
+        4,
+    )
+    .unwrap();
     assert_eq!(engine_granite_h.model.config.num_attention_layers(), 4);
 }

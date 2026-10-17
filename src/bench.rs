@@ -407,7 +407,7 @@ pub fn run_synthetic_sweep(
 
 pub fn create_engine_for_model_profile(
     model_type: &str,
-    backend: &str,
+    backend: crate::hardware::Backend,
     num_requests: usize,
     max_tokens_per_seq: usize,
     block_size: usize,

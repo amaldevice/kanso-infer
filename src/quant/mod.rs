@@ -1,3 +1,10 @@
+//! Hand-rolled Q8_0/Q4_K block kernels (NEON + scalar reference).
+//!
+//! Reference/benchmark path (review F11): production quantized matmul runs off
+//! candle's `QMatMul`, not these kernels. They stay because
+//! `tests/test_neon_simd_gemv.rs` pins NEON-vs-scalar parity through them —
+//! delete that test first if these ever go.
+
 pub mod neon;
 pub mod q4_k;
 pub mod q8_0;
