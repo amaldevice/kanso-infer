@@ -75,7 +75,7 @@ pub fn gpu_rmsnorm_buffer(
         .get("rmsnorm")
         .ok_or_else(|| EngineError::Metal("Pipeline 'rmsnorm' not found in cache".into()))?;
 
-    let command_buffer = ctx.queue.new_command_buffer();
+    let command_buffer = ctx.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(pipeline);
 
@@ -154,7 +154,7 @@ pub fn gpu_rope_buffer(
         .get("rope")
         .ok_or_else(|| EngineError::Metal("Pipeline 'rope' not found in cache".into()))?;
 
-    let command_buffer = ctx.queue.new_command_buffer();
+    let command_buffer = ctx.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(pipeline);
 
@@ -230,7 +230,7 @@ pub fn gpu_silu_gate_multiply_buffer(
         .get("silu_gate")
         .ok_or_else(|| EngineError::Metal("Pipeline 'silu_gate' not found in cache".into()))?;
 
-    let command_buffer = ctx.queue.new_command_buffer();
+    let command_buffer = ctx.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(pipeline);
 
