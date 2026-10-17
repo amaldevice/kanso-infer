@@ -3,7 +3,8 @@ mod fused_metal_layer_tests {
     use kanso_infer::config::ModelConfig;
     use kanso_infer::metal::context::MetalContext;
     use kanso_infer::metal::fused_layer::{
-        FusedLayerDimensions, FusedLayerWeights, gpu_chained_pipeline_single_encoder,
+        FUSED_THREADS_PER_TG, FusedLayerDimensions, FusedLayerWeights, GEMV_ROWS_PER_THREADGROUP,
+        encode_fused_qkv_gemv, gemv_threadgroup_geometry, gpu_chained_pipeline_single_encoder,
         gpu_discrete_layer_multi_encoder, gpu_fused_layer_single_encoder, gpu_fused_rmsnorm_rope,
     };
     use kanso_infer::metal::ops::{cpu_rmsnorm, cpu_rope, gpu_rmsnorm, gpu_rope};
@@ -22,7 +23,9 @@ mod fused_metal_layer_tests {
         assert!(source.contains("fused_rmsnorm_qkv_rope_kernel"));
         assert!(source.contains("linear_gemv_kernel"));
         assert!(source.contains("threadgroup_barrier"));
-        assert!(source.contains("simdgroup_barrier"));
+        // #50 replaced the cargo-cult `simdgroup_barrier(mem_flags::mem_none)` inside a
+        // divergent branch with real SIMD reductions.
+        assert!(source.contains("simd_sum"));
 
         let ctx = MetalContext::new().expect("MetalContext initialization failed");
         assert!(ctx.pipelines.contains("fused_rmsnorm_rope"));
@@ -336,7 +339,11 @@ mod fused_metal_layer_tests {
             .expect("fused single-encoder layer execution should succeed");
 
             let check = |label: &str, fused: &[f32], discrete: &[f32]| {
-                assert_eq!(fused.len(), discrete.len(), "{label} len at hidden {hidden_dim}");
+                assert_eq!(
+                    fused.len(),
+                    discrete.len(),
+                    "{label} len at hidden {hidden_dim}"
+                );
                 for (i, (f, d)) in fused.iter().zip(discrete.iter()).enumerate() {
                     let tol = 1e-4 * (1.0 + d.abs());
                     assert!(
@@ -420,6 +427,16 @@ mod fused_metal_layer_tests {
         );
 
         // Weight slices must match the declared dims; the GPU indexes them blindly.
+        let mut short_q = weights_for(&base);
+        short_q.w_q.pop();
+        assert!(
+            gpu_fused_layer_single_encoder(
+                &ctx, &hidden_in, &short_q, &base, &cos_table, &sin_table, pos, eps
+            )
+            .is_err(),
+            "a w_q shorter than q_dim * hidden_dim must be rejected (out-of-bounds GPU read)"
+        );
+
         let mut oversized_q = weights_for(&base);
         oversized_q.w_q.push(0.0);
         assert!(
@@ -492,9 +509,34 @@ mod fused_metal_layer_tests {
         );
     }
 
-    /// Ticket #50 acceptance: measure the weight-streaming bandwidth the fused QKV GEMV
-    /// achieves (the >= 60% of device peak claim needs Instruments; this prints the
-    /// in-process number and guards against a catastrophic regression).
+    /// Ticket #50: the projection must be spread over many threadgroups, not the single
+    /// one the old dispatch used (host-side arithmetic of the grid actually dispatched).
+    #[test]
+    fn test_fused_gemv_dispatch_geometry_is_multi_threadgroup() {
+        for out_dim in [320usize, 960, 1024, 2048, 4096] {
+            let (threadgroups, width) = gemv_threadgroup_geometry(out_dim);
+            assert_eq!(width, FUSED_THREADS_PER_TG as u64);
+            assert!(
+                threadgroups > 1,
+                "out_dim {out_dim} must be partitioned over several threadgroups"
+            );
+            let covered = threadgroups * GEMV_ROWS_PER_THREADGROUP as u64;
+            assert!(
+                covered >= out_dim as u64,
+                "out_dim {out_dim}: {threadgroups} threadgroups only cover {covered} rows"
+            );
+            assert!(
+                covered - (GEMV_ROWS_PER_THREADGROUP as u64) < out_dim as u64,
+                "out_dim {out_dim}: {threadgroups} threadgroups overshoot the grid"
+            );
+        }
+    }
+
+    /// Ticket #50 acceptance: weight-streaming bandwidth of the fused QKV GEMV.
+    /// Weights are uploaded once and many iterations are chained into a single command
+    /// buffer, so the number reflects kernel throughput rather than the per-call buffer
+    /// upload the host still does (that is #49). The >= 60% of device peak claim itself
+    /// needs Instruments on the target Mac.
     #[test]
     fn test_fused_qkv_gemv_bandwidth_960_2048() {
         let ctx = MetalContext::new().expect("MetalContext initialization failed");
@@ -511,46 +553,120 @@ mod fused_metal_layer_tests {
             let pos = 1usize;
             let eps = 1e-5f32;
             let half_dim = head_dim / 2;
+            let q_dim = dims.q_dim();
+            let kv_dim = dims.kv_dim();
 
-            let weights = FusedLayerWeights {
-                norm_weight: vec![1.0f32; hidden_dim],
-                w_q: vec![0.01f32; dims.q_dim() * hidden_dim],
-                w_k: vec![0.01f32; dims.kv_dim() * hidden_dim],
-                w_v: vec![0.01f32; dims.kv_dim() * hidden_dim],
-            };
-            let hidden_in = vec![0.5f32; hidden_dim];
-            let cos_table = vec![1.0f32; (pos + 1) * half_dim];
-            let sin_table = vec![0.0f32; (pos + 1) * half_dim];
+            let in_buf = ctx.alloc_buffer_with_data(&vec![0.5f32; hidden_dim]);
+            let norm_w_buf = ctx.alloc_buffer_with_data(&vec![1.0f32; hidden_dim]);
+            let w_q_buf = ctx.alloc_buffer_with_data(&vec![0.01f32; q_dim * hidden_dim]);
+            let w_k_buf = ctx.alloc_buffer_with_data(&vec![0.01f32; kv_dim * hidden_dim]);
+            let w_v_buf = ctx.alloc_buffer_with_data(&vec![0.01f32; kv_dim * hidden_dim]);
+            let cos_buf = ctx.alloc_buffer_with_data(&vec![1.0f32; (pos + 1) * half_dim]);
+            let sin_buf = ctx.alloc_buffer_with_data(&vec![0.0f32; (pos + 1) * half_dim]);
+            let q_out_buf = ctx.alloc_buffer::<f32>(q_dim);
+            let k_out_buf = ctx.alloc_buffer::<f32>(kv_dim);
+            let v_out_buf = ctx.alloc_buffer::<f32>(kv_dim);
 
-            let weight_bytes = (weights.w_q.len() + weights.w_k.len() + weights.w_v.len()) * 4;
+            let pipeline = ctx
+                .pipelines
+                .get("fused_rmsnorm_qkv_rope")
+                .expect("pipeline 'fused_rmsnorm_qkv_rope' missing");
 
-            // Warmup (pipeline / buffer allocation excluded from the measurement).
-            let _ = gpu_fused_layer_single_encoder(
-                &ctx, &hidden_in, &weights, &dims, &cos_table, &sin_table, pos, eps,
-            )
-            .unwrap();
+            let weight_bytes =
+                ((q_dim + 2 * kv_dim) * hidden_dim * std::mem::size_of::<f32>()) as f64;
+            let iters: u64 = 50;
 
-            let iters = 50;
-            let t0 = Instant::now();
-            for _ in 0..iters {
+            // Warmup outside the measurement.
+            for _ in 0..3 {
                 let _ = gpu_fused_layer_single_encoder(
-                    &ctx, &hidden_in, &weights, &dims, &cos_table, &sin_table, pos, eps,
+                    &ctx,
+                    &vec![0.5f32; hidden_dim],
+                    &FusedLayerWeights {
+                        norm_weight: vec![1.0f32; hidden_dim],
+                        w_q: vec![0.01f32; q_dim * hidden_dim],
+                        w_k: vec![0.01f32; kv_dim * hidden_dim],
+                        w_v: vec![0.01f32; kv_dim * hidden_dim],
+                    },
+                    &dims,
+                    &vec![1.0f32; (pos + 1) * half_dim],
+                    &vec![0.0f32; (pos + 1) * half_dim],
+                    pos,
+                    eps,
                 )
                 .unwrap();
             }
+
+            let command_buffer = ctx.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            for _ in 0..iters {
+                encode_fused_qkv_gemv(
+                    encoder,
+                    pipeline,
+                    &in_buf,
+                    &norm_w_buf,
+                    &w_q_buf,
+                    &cos_buf,
+                    &sin_buf,
+                    &q_out_buf,
+                    &dims,
+                    q_dim,
+                    pos,
+                    eps,
+                    true,
+                );
+                encode_fused_qkv_gemv(
+                    encoder,
+                    pipeline,
+                    &in_buf,
+                    &norm_w_buf,
+                    &w_k_buf,
+                    &cos_buf,
+                    &sin_buf,
+                    &k_out_buf,
+                    &dims,
+                    kv_dim,
+                    pos,
+                    eps,
+                    true,
+                );
+                encode_fused_qkv_gemv(
+                    encoder,
+                    pipeline,
+                    &in_buf,
+                    &norm_w_buf,
+                    &w_v_buf,
+                    &cos_buf,
+                    &sin_buf,
+                    &v_out_buf,
+                    &dims,
+                    kv_dim,
+                    pos,
+                    eps,
+                    false,
+                );
+                // Serialise iterations: without this Metal may overlap them and the
+                // measured rate would not be a sustained weight-streaming rate.
+                let written: [&metal::ResourceRef; 3] = [&q_out_buf, &k_out_buf, &v_out_buf];
+                encoder.memory_barrier_with_resources(&written);
+            }
+            encoder.end_encoding();
+
+            let t0 = Instant::now();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
             let elapsed = t0.elapsed();
-            let gbps = (weight_bytes as f64 * iters as f64)
-                / elapsed.as_secs_f64()
-                / 1e9;
+
+            let gbps = weight_bytes * iters as f64 / elapsed.as_secs_f64() / 1e9;
             println!(
-                "Fused QKV GEMV hidden_dim={hidden_dim}: {:.1} GB/s weight streaming over {iters} iters ({:?}, {:.2} MB of weights)",
+                "Fused QKV GEMV hidden_dim={hidden_dim}: {:.1} GB/s weight streaming \
+                 ({:.2} MB of weights x {iters} iters in {elapsed:?})",
                 gbps,
-                elapsed,
-                weight_bytes as f64 / 1e6
+                weight_bytes / 1e6
             );
             assert!(
-                gbps > 1.0,
-                "hidden_dim={hidden_dim}: fused QKV GEMV only reached {gbps:.1} GB/s"
+                gbps > 20.0,
+                "hidden_dim={hidden_dim}: fused QKV GEMV only streamed {gbps:.1} GB/s, \
+                 the multi-threadgroup GEMV should be far above this"
             );
         }
     }
