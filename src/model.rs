@@ -12,6 +12,10 @@ pub struct Model {
     pub device: Device,
     pub backend: crate::hardware::Backend,
     pub hybrid_pipeline: Option<crate::ane::HybridExecutionPipeline>,
+    /// #45: batched forward passes issued so far. One per engine step is the whole
+    /// point of continuous batching — a per-sequence loop shows up here as a count
+    /// that grows with the batch size.
+    forward_calls: std::sync::atomic::AtomicU64,
 }
 
 /// Fixed seed for mock-model weights so tests are reproducible.
@@ -54,7 +58,13 @@ impl Model {
             device,
             backend: crate::hardware::Backend::default(),
             hybrid_pipeline: None,
+            forward_calls: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Batched forward passes issued so far (#45 acceptance hook).
+    pub fn forward_calls(&self) -> u64 {
+        self.forward_calls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Loads a model directly from a real GGUF file.
