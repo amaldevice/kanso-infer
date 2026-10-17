@@ -97,6 +97,70 @@ impl KvStorage {
         Ok(())
     }
 
+    /// Writes a whole batch of tokens' K and V in one scatter each (#45).
+    ///
+    /// `slots[i] = block * block_size + offset` is where token `i` goes; `k`/`v` are
+    /// `[T, n_kv_heads, head_dim]`. Same result as `T` calls to [`Self::write_kv_token`],
+    /// but two tensor ops per layer instead of roughly eight per token — which is what
+    /// a decode batch pays for otherwise.
+    pub fn write_kv_slots(
+        &mut self,
+        layer: usize,
+        slots: &[usize],
+        k: &Tensor,
+        v: &Tensor,
+    ) -> Result<(), EngineError> {
+        if layer >= self.num_layers {
+            return Err(EngineError::Model(format!(
+                "Layer index {} out of bounds ({})",
+                layer, self.num_layers
+            )));
+        }
+        let num_slots = self.num_blocks * self.block_size;
+        if slots.iter().any(|&slot| slot >= num_slots) {
+            return Err(EngineError::Model(format!(
+                "Slot out of bounds for {} blocks of size {}",
+                self.num_blocks, self.block_size
+            )));
+        }
+        if k.dims() != [slots.len(), self.n_kv_heads, self.head_dim]
+            || v.dims() != [slots.len(), self.n_kv_heads, self.head_dim]
+        {
+            return Err(EngineError::Model(format!(
+                "write_kv_slots: expected [{}, {}, {}] K/V, got {:?} / {:?}",
+                slots.len(),
+                self.n_kv_heads,
+                self.head_dim,
+                k.dims(),
+                v.dims()
+            )));
+        }
+
+        // candle's `scatter_set` is element-wise (indexes must have the source's
+        // shape), so each token's slot id is repeated across its head/dim row — a few
+        // KB of host work per layer against one scatter op per K and per V.
+        let repeats = self.n_kv_heads * self.head_dim;
+        let mut slot_ids: Vec<u32> = Vec::with_capacity(slots.len() * repeats);
+        for &slot in slots {
+            let end = slot_ids.len() + repeats;
+            slot_ids.resize(end, slot as u32);
+        }
+        let slot_ids = Tensor::from_vec(
+            slot_ids,
+            (slots.len(), self.n_kv_heads, self.head_dim),
+            k.device(),
+        )?;
+        let cache_shape = (num_slots, self.n_kv_heads, self.head_dim);
+
+        self.kv_k[layer]
+            .reshape(cache_shape)?
+            .scatter_set(&slot_ids, k, 0)?;
+        self.kv_v[layer]
+            .reshape(cache_shape)?
+            .scatter_set(&slot_ids, v, 0)?;
+        Ok(())
+    }
+
     /// Reads back token K and V stored at physical block and offset.
     pub fn read_kv_token(
         &self,
