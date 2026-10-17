@@ -242,4 +242,37 @@ impl KvStorage {
     ) -> Result<(Tensor, Tensor), EngineError> {
         self.gather_blocks(layer, block_table.blocks(), block_table.num_tokens())
     }
+
+    /// First physical block of `blocks` when the table's used blocks are one consecutive
+    /// run of the pool, `None` when the table is fragmented (ticket #48).
+    fn contiguous_run(&self, blocks: &[usize], num_tokens: usize) -> Option<usize> {
+        let needed = num_tokens.div_ceil(self.block_size).min(blocks.len());
+        let first = *blocks.first()?;
+        (0..needed).all(|i| blocks[i] == first + i).then_some(first)
+    }
+
+    /// Decode-path read: K/V for `num_tokens` tokens of `layer` as `[num_tokens,
+    /// n_kv_heads, head_dim]`, straight out of the block pool.
+    ///
+    /// A consecutive table (the pool hands out the lowest free block, so a growing
+    /// sequence stays contiguous) is a zero-copy *view* of the pool storage — the whole
+    /// history is never materialized per layer. Fragmented tables (prefix-cache reuse,
+    /// speculation rollback) fall back to one `gather_blocks` copy.
+    pub fn paged_kv_tokens(
+        &self,
+        layer: usize,
+        blocks: &[usize],
+        num_tokens: usize,
+    ) -> Result<(Tensor, Tensor), EngineError> {
+        match self.contiguous_run(blocks, num_tokens) {
+            Some(first) => {
+                let start = first * self.block_size;
+                let view = |pool: &Tensor| -> Result<Tensor, EngineError> {
+                    Ok(pool.flatten(0, 1)?.narrow(0, start, num_tokens)?)
+                };
+                Ok((view(&self.kv_k[layer])?, view(&self.kv_v[layer])?))
+            }
+            None => self.gather_blocks(layer, blocks, num_tokens),
+        }
+    }
 }

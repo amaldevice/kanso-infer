@@ -147,6 +147,115 @@ pub fn amx_gemm_b_trans(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &
     }
 }
 
+/// C = A * B^T where A is [M, K] with row stride `lda` and B is a contiguous [N, K]
+/// block (ticket #48: the paged KV pool hands A rows `n_kv_heads * head_dim` apart).
+#[allow(clippy::too_many_arguments)]
+pub fn amx_gemm_a_strided_b_trans(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    lda: usize,
+    b: &[f32],
+    c: &mut [f32],
+) {
+    assert!(
+        a.len() >= m.saturating_sub(1) * lda + k,
+        "A buffer too small"
+    );
+    assert!(b.len() >= n * k, "B buffer too small");
+    assert!(c.len() >= m * n, "C buffer too small");
+
+    #[cfg(target_os = "macos")]
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_TRANS,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            lda as i32,
+            b.as_ptr(),
+            k as i32,
+            0.0,
+            c.as_mut_ptr(),
+            n as i32,
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        for i in 0..m {
+            let a_row = &a[i * lda..i * lda + k];
+            for j in 0..n {
+                let b_row = &b[j * k..(j + 1) * k];
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a_row[p] * b_row[p];
+                }
+                c[i * n + j] = sum;
+            }
+        }
+    }
+}
+
+/// C = A * B where A is a contiguous [M, K] block and B is [K, N] with row stride `ldb`
+/// (ticket #48: the paged KV pool hands B rows `n_kv_heads * head_dim` apart).
+#[allow(clippy::too_many_arguments)]
+pub fn amx_gemm_b_strided(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[f32],
+    ldb: usize,
+    c: &mut [f32],
+) {
+    assert!(a.len() >= m * k, "A buffer too small");
+    assert!(
+        b.len() >= k.saturating_sub(1) * ldb + n,
+        "B buffer too small"
+    );
+    assert!(c.len() >= m * n, "C buffer too small");
+
+    #[cfg(target_os = "macos")]
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_NO_TRANS,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            k as i32,
+            b.as_ptr(),
+            ldb as i32,
+            0.0,
+            c.as_mut_ptr(),
+            n as i32,
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a_row[p] * b[p * ldb + j];
+                }
+                c[i * n + j] = sum;
+            }
+        }
+    }
+}
+
 /// Matrix-vector multiplication: y = A * x
 /// A is [M, K], x is [K], y is [M] in row-major layout.
 pub fn amx_gemv(m: usize, k: usize, a: &[f32], x: &[f32], y: &mut [f32]) {
@@ -354,6 +463,122 @@ fn gemm_3d_in_place(
         }
     }
     Some(Tensor::from_vec(c, (batch, m, n), &Device::Cpu).map_err(EngineError::from))
+}
+
+/// Paged decode attention for one token (ticket #48): `out[h] = softmax(q[h] K[h]^T *
+/// scale) V[h]` over the context, with `q` a contiguous `[n_kv_heads, m, head_dim]`
+/// tensor (`m` = GQA group size for decode) and `k`/`v` the `[ctx, n_kv_heads,
+/// head_dim]` pool views — or the fragmented gather, which shares their strides. Pool
+/// rows go straight into Accelerate with their own leading dimension, so the history
+/// is never copied; only the `[n_kv_heads, m, head_dim]` output and two
+/// `[ctx, m]`-sized scratch buffers are allocated.
+///
+/// Returns `None` for non-CPU-F32 or unexpected layouts; the caller falls back to the
+/// generic attention path.
+#[allow(clippy::too_many_lines)]
+pub fn amx_paged_decode_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+) -> Option<Result<Tensor, EngineError>> {
+    let (kv_heads, m, head_dim) = q.dims3().ok()?;
+    let (ctx, kv_k, hd_k) = k.dims3().ok()?;
+    let (ctx_v, kv_v, hd_v) = v.dims3().ok()?;
+    if kv_k != kv_heads || kv_v != kv_heads || hd_k != head_dim || hd_v != head_dim {
+        return None;
+    }
+    if ctx_v != ctx || ctx == 0 || m == 0 || kv_heads == 0 {
+        return None;
+    }
+    if q.dtype() != DType::F32 || k.dtype() != DType::F32 || v.dtype() != DType::F32 {
+        return None;
+    }
+    if !matches!(q.device(), Device::Cpu)
+        || !matches!(k.device(), Device::Cpu)
+        || !matches!(v.device(), Device::Cpu)
+    {
+        return None;
+    }
+
+    let (q_guard, q_layout) = q.storage_and_layout();
+    let (k_guard, k_layout) = k.storage_and_layout();
+    let (v_guard, v_layout) = v.storage_and_layout();
+    let Storage::Cpu(q_storage) = &*q_guard else {
+        return None;
+    };
+    let Storage::Cpu(k_storage) = &*k_guard else {
+        return None;
+    };
+    let Storage::Cpu(v_storage) = &*v_guard else {
+        return None;
+    };
+    let q_data = q_storage.as_slice::<f32>().ok()?;
+    let k_data = k_storage.as_slice::<f32>().ok()?;
+    let v_data = v_storage.as_slice::<f32>().ok()?;
+
+    if !q_layout.is_contiguous() {
+        return None;
+    }
+    // `[ctx, n_kv_heads, head_dim]` with heads interleaved per token — the pool view
+    // and the contiguous fragmented gather share these strides.
+    let pool_stride = [kv_heads * head_dim, head_dim, 1];
+    if k_layout.stride() != pool_stride || v_layout.stride() != pool_stride {
+        return None;
+    }
+
+    let q_start = q_layout.start_offset();
+    let k_start = k_layout.start_offset();
+    let v_start = v_layout.start_offset();
+    let q_end = q_start.checked_add(kv_heads * m * head_dim)?;
+    let kv_end = ctx.checked_mul(kv_heads)?.checked_mul(head_dim)?;
+    if q_end > q_data.len()
+        || k_start.checked_add(kv_end)? > k_data.len()
+        || v_start.checked_add(kv_end)? > v_data.len()
+    {
+        return None;
+    }
+
+    let row_stride = kv_heads * head_dim;
+    let mut out = vec![0.0f32; kv_heads * m * head_dim];
+    let mut scores_t = vec![0.0f32; ctx * m];
+    let mut probs = vec![0.0f32; m * ctx];
+    for h in 0..kv_heads {
+        let q_h = &q_data[q_start + h * m * head_dim..q_start + (h + 1) * m * head_dim];
+        let k_h = &k_data[k_start + h * head_dim..];
+        let v_h = &v_data[v_start + h * head_dim..];
+        let out_h = &mut out[h * m * head_dim..(h + 1) * m * head_dim];
+
+        // scores^T [ctx, m] = K_h [ctx, hd] x Q_h^T [hd, m]
+        amx_gemm_a_strided_b_trans(ctx, m, head_dim, k_h, row_stride, q_h, &mut scores_t);
+
+        // Scale + softmax over the ctx axis, one column per query row; the probabilities
+        // land in `probs` as a contiguous [m, ctx] block for the GEMV below.
+        for g in 0..m {
+            let mut max = f32::NEG_INFINITY;
+            for t in 0..ctx {
+                let s = scores_t[t * m + g] * scale;
+                scores_t[t * m + g] = s;
+                if s > max {
+                    max = s;
+                }
+            }
+            let mut sum = 0.0f32;
+            for t in 0..ctx {
+                let e = (scores_t[t * m + g] - max).exp();
+                scores_t[t * m + g] = e;
+                sum += e;
+            }
+            let inv = 1.0 / sum;
+            for t in 0..ctx {
+                probs[g * ctx + t] = scores_t[t * m + g] * inv;
+            }
+        }
+
+        // out_h [m, hd] = P [m, ctx] x V_h [ctx, hd]
+        amx_gemm_b_strided(m, head_dim, ctx, &probs, v_h, row_stride, out_h);
+    }
+    Some(Tensor::from_vec(out, (kv_heads, m, head_dim), &Device::Cpu).map_err(EngineError::from))
 }
 
 /// AMX-accelerated matrix multiplication for Candle Tensors.

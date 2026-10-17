@@ -1,11 +1,23 @@
 use crate::config::{ModelArchitecture, ModelConfig};
 use crate::engine::ScratchpadWorkspace;
 use crate::error::EngineError;
+use crate::hardware::Backend;
 use crate::kv_cache::{BlockTable, KvStorage};
 use crate::weights::{LayerWeights, LinearWeight, ModelWeights};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::cell::RefCell;
+
+/// Precomputed RoPE rows for positions `0..len` (ticket #48): decode indexes this
+/// instead of rebuilding the theta vector, the angle matmul and both cos/sin tensors
+/// on every step. Column count is `head_dim / 2`.
+struct RopeTable {
+    len: usize,
+    cos: Tensor,
+    sin: Tensor,
+}
+
 pub struct Model {
     pub weights: ModelWeights,
     pub config: ModelConfig,
@@ -16,6 +28,9 @@ pub struct Model {
     /// point of continuous batching — a per-sequence loop shows up here as a count
     /// that grows with the batch size.
     forward_calls: std::sync::atomic::AtomicU64,
+    /// Grown on demand, dropped by [`Model::to_device`] because its rows live on the
+    /// device the model was built for.
+    rope_table: RefCell<Option<RopeTable>>,
 }
 
 /// Fixed seed for mock-model weights so tests are reproducible.
@@ -59,6 +74,7 @@ impl Model {
             backend: crate::hardware::Backend::default(),
             hybrid_pipeline: None,
             forward_calls: std::sync::atomic::AtomicU64::new(0),
+            rope_table: RefCell::new(None),
         }
     }
 
@@ -94,6 +110,7 @@ impl Model {
         // Quantized blocks are rebuilt on the target device, not expanded to F32.
         self.weights = self.weights.to_device(device)?;
         self.device = device.clone();
+        self.rope_table.borrow_mut().take();
         Ok(())
     }
 
@@ -177,7 +194,16 @@ impl Model {
             // transposed) operands; double-transposed views like
             // `transpose(0,1).t()` from the GQA path are rejected, so
             // normalize first. No-op copy when already contiguous.
-            Ok(a.contiguous()?.matmul(&b.contiguous()?)?)
+            //
+            // Only the MLX GEMM needs this: CPU-resident tensors go to candle's
+            // CPU matmul, which streams a strided operand without copying it, and
+            // forcing contiguity there would copy the whole attention history per
+            // layer per token (ticket #48).
+            if a.device().is_metal() {
+                Ok(a.contiguous()?.matmul(&b.contiguous()?)?)
+            } else {
+                Ok(a.matmul(b)?)
+            }
         } else {
             Ok(a.matmul(b)?)
         }
@@ -331,8 +357,40 @@ impl Model {
         Ok(normalized.broadcast_mul(weight)?)
     }
 
+    /// RoPE cos/sin for `positions`, read out of a table computed once per position
+    /// range (ticket #48) instead of rebuilding theta, the angle matmul and both
+    /// cos/sin tensors on every decode step.
+    ///
+    /// The table grows in 1024-row steps and is dropped by [`Model::to_device`], so it
+    /// never outlives its device.
     pub fn rope_cos_sin(&self, positions: &[usize]) -> Result<(Tensor, Tensor), EngineError> {
         let head_dim = self.config.head_dim();
+        let max_pos = positions.iter().copied().max().unwrap_or(0);
+
+        {
+            let mut table = self.rope_table.borrow_mut();
+            if table.as_ref().is_none_or(|t| t.len <= max_pos) {
+                let len = (max_pos + 1).next_multiple_of(1024);
+                *table = Some(self.build_rope_table(len, head_dim)?);
+            }
+        }
+
+        let index = Tensor::from_vec(
+            positions.iter().map(|&p| p as u32).collect::<Vec<u32>>(),
+            (positions.len(),),
+            &self.device,
+        )?;
+        let table = self.rope_table.borrow();
+        let table = table.as_ref().expect("rope table built above");
+        Ok((
+            table.cos.index_select(&index, 0)?,
+            table.sin.index_select(&index, 0)?,
+        ))
+    }
+
+    /// Fills `[len, head_dim / 2]` cos/sin rows with the same math the per-step path
+    /// used, so results are unchanged row for row.
+    fn build_rope_table(&self, len: usize, head_dim: usize) -> Result<RopeTable, EngineError> {
         let half = head_dim / 2;
         let theta: Vec<f32> = (0..half)
             .map(|j| {
@@ -343,11 +401,15 @@ impl Model {
             .collect();
         let theta = Tensor::from_vec(theta, (1, half), &self.device)?;
 
-        let positions_f: Vec<f32> = positions.iter().map(|&p| p as f32).collect();
-        let positions = Tensor::from_vec(positions_f, (positions.len(), 1), &self.device)?;
+        let positions: Vec<f32> = (0..len).map(|p| p as f32).collect();
+        let positions = Tensor::from_vec(positions, (len, 1), &self.device)?;
 
         let angles = positions.matmul(&theta)?;
-        Ok((angles.cos()?, angles.sin()?))
+        Ok(RopeTable {
+            len,
+            cos: angles.cos()?,
+            sin: angles.sin()?,
+        })
     }
 
     pub fn rope_apply(
@@ -400,6 +462,45 @@ impl Model {
 
         // Reshape back to [n_heads, q_len, head_dim]
         Ok(attn_out.reshape((n_heads, q_len, head_dim))?)
+    }
+
+    /// Single-token decode attention over the K/V pool read (ticket #48).
+    ///
+    /// `k`/`v` are `[ctx, n_kv_heads, head_dim]` — pool views when the block table is
+    /// one consecutive run, the fragmented gather otherwise. The AMX backend feeds those
+    /// rows straight into Accelerate with the pool's own row stride, so the history is
+    /// never copied; every other backend runs the same math through `gqa_attention`
+    /// (candle's CPU and metal matmul stream the strided operand without re-copying it).
+    /// Returns `[n_heads, 1, head_dim]`.
+    fn decode_attention_paged(
+        &self,
+        q: &Tensor, // [n_heads, 1, head_dim]
+        k: &Tensor, // [ctx, n_kv_heads, head_dim]
+        v: &Tensor, // [ctx, n_kv_heads, head_dim]
+    ) -> Result<Tensor, EngineError> {
+        if matches!(self.backend, Backend::Amx) {
+            let (n_heads, q_len, head_dim) = q.dims3()?;
+            let (_, n_kv_heads, _) = k.dims3()?;
+            let group_size = n_heads / n_kv_heads;
+            let q_folded = q
+                .contiguous()?
+                .reshape((n_kv_heads, group_size * q_len, head_dim))?;
+            let scale = 1.0 / (head_dim as f64).sqrt();
+            if let Some(out) =
+                crate::accelerate::amx::amx_paged_decode_attention(&q_folded, k, v, scale as f32)
+            {
+                // [n_kv_heads, group * q_len, head_dim] -> [n_heads, q_len, head_dim]
+                return Ok(out?.reshape((n_heads, q_len, head_dim))?);
+            }
+            // Unusable layout: one contiguous copy, then the generic path.
+            let (k_all, v_all) = (
+                k.transpose(0, 1)?.contiguous()?,
+                v.transpose(0, 1)?.contiguous()?,
+            );
+            return self.gqa_attention(q, &k_all, &v_all, None);
+        }
+        let (k_all, v_all) = (k.transpose(0, 1)?, v.transpose(0, 1)?);
+        self.gqa_attention(q, &k_all, &v_all, None)
     }
 
     pub fn forward_tokens(&self, tokens: &[u32]) -> Result<Tensor, EngineError> {
@@ -651,18 +752,17 @@ impl Model {
             // Write roped token K, V directly into physical block in KvStorage
             kv_storage.write_kv_token(layer_idx, physical_block, offset, &k_token, &v_token)?;
 
-            // Gather context directly from physical memory blocks mapped in block table
-            let (k_all, v_all) = kv_storage.gather_blocks(
+            // #48: attention reads the history straight out of the block pool through the
+            // block table — a view of the pool storage when the table is one consecutive
+            // run — instead of re-gathering the whole history into a fresh tensor per
+            // layer per token.
+            let (k_tokens, v_tokens) = kv_storage.paged_kv_tokens(
                 layer_idx,
                 &block_table.blocks()[..=block_idx],
                 pos + 1,
             )?;
 
-            // Reshape for attention: [num_kv_heads, pos + 1, head_dim]
-            let k_all = k_all.transpose(0, 1)?;
-            let v_all = v_all.transpose(0, 1)?;
-
-            let attn_out = self.gqa_attention(&q, &k_all, &v_all, None)?;
+            let attn_out = self.decode_attention_paged(&q, &k_tokens, &v_tokens)?;
             // Merge heads back: [1, hidden_size]
             let attn_out = attn_out
                 .transpose(0, 1)?
@@ -695,39 +795,6 @@ impl Model {
         }
 
         Ok(logits)
-    }
-
-    pub fn prefill_prompt(
-        &self,
-        prompt_tokens: &[u32],
-        block_table: &BlockTable,
-        kv_storage: &mut KvStorage,
-    ) -> Result<Tensor, EngineError> {
-        self.prefill_prompt_with_workspace(prompt_tokens, block_table, kv_storage, None)
-    }
-
-    pub fn prefill_prompt_with_workspace(
-        &self,
-        prompt_tokens: &[u32],
-        block_table: &BlockTable,
-        kv_storage: &mut KvStorage,
-        mut workspace: Option<&mut ScratchpadWorkspace>,
-    ) -> Result<Tensor, EngineError> {
-        if prompt_tokens.is_empty() {
-            return Err(EngineError::Model("Empty input tokens".to_string()));
-        }
-        let mut last_logits = None;
-        for (pos, &token) in prompt_tokens.iter().enumerate() {
-            let logits = self.forward_decode_step_with_workspace(
-                token,
-                pos,
-                block_table,
-                kv_storage,
-                workspace.as_deref_mut(),
-            )?;
-            last_logits = Some(logits);
-        }
-        Ok(last_logits.unwrap())
     }
 
     pub fn forward_verify_tokens(
