@@ -1,5 +1,5 @@
 use clap::Parser;
-use kanso_infer::DEFAULT_BACKEND;
+use kanso_infer::Backend;
 use kanso_infer::bench::{
     BenchmarkReport, parse_trace_file, run_synthetic_benchmark, run_trace_benchmark,
 };
@@ -32,9 +32,9 @@ pub struct Args {
     #[arg(long, default_value_t = 64)]
     pub gen_len: usize,
 
-    /// Execution backend: "cpu", "metal", "neon", or "amx"
-    #[arg(long, default_value = DEFAULT_BACKEND)]
-    pub backend: String,
+    /// Execution backend: "cpu", "metal", "neon", or "amx" (unknown values are rejected)
+    #[arg(long, default_value_t = Backend::default())]
+    pub backend: Backend,
 
     /// KV cache block size
     #[arg(long, default_value_t = 16)]
@@ -64,7 +64,7 @@ pub struct Args {
     pub json_output: Option<String>,
 }
 
-fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
+fn print_report(label: &str, report: &BenchmarkReport, backend: Backend) {
     let peak_rss_mb = kanso_infer::hardware::get_peak_rss_mb();
     let thermal = kanso_infer::hardware::get_thermal_state();
 
@@ -109,13 +109,19 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: &str) {
 
 fn create_engine_for_workload(
     model_path: &std::path::Path,
-    backend: &str,
+    backend: Backend,
     num_requests: usize,
     max_tokens_per_seq: usize,
     block_size: usize,
     max_running: usize,
 ) -> Result<Engine, EngineError> {
-    let device = candle_core::Device::Cpu;
+    let device = backend.device()?;
+    println!(
+        "Loading model from '{}' on backend '{}' (device: {})...",
+        model_path.display(),
+        backend,
+        kanso_infer::device_label(&device)
+    );
     let mut model = Model::load_gguf(model_path, device)?;
     model.set_backend(backend);
 
@@ -200,7 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let mut engine = create_engine_for_workload(
             &model_path,
-            &args.backend,
+            args.backend,
             trace.len(),
             max_tokens,
             args.block_size,
@@ -208,7 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )?;
 
         let report = run_trace_benchmark(&mut engine, &trace, warmup)?;
-        print_report("trace_replay", &report, &args.backend);
+        print_report("trace_replay", &report, args.backend);
         if let Some(json_path) = &args.json_output {
             let json_content = serde_json::to_string_pretty(&report)?;
             std::fs::write(json_path, json_content)?;
@@ -233,7 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let max_tokens = args.prompt_len + args.gen_len;
         let mut engine = create_engine_for_workload(
             &model_path,
-            &args.backend,
+            args.backend,
             batch_size,
             max_tokens,
             args.block_size,
@@ -249,7 +255,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )?;
 
         let label = format!("batch_size={batch_size}");
-        print_report(&label, &report, &args.backend);
+        print_report(&label, &report, args.backend);
         reports.push(report);
     }
 

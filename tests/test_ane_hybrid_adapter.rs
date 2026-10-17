@@ -19,7 +19,7 @@ fn test_ane_layer_adapter_interface_and_dispatch() {
         layer_weights,
         hidden_size,
         intermediate_size,
-        "cpu",
+        kanso_infer::Backend::Cpu,
     );
     assert!(cpu_adapter.is_available());
     assert_eq!(cpu_adapter.backend_name(), "cpu");
@@ -42,7 +42,7 @@ fn test_ane_layer_adapter_interface_and_dispatch() {
         hidden_size,
         intermediate_size,
         layer_weights,
-        "cpu",
+        kanso_infer::Backend::Cpu,
     );
     assert_eq!(coreml_adapter.layer_index(), 0);
 
@@ -75,7 +75,7 @@ fn test_ane_adapter_fallback_mechanism() {
         hidden_size,
         intermediate_size,
         layer_weights,
-        "cpu",
+        kanso_infer::Backend::Cpu,
     );
 
     // Simulate ANE hardware unavailable
@@ -96,7 +96,7 @@ fn test_ane_adapter_fallback_mechanism() {
             hidden_size,
             intermediate_size,
             layer_weights,
-            "amx",
+            kanso_infer::Backend::Amx,
         );
         amx_fallback_adapter.set_ane_available(false);
         assert_eq!(amx_fallback_adapter.backend_name(), "amx_cpu");
@@ -124,9 +124,9 @@ fn test_hybrid_scheduling_pipeline_attention_amx_metal_mlp_ane() {
     let intermediate_size = model.config.intermediate_size;
 
     let attention_backend = if kanso_infer::accelerate::amx::has_accelerate_support() {
-        "amx"
+        kanso_infer::Backend::Amx
     } else {
-        "cpu"
+        kanso_infer::Backend::Cpu
     };
 
     let mut adapters: Vec<Box<dyn AneLayerAdapter>> = Vec::new();
@@ -173,9 +173,9 @@ fn test_model_forward_parity_hybrid_vs_monolithic() {
         Model::create_mock_tiny(32, 4, 2, 2, 100).expect("failed to create mock model");
 
     let attention_backend = if kanso_infer::accelerate::amx::has_accelerate_support() {
-        "amx"
+        kanso_infer::Backend::Amx
     } else {
-        "cpu"
+        kanso_infer::Backend::Cpu
     };
     model_monolithic.set_backend(attention_backend);
     model_hybrid.set_backend(attention_backend);
@@ -291,7 +291,13 @@ fn test_decode_step_parity_hybrid_vs_monolithic() {
 #[test]
 fn test_adapter_input_validation_errors() {
     let model = Model::create_mock_tiny(32, 4, 2, 2, 100).expect("model");
-    let adapter = CoreMlAneAdapter::new(0, 32, 64, &model.weights.layers[0], "cpu");
+    let adapter = CoreMlAneAdapter::new(
+        0,
+        32,
+        64,
+        &model.weights.layers[0],
+        kanso_infer::Backend::Cpu,
+    );
 
     // Empty input error
     assert!(adapter.forward_mlp(&[]).is_err());

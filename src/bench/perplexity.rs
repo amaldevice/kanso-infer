@@ -169,7 +169,7 @@ pub fn forward_tokens_with_quant(
                 model.config.clone(),
                 model.device.clone(),
             );
-            q_model.set_backend(model.backend());
+            q_model.set_backend(model.backend);
             for layer in &mut q_model.weights.layers {
                 layer.attn_q = quantize_tensor_q8_0(&layer.attn_q)?;
                 layer.attn_k = quantize_tensor_q8_0(&layer.attn_k)?;
@@ -187,7 +187,7 @@ pub fn forward_tokens_with_quant(
                 model.config.clone(),
                 model.device.clone(),
             );
-            q_model.set_backend(model.backend());
+            q_model.set_backend(model.backend);
             for layer in &mut q_model.weights.layers {
                 layer.attn_q = quantize_tensor_q4_k(&layer.attn_q)?;
                 layer.attn_k = quantize_tensor_q4_k(&layer.attn_k)?;
@@ -404,25 +404,30 @@ pub fn compare_backends_perplexity(
     };
 
     // 1. FP32 Baseline (CPU)
-    model.set_backend("cpu");
+    model.set_backend(crate::hardware::Backend::Cpu);
     let baseline_ppl = calculate_perplexity(&model, tokens, stride)?;
 
     // 2. Hardware Backends Evaluation
-    let backend_names = ["cpu", "amx", "neon", "metal"];
+    let backend_names = [
+        crate::hardware::Backend::Cpu,
+        crate::hardware::Backend::Amx,
+        crate::hardware::Backend::Neon,
+        crate::hardware::Backend::Metal,
+    ];
     let mut backends = Vec::new();
-    for &b_name in &backend_names {
-        model.set_backend(b_name);
+    for &b in &backend_names {
+        model.set_backend(b);
         let ppl = calculate_perplexity(&model, tokens, stride)?;
         let delta = ppl - baseline_ppl;
         backends.push(BackendPpl {
-            backend: b_name.to_string(),
+            backend: b.to_string(),
             perplexity: ppl,
             delta_vs_fp32: delta,
         });
     }
 
     // Reset backend to cpu for quantization evals
-    model.set_backend("cpu");
+    model.set_backend(crate::hardware::Backend::Cpu);
 
     // 3. Quantized Kernels Evaluation
     let quant_configs = [

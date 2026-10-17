@@ -135,8 +135,8 @@ fn test_amx_gemv_parity_against_cpu_reference() {
 #[test]
 fn test_model_forward_amx_backend_support() {
     let mut model = Model::create_mock_tiny(64, 4, 2, 2, 256).expect("model creation");
-    model.set_backend("amx");
-    assert_eq!(model.backend(), "amx");
+    model.set_backend(kanso_infer::Backend::Amx);
+    assert_eq!(model.backend(), kanso_infer::Backend::Amx);
 
     let prompt = vec![1u32, 5, 42];
     let logits_amx = model.forward_single_prompt(&prompt).expect("amx forward");
@@ -144,7 +144,7 @@ fn test_model_forward_amx_backend_support() {
 
     // Check parity with default/cpu
     let mut cpu_model = Model::create_mock_tiny(64, 4, 2, 2, 256).expect("model creation");
-    cpu_model.set_backend("cpu");
+    cpu_model.set_backend(kanso_infer::Backend::Cpu);
     let logits_cpu = cpu_model
         .forward_single_prompt(&prompt)
         .expect("cpu forward");
@@ -232,9 +232,10 @@ fn test_amx_matmul_batched_transposed_matches_candle() {
 
 #[test]
 fn test_bench_engine_creation_with_amx_backend() {
-    let engine = create_engine_for_model_profile("smollm2", "amx", 2, 64, 16, 4)
-        .expect("engine creation with amx backend");
-    assert_eq!(engine.model.backend(), "amx");
+    let engine =
+        create_engine_for_model_profile("smollm2", kanso_infer::Backend::Amx, 2, 64, 16, 4)
+            .expect("engine creation with amx backend");
+    assert_eq!(engine.model.backend(), kanso_infer::Backend::Amx);
 }
 
 #[test]
