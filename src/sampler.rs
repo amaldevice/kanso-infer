@@ -1,6 +1,7 @@
 use crate::error::EngineError;
 use candle_core::Tensor;
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 /// argmax over `logits`: the token every temperature-0 path draws.
 pub fn greedy_token(logits: &[f32]) -> u32 {
@@ -83,21 +84,38 @@ pub fn sample_from_probs(probs: &[f32], rng: &mut impl Rng) -> u32 {
     probs.iter().rposition(|&p| p > 0.0).unwrap_or(0) as u32
 }
 
-pub fn sample_token(
-    logits: &Tensor,
+/// Draws one token from a flat logits row under `temperature`/`top_p`.
+///
+/// Reproducible by construction (ticket #61 F9): the same row, knobs and `seed` always
+/// draw the same token, so a `temperature > 0` request replays exactly.
+pub fn sample_logits(
+    logits: &[f32],
     temperature: f32,
     top_p: f32,
-    _seed: u64,
+    seed: u64,
 ) -> Result<u32, EngineError> {
-    let logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
-    if logits_vec.is_empty() {
+    if logits.is_empty() {
         return Err(EngineError::Model("Empty logits".to_string()));
     }
 
     if temperature <= 0.0 {
-        return Ok(greedy_token(&logits_vec));
+        return Ok(greedy_token(logits));
     }
 
-    let probs = softmax_probs(&logits_vec, temperature, top_p)?;
-    Ok(sample_from_probs(&probs, &mut rand::rng()))
+    let probs = softmax_probs(logits, temperature, top_p)?;
+    Ok(sample_from_probs(&probs, &mut StdRng::seed_from_u64(seed)))
+}
+
+pub fn sample_token(
+    logits: &Tensor,
+    temperature: f32,
+    top_p: f32,
+    seed: u64,
+) -> Result<u32, EngineError> {
+    sample_logits(
+        &logits.flatten_all()?.to_vec1::<f32>()?,
+        temperature,
+        top_p,
+        seed,
+    )
 }

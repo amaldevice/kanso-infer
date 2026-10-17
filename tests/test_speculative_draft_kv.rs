@@ -24,6 +24,11 @@
 //!
 //! What the proxy does not cover is the real pair's acceptance; it is reported in the same
 //! run (set the two env vars) and asserted to stay out of chance level.
+//!
+//! `speculative_decode_beats_non_spec_at_ctx_512` carries a wall-clock gate (1.3x on the
+//! mock proxy), so it is `#[ignore]`d in debug builds where per-op overhead dominates the
+//! measurement (ticket #61 F5). The release-only CI job runs it; the debug run reports it as
+//! ignored rather than passing under a lowered floor.
 
 use candle_core::{DType, Device, Tensor};
 use kanso_infer::engine::Engine;
@@ -208,7 +213,16 @@ fn draft_agrees_with_target_on_the_proxy_pair() {
     }
 }
 
+/// The 1.3x ticket gate, applied where throughput is meaningful. An unoptimized `cargo test`
+/// build spends its time in per-op overhead (candle is built at opt-level 0), so its ratio
+/// is noise around break-even, not a benchmark, and the test is `#[ignore]`d there instead of
+/// being asserted against a floor a regression could slide under (ticket #61 F5): release
+/// measures 1.68x and the release-only CI job gates on it.
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only speedup gate (ticket #61 F5): run `cargo test --release`"
+)]
 fn speculative_decode_beats_non_spec_at_ctx_512() {
     let prompt: Vec<u32> = (0..PROMPT_LEN).map(|i| (i % VOCAB) as u32).collect();
 
@@ -288,9 +302,8 @@ fn speculative_decode_beats_non_spec_at_ctx_512() {
         // Identical weights + greedy speculation ⇒ byte-identical token stream.
         assert_eq!(spec_tokens, plain_tokens);
         assert!(
-            speedup > min_speedup(),
-            "speculative speedup {speedup:.2}x ≤ {}x (non-spec {:.1}ms vs spec {:.1}ms)",
-            min_speedup(),
+            speedup > MIN_SPEEDUP,
+            "speculative speedup {speedup:.2}x ≤ {MIN_SPEEDUP}x (non-spec {:.1}ms vs spec {:.1}ms)",
             plain_time.as_secs_f64() * 1e3,
             spec_time.as_secs_f64() * 1e3
         );
@@ -310,6 +323,10 @@ fn speculative_decode_beats_non_spec_at_ctx_512() {
 /// verifier in the order it proposes them. With a draft that *is* the target, `p == q`, so
 /// every proposal is accepted (min(1, p/q) = 1) and τ̄ is the full γ+1 — a misaligned or
 /// missing `draft_probs` vector would drop acceptance to chance or error out.
+///
+/// This covers the aligned case only. The `q ≠ p` case (residual branch firing, output
+/// staying on `p`) is driven through the real verifier in
+/// `test_speculative_sampling_distribution.rs` (ticket #61 F8).
 #[test]
 fn temperature_sampling_verifies_draft_distributions() {
     use kanso_infer::scheduler::SamplingParams;
@@ -345,17 +362,4 @@ fn temperature_sampling_verifies_draft_distributions() {
         Some(TOTAL_BLOCKS),
         "draft KV blocks leaked"
     );
-}
-
-/// The 1.3x ticket gate, applied where throughput is meaningful. An unoptimized `cargo test`
-/// build spends its time in per-op overhead (candle is built at opt-level 0), so its ratio
-/// (measured 0.96-1.05x here) is noise around break-even, not a benchmark; release measures
-/// 1.68x. The debug floor only has to catch the regression this ticket fixes: a draft that
-/// re-computes the whole prefix per token ran at 0.01x.
-fn min_speedup() -> f64 {
-    if cfg!(debug_assertions) {
-        0.75
-    } else {
-        MIN_SPEEDUP
-    }
 }

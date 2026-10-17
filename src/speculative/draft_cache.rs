@@ -3,6 +3,8 @@ use crate::kv_cache::{BlockPool, BlockTable, KvStorage};
 use crate::model::Model;
 use crate::sampler::{greedy_token, sample_from_probs, softmax_probs};
 use crate::scheduler::SamplingParams;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use std::collections::HashMap;
 
 /// One round of draft proposals: the tokens and, for temperature > 0, the distribution
@@ -123,13 +125,16 @@ impl DraftCache {
             })?
         };
 
+        // One seeded stream per round (ticket #61 F9), so a temperature > 0 request drafts
+        // the same proposals on every replay of the same prefix.
+        let mut rng = StdRng::seed_from_u64(sampling.seed);
         for _ in 0..gamma {
             let flat = logits.flatten_all()?.to_vec1::<f32>()?;
             let (token, probs) = if sampling.temperature <= 0.0 {
                 (greedy_token(&flat), Vec::new())
             } else {
                 let p = softmax_probs(&flat, sampling.temperature, sampling.top_p)?;
-                (sample_from_probs(&p, &mut rand::rng()), p)
+                (sample_from_probs(&p, &mut rng), p)
             };
             proposals.tokens.push(token);
             if !probs.is_empty() {

@@ -18,7 +18,7 @@ Transform `kanso-infer` into an uncompromising high-performance inference engine
 4. **ARM NEON SIMD Vector Acceleration**: Utilize AArch64 vector intrinsics (`vdotq_s32`, `vfmaq_f32`) for on-the-fly dequantization of Q8_0 and Q4_K weights in CPU registers during decode GEMV.
 5. **Token-Budget Chunked Prefill Scheduler**: Co-schedule small prompt chunks alongside decode steps under a fixed maximum token budget per iteration, eliminating TTFT spikes and ensuring steady streaming generation.
 6. **Speculative Decoding Verification Pipeline**: Implement target-draft speculative execution with verifiable KV block rollback to break past the autoregressive memory bandwidth limit on small batch sizes.
-7. **Zero-Allocation Static Workspace**: Guarantee zero heap allocations (`malloc`/`free`) during inner decode steps by reusing pre-allocated scratchpad workspaces.
+7. **Bounded-Allocation Decode Path**: Bound the *extra* bytes a decode step allocates instead of promising zero allocations: the step must not re-materialize the KV history (it reads its context as a view of the block pool, ticket #48), and the buffers it does allocate per step must stay well under a quarter of the history it reads. `tests/test_decode_allocations.rs` is the gate.
 
 ---
 
@@ -33,7 +33,7 @@ Transform `kanso-infer` into an uncompromising high-performance inference engine
 7. As an API client, I want steady Inter-Token Latency under multi-user concurrency, so that streaming responses feel smooth and uninterrupted.
 8. As a performance researcher, I want speculative decoding with draft-tree verification, so that single-request generation throughput can exceed the theoretical physical memory bandwidth limit of the model.
 9. As an inference engineer, I want the speculative decoding pipeline to support atomic KV cache rollback upon token rejection, so that invalid speculative paths never pollute the block pool.
-10. As a performance engineer, I want the inner decode loop to be completely zero-allocation, so that system allocators and page-table locks do not introduce tail latency jitter.
+10. As a performance engineer, I want the inner decode loop to reuse its buffers instead of re-materializing the KV history every step, so that per-step *extra* allocation stays bounded (well under a quarter of the history it reads) and allocator tail latency cannot dominate a token.
 11. As a systems researcher, I want an end-to-end 64-bit FNV-1a checksum verification harness, so that I can mathematically prove greedy output parity across CPU, NEON SIMD, and Metal backends.
 12. As a benchmark operator, I want automated ShareGPT trace replay capabilities, so that I can evaluate continuous batching throughput under realistic prompt/generation length distributions.
 13. As an engineer evaluating engines, I want standardized Time-to-First-Token (TTFT) and Inter-Token Latency (ITL) metrics reporting, so that I can directly compare `kanso-infer` against `rvllm` and `llama.cpp`.

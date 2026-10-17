@@ -1,5 +1,4 @@
 use candle_core::{DType, Device, Tensor};
-use kanso_infer::engine::ScratchpadWorkspace;
 use kanso_infer::kv_cache::{BlockTable, KvStorage};
 use kanso_infer::model::Model;
 
@@ -131,33 +130,6 @@ fn test_physical_kv_cache_storage_write_and_gather() {
         &v_vals[2 * head_elements..3 * head_elements],
         &vec![6.0f32; head_elements][..]
     );
-}
-
-#[test]
-fn test_scratchpad_workspace_memory_reuse() {
-    let max_batch = 4;
-    let hidden_dim = 16;
-    let intermediate_dim = 32;
-    let vocab_size = 50;
-
-    let mut workspace =
-        ScratchpadWorkspace::new(max_batch, hidden_dim, intermediate_dim, vocab_size);
-
-    assert_eq!(workspace.hidden_states.len(), max_batch * hidden_dim);
-    assert_eq!(workspace.logits.len(), max_batch * vocab_size);
-
-    let ptr_hidden = workspace.hidden_states.as_ptr();
-    let ptr_logits = workspace.logits.as_ptr();
-
-    for step in 0..10 {
-        workspace.hidden_states[0] = step as f32;
-        workspace.logits[0] = (step * 2) as f32;
-        workspace.clear();
-
-        // Memory pointer must remain identical, proving no reallocation on heap
-        assert_eq!(workspace.hidden_states.as_ptr(), ptr_hidden);
-        assert_eq!(workspace.logits.as_ptr(), ptr_logits);
-    }
 }
 
 #[test]

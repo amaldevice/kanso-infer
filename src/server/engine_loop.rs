@@ -116,10 +116,13 @@ impl EngineLoop {
 
 impl Drop for EngineLoop {
     fn drop(&mut self) {
+        // Tell the loop to stop, then let the thread go: `EngineLoop` is dropped from an
+        // async handler on a tokio worker, and joining a thread that is mid-`Engine::step`
+        // would block that worker (ticket #61 F14). The handle is detached; the loop
+        // returns as soon as it reads the Shutdown command it can already see, and the
+        // engine it owns goes with it.
         let _ = self.tx.send(Command::Shutdown);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        let _ = self.thread.take();
     }
 }
 
@@ -142,12 +145,13 @@ fn run(mut engine: Engine, max_queue: Option<usize>, rx: Receiver<Command>) {
         }
 
         while engine.has_unfinished_requests() {
+            // Retire sequences whose client hung up before stepping: the engine must not
+            // keep decoding a stream nobody reads (ticket #61 F1).
+            cancel_disconnected(&mut engine, &mut subscribers);
+
             match engine.step() {
                 Ok(outputs) => {
                     for out in outputs {
-                        // ponytail: a client that disconnects mid-stream leaves its
-                        // sequence running to `max_tokens` (`send` just fails); add
-                        // per-request cancellation when disconnects must free KV early.
                         if let Some(tx) = subscribers.get(&out.request_id) {
                             let _ = tx.send(Event::Token(out.token_id));
                             if out.is_finished {
@@ -172,6 +176,24 @@ fn run(mut engine: Engine, max_queue: Option<usize>, rx: Receiver<Command>) {
                 }
             }
         }
+    }
+}
+
+/// Retires every sequence whose subscriber dropped its receiver — a client that stopped
+/// reading ends the request, it does not buy `max_tokens` more steps of engine work
+/// (ticket #61 F1).
+fn cancel_disconnected(
+    engine: &mut Engine,
+    subscribers: &mut HashMap<u64, UnboundedSender<Event>>,
+) {
+    let disconnected: Vec<u64> = subscribers
+        .iter()
+        .filter(|(_, tx)| tx.is_closed())
+        .map(|(&id, _)| id)
+        .collect();
+    for id in disconnected {
+        subscribers.remove(&id);
+        engine.cancel_request(id);
     }
 }
 
