@@ -100,6 +100,9 @@ pub struct BenchmarkReport {
     pub itl_p99_ms: f64,
     pub prefill_tokens_per_sec: f64,
     pub decode_ms_per_step: f64,
+    /// Per-actual-token decode latency in ms (decode duration / total tokens, #62 F5).
+    #[serde(default)]
+    pub decode_ms_per_token: f64,
     pub checksum: u64,
     pub prefix_hit_rate: f64,
     /// Resident weight bytes + KV bytes for the run's sequence context, weighed
@@ -122,6 +125,16 @@ impl BenchmarkReport {
         speculative: crate::speculative::profiler::SpeculativeReport,
     ) -> Self {
         self.speculative = Some(speculative);
+        self
+    }
+
+    /// Attaches weighed bytes and measured peak hardware bandwidth to report (#62 F3).
+    #[must_use]
+    pub fn with_telemetry(mut self, bytes_read_per_step: usize) -> Self {
+        self.bytes_read_per_step = bytes_read_per_step;
+        let (peak, source) = crate::hardware::measure_peak_bandwidth_gb_s();
+        self.peak_bandwidth_gb_s = peak;
+        self.peak_bandwidth_source = source;
         self
     }
 
@@ -149,6 +162,7 @@ pub fn evaluate_run(
         0,
         0.0,
         0,
+        0,
     )
 }
 
@@ -163,6 +177,7 @@ pub fn evaluate_run_with_metrics(
     decode_steps: usize,
     decode_duration_secs: f64,
     checksum: u64,
+    bytes_read_per_step: usize,
 ) -> BenchmarkReport {
     evaluate_run_with_timings(
         total_tokens,
@@ -175,6 +190,7 @@ pub fn evaluate_run_with_metrics(
         decode_steps,
         decode_duration_secs,
         checksum,
+        bytes_read_per_step,
     )
 }
 
@@ -190,6 +206,7 @@ pub fn evaluate_run_with_timings(
     decode_steps: usize,
     decode_duration_secs: f64,
     checksum: u64,
+    bytes_read_per_step: usize,
 ) -> BenchmarkReport {
     let safe_duration = if total_duration_secs > 0.0 {
         total_duration_secs
@@ -230,6 +247,15 @@ pub fn evaluate_run_with_timings(
         (safe_duration * 1000.0) / (total_tokens.max(1) as f64)
     };
 
+    let decode_ms_per_token = if total_tokens > 0 && decode_duration_secs > 0.0 {
+        (decode_duration_secs * 1000.0) / (total_tokens as f64)
+    } else {
+        decode_ms_per_step
+    };
+
+    let (peak_bandwidth_gb_s, peak_bandwidth_source) =
+        crate::hardware::measure_peak_bandwidth_gb_s();
+
     BenchmarkReport {
         total_tokens,
         total_duration_secs,
@@ -247,11 +273,12 @@ pub fn evaluate_run_with_timings(
         itl_p99_ms,
         prefill_tokens_per_sec,
         decode_ms_per_step,
+        decode_ms_per_token,
         checksum,
         prefix_hit_rate: 0.0,
-        bytes_read_per_step: 0,
-        peak_bandwidth_gb_s: 0.0,
-        peak_bandwidth_source: String::new(),
+        bytes_read_per_step,
+        peak_bandwidth_gb_s,
+        peak_bandwidth_source,
         speculative: None,
     }
 }
@@ -347,6 +374,10 @@ fn execute_engine_run(
     let overall_elapsed = overall_start.elapsed().as_secs_f64();
     let checksum = fnv1a_64(&generated_tokens);
 
+    let total_ctx: usize = requests.iter().map(|t| t.prompt_len + t.gen_len).sum();
+    let bytes_read_per_step = engine.model.weights.storage_bytes()
+        + engine.model.config.kv_cache_bytes_per_token_f32() * total_ctx;
+
     let mut report = evaluate_run_with_timings(
         generated_tokens.len(),
         overall_elapsed,
@@ -358,20 +389,8 @@ fn execute_engine_run(
         decode_steps,
         decode_duration.as_secs_f64(),
         checksum,
+        bytes_read_per_step,
     );
-    // #53: weigh what the run actually reads per decode step — resident weight
-    // bytes (quantized blocks stay resident per #47) plus KV bytes for the
-    // sequence context — and measure the peak denominator on this machine.
-    let max_ctx = requests
-        .iter()
-        .map(|t| t.prompt_len + t.gen_len)
-        .max()
-        .unwrap_or(0);
-    report.bytes_read_per_step = engine.model.weights.storage_bytes()
-        + engine.model.config.kv_cache_bytes_per_token_f32() * max_ctx;
-    let (peak, source) = crate::hardware::measure_peak_bandwidth_gb_s();
-    report.peak_bandwidth_gb_s = peak;
-    report.peak_bandwidth_source = source;
     let delta_matched = engine.prefix_matched_tokens.saturating_sub(initial_matched);
     let delta_total = engine
         .total_prompt_tokens_admitted

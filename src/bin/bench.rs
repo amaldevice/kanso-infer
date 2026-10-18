@@ -80,7 +80,7 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: Backend) {
         report.num_requests, report.total_tokens_per_sec, report.tokens_per_sec_per_request,
     );
     println!(
-        "{:<24} ttft_ms(p50/p90/mean/max)={:.1}/{:.1}/{:.1}/{:.1} itl_ms(p50/p90/p99)={:.1}/{:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} prefix_hit={:.1}% checksum={:016x}",
+        "{:<24} ttft_ms(p50/p90/mean/max)={:.1}/{:.1}/{:.1}/{:.1} itl_ms(p50/p90/p99)={:.1}/{:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} (decode_ms/tok={:.2}) prefix_hit={:.1}% checksum={:016x}",
         "",
         report.ttft_p50_ms,
         report.ttft_p90_ms,
@@ -91,6 +91,7 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: Backend) {
         report.itl_p99_ms,
         report.prefill_tokens_per_sec,
         report.decode_ms_per_step,
+        report.decode_ms_per_token,
         report.prefix_hit_rate * 100.0,
         report.checksum,
     );

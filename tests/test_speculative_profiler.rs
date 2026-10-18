@@ -208,11 +208,12 @@ fn test_benchmark_report_speculative_integration() {
         itl_p99_ms: 5.0,
         prefill_tokens_per_sec: 500.0,
         decode_ms_per_step: 4.0,
+        decode_ms_per_token: 4.0,
         checksum: 0x12345678,
         prefix_hit_rate: 0.0,
-        bytes_read_per_step: 0,
-        peak_bandwidth_gb_s: 0.0,
-        peak_bandwidth_source: String::new(),
+        bytes_read_per_step: 100_000_000,
+        peak_bandwidth_gb_s: 150.0,
+        peak_bandwidth_source: "measured: test".to_string(),
         speculative: None,
     }
     .with_speculative(spec_report);
