@@ -951,6 +951,14 @@ impl Model {
             crate::accelerate::amx::AmxWorkspace::SLOT_LOGITS,
         )?)?;
 
+        // The AMX path wrote those logits into a workspace slot, so the tensor aliases a
+        // buffer the next decode step overwrites. Every caller in this crate consumes
+        // logits before stepping again, but this method is public: hand back an owned copy
+        // rather than a slice of the workspace. One allocation against the ~230 the
+        // workspace saves per step.
+        if matches!(self.backend, Backend::Amx) {
+            return Ok(logits.copy()?);
+        }
         Ok(logits)
     }
 

@@ -51,9 +51,10 @@ Measured on a 2-layer mock at ctx 32 (`tests/test_amx_workspace.rs`, AC1/AC2):
 | :--- | ---: | ---: |
 | `--backend cpu` | 874 | 182 032 |
 | `--backend amx`, before #93 | 776 | 123 392 |
-| `--backend amx`, after #93 | 642 | 90 976 |
+| `--backend amx`, after #93 | 647 | 93 416 |
 
-A single `matmul_weight_into` call now allocates **0** buffers. The test asserts the
+A single `matmul_weight_into` call now allocates **0** buffers. The 647 includes one
+deliberate copy of the returned logits (below); without it the count is 642. The test asserts the
 reduction is at least the seven projection outputs per layer, in both count and bytes, so
 the saving is measured rather than claimed.
 
@@ -67,6 +68,13 @@ valid until the next `*_into` call on that same slot. Each live intermediate of 
 path owns a distinct slot (`AmxWorkspace::SLOT_*`), which is what keeps the reuse safe:
 Q, K, V, the attention output, the three MLP outputs, the logits and the paged-attention
 output never share a slot within one layer.
+
+The aliasing must not escape `Model`. `forward_decode_step` is public, and its logits are
+written into `SLOT_LOGITS`, so on the AMX path the method returns `logits.copy()` — an
+owned tensor a caller can hold across later steps. Skipping that copy is not a style
+question: `decode_logits_survive_the_next_decode_step` fails with a max |Δ| of 65 when the
+copy is removed, because the next step overwrites the slot. That one allocation is the
+price of keeping the public API honest, and it is why the table above says 647, not 642.
 
 ## What is still open
 

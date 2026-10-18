@@ -262,17 +262,64 @@ fn amx_workspace_decode_logits_match_cpu() {
     );
 }
 
-/// AC3: there is no per-decode workspace clearing. The slots a decode step writes are
-/// the same buffers the next step writes — reused, not dropped and rebuilt, and never
-/// zero-filled between tokens. (The `ScratchpadWorkspace` whose `clear()` used to run on
-/// every decode was removed in Fase-2 F12; this test keeps a clearing step from coming
-/// back through the AMX workspace.)
+/// AC3: there is no per-decode workspace clearing. A slot keeps its buffer across calls —
+/// reused, not dropped, rebuilt or zero-filled in between. (The `ScratchpadWorkspace` whose
+/// `clear()` ran on every decode was removed in Fase-2 F12; this test keeps a clearing step
+/// from coming back through the AMX workspace.)
 ///
-/// The verification command for the same property over the whole tree:
-/// `rg -n 'workspace\.clear|ScratchpadWorkspace|with_workspace' src tests` must only match
-/// the AMX workspace itself, never a per-step call site.
+/// The verification command for the tree-wide half of this:
+/// `rg -n 'workspace\.clear|ScratchpadWorkspace|with_workspace' src tests` must not match a
+/// per-step call site.
 #[test]
-fn decode_step_reuses_workspace_buffers_without_clearing_them() {
+fn workspace_slot_is_reused_across_calls_not_cleared() {
+    let _serial = serial();
+    if !kanso_infer::accelerate::amx::has_accelerate_support() {
+        println!("#93 SKIP: no Accelerate support on this platform");
+        return;
+    }
+
+    let mut workspace = kanso_infer::accelerate::amx::AmxWorkspace::default();
+    let x = Tensor::from_vec(vec![1.0f32; HIDDEN], (1, HIDDEN), &Device::Cpu).unwrap();
+    let w = Tensor::from_vec(
+        vec![0.5f32; HIDDEN * HIDDEN],
+        (HIDDEN, HIDDEN),
+        &Device::Cpu,
+    )
+    .unwrap();
+
+    let address_of = |t: &Tensor| -> u64 {
+        let (guard, _) = t.storage_and_layout();
+        let candle_core::Storage::Cpu(storage) = &*guard else {
+            panic!("expected a cpu tensor");
+        };
+        storage.as_slice::<f32>().expect("f32 storage").as_ptr() as u64
+    };
+
+    let first = workspace
+        .matmul_weight_into(0, &x, &w)
+        .expect("first matmul_weight_into");
+    let first_addr = address_of(&first);
+    drop(first);
+    let second = workspace
+        .matmul_weight_into(0, &x, &w)
+        .expect("second matmul_weight_into");
+    let second_addr = address_of(&second);
+
+    println!("#93 workspace slot 0 address across two calls: {first_addr:#x}, {second_addr:#x}");
+    assert_eq!(
+        first_addr, second_addr,
+        "slot 0 got a new buffer between calls: the workspace is being rebuilt (or \
+         cleared) per call instead of reused"
+    );
+}
+
+/// The workspace is reused, but a caller must not be able to tell. Logits handed back by
+/// one decode step stay valid while the next step runs: the tensor is an owned copy, not a
+/// view into the slot the next step writes. Without this, a caller that holds logits across
+/// steps (sampling one token while proposing the next) would silently read the wrong
+/// token's distribution.
+#[test]
+fn decode_logits_survive_the_next_decode_step() {
     let _serial = serial();
     let mut model = mock();
     model.set_backend(Backend::Amx);
@@ -284,26 +331,45 @@ fn decode_step_reuses_workspace_buffers_without_clearing_them() {
             .expect("warmup decode step");
     }
 
-    // Address of the buffer backing the logits the step returns. If the workspace were
-    // cleared or rebuilt per decode, this address would move between steps.
-    let address_of = |model: &Model, kv: &mut KvStorage| -> u64 {
-        let logits = model
-            .forward_decode_step(7, CTX - 1, &table, kv)
-            .expect("decode step");
-        let (guard, _) = logits.storage_and_layout();
-        let candle_core::Storage::Cpu(storage) = &*guard else {
-            panic!("expected a cpu logits tensor");
-        };
-        storage.as_slice::<f32>().expect("f32 storage").as_ptr() as u64
-    };
+    // Hold the tensor itself, not a copy of its values: this is what a caller does.
+    let held = model
+        .forward_decode_step(7, CTX - 1, &table, &mut kv)
+        .expect("first decode step");
+    let _second = model
+        .forward_decode_step(11, CTX - 1, &table, &mut kv)
+        .expect("second decode step");
 
-    let first = address_of(&model, &mut kv);
-    let second = address_of(&model, &mut kv);
-    println!("#93 logits slot address across two decode steps: {first:#x}, {second:#x}");
-    assert_eq!(
-        first, second,
-        "the logits buffer moved between decode steps: the workspace is being rebuilt \
-         (or cleared) per decode instead of reused"
+    // Read only after the second step has run.
+    let after = held.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+    // A fresh model decoding only as far as the first step is the reference for what those
+    // logits were. If the second step overwrote the slot, the two disagree.
+    let mut fresh = mock();
+    fresh.set_backend(Backend::Amx);
+    let (mut fresh_kv, fresh_table) = kv_for(&fresh, CTX);
+    for _ in 0..3 {
+        fresh
+            .forward_decode_step(1, CTX - 1, &fresh_table, &mut fresh_kv)
+            .expect("warmup decode step");
+    }
+    let reference = fresh
+        .forward_decode_step(7, CTX - 1, &fresh_table, &mut fresh_kv)
+        .expect("reference decode step")
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+    let drift = reference
+        .iter()
+        .zip(after.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!("#93 held logits vs reference max |Δ|: {drift}");
+    assert!(
+        drift <= 1e-4,
+        "logits from an earlier decode step changed after another step ran (max |Δ| \
+         {drift}); they must be an owned copy, not a view into the reused workspace slot"
     );
 }
 
