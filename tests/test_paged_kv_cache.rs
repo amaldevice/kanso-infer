@@ -51,11 +51,11 @@ fn test_prefix_cache_matching() {
 #[test]
 fn test_paged_kv_tokens_match_gather() {
     use candle_core::{Device, IndexOp, Tensor};
-    use kanso_infer::kv_cache::KvStorage;
+use kanso_infer::kv_cache::{KvStorageKind};
 
     let dev = Device::Cpu;
     let (layers, blocks, bs, kv_heads, hd) = (2usize, 8usize, 4usize, 2usize, 8usize);
-    let mut kv = KvStorage::new(layers, blocks, bs, kv_heads, hd, &dev).unwrap();
+    let mut kv = KvStorageKind::f32_new(layers, blocks, bs, kv_heads, hd, &dev).unwrap();
 
     // Fill every slot with a value that encodes (block, offset).
     for layer in 0..layers {

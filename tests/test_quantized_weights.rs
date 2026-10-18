@@ -26,7 +26,7 @@ use candle_core::quantized::gguf_file::{self, Value};
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{Device, Tensor};
 use kanso_infer::bench::perplexity::{calculate_perplexity, get_bundled_wikitext2_tokens};
-use kanso_infer::kv_cache::{BlockTable, KvStorage};
+use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
 use kanso_infer::model::Model;
 use kanso_infer::weights::ModelWeights;
 use rand::rngs::StdRng;
@@ -214,7 +214,7 @@ fn rss_bytes() -> Option<u64> {
 }
 
 fn decode_tok_s(model: &Model, steps: usize) -> f64 {
-    let mut kv_storage = KvStorage::new(
+    let mut kv_storage = KvStorageKind::f32_new(
         model.config.num_hidden_layers,
         steps + 2,
         model.config.block_size,

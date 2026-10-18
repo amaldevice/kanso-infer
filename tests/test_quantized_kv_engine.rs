@@ -20,7 +20,7 @@ use candle_core::Tensor;
 use kanso_infer::engine::Engine;
 use kanso_infer::error::EngineError;
 use kanso_infer::hardware::Backend;
-use kanso_infer::kv_cache::{BlockTable, KvStorage, QuantMode};
+use kanso_infer::kv_cache::{BlockTable, KvStorage, KvStorageKind, QuantMode};
 use kanso_infer::model::Model;
 
 /// Max |quantized - F32| logit, as a fraction of the F32 logit range (max - min).
@@ -127,8 +127,11 @@ fn engine_preserves_legacy_constructor_signatures() {
 fn quantized_kv_is_refused_on_metal() {
     let mut model = Model::create_mock_tiny(16, 4, 2, 2, 50).expect("mock model");
     model.set_backend(Backend::Metal);
-    let err = Engine::new_with_budget_and_kv(model, 1, 64, 16, usize::MAX, Some(QuantMode::Int8))
-        .expect_err("Metal must refuse quantized KV, not fall back to the F32 kernel");
+    let err = match Engine::new_with_budget_and_kv(model, 1, 64, 16, usize::MAX, Some(QuantMode::Int8))
+    {
+        Ok(_) => panic!("Metal must refuse quantized KV, not fall back to the F32 kernel"),
+        Err(err) => err,
+    };
     assert!(
         matches!(err, EngineError::Config(_)),
         "expected a Config error naming the Metal limitation, got {err:?}"
@@ -147,10 +150,13 @@ fn int8_kv_logits_track_f32_within_declared_drift() {
         let (_, table) = context(&model, ctx);
         let mut reference = KvStorageKind::f32(f32_storage(&model, &table));
         let mut quantized = KvStorageKind::quantized(
-            &model,
+            model.config.num_hidden_layers,
             table.blocks().len(),
             model.config.block_size,
+            model.config.num_key_value_heads,
+            model.config.head_dim(),
             QuantMode::Int8,
+            &model.device,
         )
         .expect("int8 storage");
         let expected = logits_of(&model, &mut reference, ctx);
@@ -175,10 +181,13 @@ fn fp8_kv_logits_track_f32_within_declared_drift() {
         let (_, table) = context(&model, ctx);
         let mut reference = KvStorageKind::f32(f32_storage(&model, &table));
         let mut quantized = KvStorageKind::quantized(
-            &model,
+            model.config.num_hidden_layers,
             table.blocks().len(),
             model.config.block_size,
+            model.config.num_key_value_heads,
+            model.config.head_dim(),
             QuantMode::Fp8,
+            &model.device,
         )
         .expect("fp8 storage");
         let expected = logits_of(&model, &mut reference, ctx);
@@ -199,13 +208,27 @@ fn fp8_kv_logits_track_f32_within_declared_drift() {
 #[test]
 fn quantized_kv_bytes_per_token_are_below_f32() {
     let model = mock();
-    let f32_bytes = KvStorageKind::f32_bytes_per_token(
+    let f32_bytes = KvStorageKind::f32_new(
+        model.config.num_hidden_layers,
+        8,
+        model.config.block_size,
         model.config.num_key_value_heads,
         model.config.head_dim(),
-    );
+        &model.device,
+    )
+    .expect("f32 storage")
+    .memory_bytes_per_token();
     for mode in [QuantMode::Int8, QuantMode::Fp8] {
-        let storage =
-            KvStorageKind::quantized(&model, 8, model.config.block_size, mode).expect("storage");
+        let storage = KvStorageKind::quantized(
+            model.config.num_hidden_layers,
+            8,
+            model.config.block_size,
+            model.config.num_key_value_heads,
+            model.config.head_dim(),
+            mode,
+            &model.device,
+        )
+        .expect("storage");
         let bytes = storage.memory_bytes_per_token();
         assert!(
             bytes < f32_bytes,
@@ -253,11 +276,12 @@ fn decode_path_holds_one_storage_type() {
     let (k, v) = storage
         .gather_context(0, &table)
         .expect("gather through the enum");
+    // 40 prefilled tokens plus the decode token just written at position 40.
+    assert_eq!(k.dims(), &[prompt.len() + 1, 2, 4]);
+    assert_eq!(v.dims(), &[prompt.len() + 1, 2, 4]);
+    let (k, _) = storage.paged_kv_tokens(0, table.blocks(), prompt.len()).unwrap();
     assert_eq!(k.dims(), &[prompt.len(), 2, 4]);
-    assert_eq!(v.dims(), &[prompt.len(), 2, 4]);
-    let (k, _) = storage.paged_view(0, table.blocks(), prompt.len()).unwrap();
-    assert_eq!(k.dims(), &[prompt.len(), 2, 4]);
-    let (k1, v1) = storage.read_token(0, 0, 0).unwrap();
+    let (k1, v1) = storage.read_kv_token(0, 0, 0).unwrap();
     assert_eq!(k1.dims(), &[2, 4]);
     assert_eq!(v1.dims(), &[2, 4]);
     let _ = Tensor::zeros((1,), candle_core::DType::F32, &model.device).unwrap();

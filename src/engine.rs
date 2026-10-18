@@ -1,7 +1,7 @@
 use candle_core::Tensor;
 
 use crate::error::EngineError;
-use crate::kv_cache::{BlockPool, BlockTable, KvStorage, PrefixCache};
+use crate::kv_cache::{BlockPool, BlockTable, KvStorageKind, PrefixCache, QuantMode};
 use crate::model::Model;
 use crate::sampler::sample_logits;
 use crate::scheduler::{SamplingParams, Sequence, SequenceStatus};
@@ -23,7 +23,7 @@ pub struct Engine {
     pub token_budget: usize,
     pub current_step: usize,
     pub next_request_id: u64,
-    pub kv_storage: KvStorage,
+    pub kv_storage: KvStorageKind,
     pub prefix_matched_tokens: usize,
     pub total_prompt_tokens_admitted: usize,
     pub prefix_cache_hits: usize,
@@ -47,14 +47,54 @@ impl Engine {
         block_size: usize,
         token_budget: usize,
     ) -> Result<Self, EngineError> {
-        let kv_storage = KvStorage::new(
-            model.config.num_hidden_layers,
-            total_blocks,
-            block_size,
-            model.config.num_key_value_heads,
-            model.config.head_dim(),
-            &model.device,
-        )?;
+        Self::new_with_budget_and_kv(model, max_running, total_blocks, block_size, token_budget, None)
+    }
+
+    /// `new_with_budget` with an explicit KV cache type (ticket #88).
+    ///
+    /// `kv_mode` is `None` for the F32 pool — the default, and the behaviour every other
+    /// constructor keeps. This is the one place the storage implementation is chosen; the
+    /// decode path below it only ever sees [`KvStorageKind`].
+    ///
+    /// Quantized pools are host-side (CPU/AMX): the Metal paged-attention kernel reads an
+    /// F32 pool buffer directly, so asking for INT8/FP8 there is a startup configuration
+    /// error rather than a silent fallback to the F32 kernel (ticket #88).
+    pub fn new_with_budget_and_kv(
+        model: Model,
+        max_running: usize,
+        total_blocks: usize,
+        block_size: usize,
+        token_budget: usize,
+        kv_mode: Option<QuantMode>,
+    ) -> Result<Self, EngineError> {
+        let kv_storage = match kv_mode {
+            None => KvStorageKind::f32_new(
+                model.config.num_hidden_layers,
+                total_blocks,
+                block_size,
+                model.config.num_key_value_heads,
+                model.config.head_dim(),
+                &model.device,
+            )?,
+            Some(mode) => {
+                if matches!(model.backend, crate::hardware::Backend::Metal) {
+                    return Err(EngineError::Config(format!(
+                        "quantized KV ({mode:?}) requires a dequantized gather; the Metal \
+                         paged-attention kernel reads the F32 pool directly. Run the CPU/AMX \
+                         backend or leave the KV cache at F32."
+                    )));
+                }
+                KvStorageKind::quantized(
+                    model.config.num_hidden_layers,
+                    total_blocks,
+                    block_size,
+                    model.config.num_key_value_heads,
+                    model.config.head_dim(),
+                    mode,
+                    &model.device,
+                )?
+            }
+        };
 
         Ok(Self {
             model,

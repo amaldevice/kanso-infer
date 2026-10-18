@@ -12,7 +12,7 @@
 mod metal_paged_attention_wiring {
     use candle_core::{Device, Tensor};
     use kanso_infer::hardware::Backend;
-    use kanso_infer::kv_cache::{BlockTable, KvStorage};
+use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
     use kanso_infer::model::Model;
 
     const HIDDEN: usize = 64;
@@ -42,10 +42,10 @@ mod metal_paged_attention_wiring {
         (x * 0.037).sin() * 0.5
     }
 
-    fn filled_kv(model: &Model, ctx: usize) -> (KvStorage, BlockTable) {
+    fn filled_kv(model: &Model, ctx: usize) -> (KvStorageKind, BlockTable) {
         let head_dim = model.config.head_dim();
         let blocks = ctx.div_ceil(BLOCK_SIZE);
-        let mut kv = KvStorage::new(
+        let mut kv = KvStorageKind::f32_new(
             model.config.num_hidden_layers,
             blocks,
             BLOCK_SIZE,
@@ -67,8 +67,10 @@ mod metal_paged_attention_wiring {
                 }
             }
             let shape = (blocks, BLOCK_SIZE, KV_HEADS, head_dim);
-            kv.kv_k[layer] = Tensor::from_vec(k, shape, &model.device).expect("k pool");
-            kv.kv_v[layer] = Tensor::from_vec(v, shape, &model.device).expect("v pool");
+            // The Metal seam takes the F32 pool; this test drives exactly that path.
+            let pool = kv.f32_pool_mut().expect("F32 pool");
+            pool.kv_k[layer] = Tensor::from_vec(k, shape, &model.device).expect("k pool");
+            pool.kv_v[layer] = Tensor::from_vec(v, shape, &model.device).expect("v pool");
         }
         let mut table = BlockTable::new();
         for b in 0..blocks {

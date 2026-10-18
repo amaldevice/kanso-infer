@@ -9,7 +9,7 @@
 //!   verifier that never reached the residual branch, or wired `p`/`q` backwards, fails.
 
 use candle_core::Device;
-use kanso_infer::kv_cache::{BlockPool, BlockTable, KvStorage, PrefixCache};
+use kanso_infer::kv_cache::{BlockPool, BlockTable, KvStorageKind, PrefixCache};
 use kanso_infer::model::Model;
 use kanso_infer::sampler::{sample_from_probs, softmax_probs};
 use kanso_infer::scheduler::SamplingParams;
@@ -133,7 +133,7 @@ const E2E_SEED_BASE: u64 = 0x5EED_0061;
 /// starts from the same state.
 fn verify_one_round(
     model: &Model,
-    storage: &mut KvStorage,
+    storage: &mut KvStorageKind,
     sampling: SamplingParams,
     candidate: u32,
     q: &[f32],
@@ -159,7 +159,7 @@ fn verify_one_round(
 
 /// The target's own next-token distribution at `temperature`, read through
 /// `forward_verify_tokens` — the same forward the verifier's `p` comes from.
-fn target_distribution(model: &Model, storage: &mut KvStorage, temperature: f32) -> Vec<f32> {
+fn target_distribution(model: &Model, storage: &mut KvStorageKind, temperature: f32) -> Vec<f32> {
     let mut pool = BlockPool::new(E2E_BLOCKS);
     let mut table = BlockTable::new();
     table.push_block(pool.allocate().expect("pool has a block"));
@@ -188,7 +188,7 @@ fn speculative_verifier_stays_on_the_target_distribution_when_q_differs_from_p()
         top_p: 1.0,
         seed: 7,
     };
-    let mut storage = KvStorage::new(
+    let mut storage = KvStorageKind::f32_new(
         E2E_LAYERS,
         E2E_BLOCKS,
         E2E_BLOCK_SIZE,

@@ -9,7 +9,7 @@
 
 use candle_core::{IndexOp, Tensor};
 use kanso_infer::engine::Engine;
-use kanso_infer::kv_cache::{BlockTable, KvStorage};
+use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
 use kanso_infer::model::Model;
 
 /// Every sequence in a step — decode tokens and prefill chunks alike — must ride
@@ -54,7 +54,7 @@ fn test_one_forward_call_per_step_regardless_of_batch() {
 fn test_batched_forward_matches_per_sequence_reference() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     let kv = |blocks: usize| {
-        KvStorage::new(
+        KvStorageKind::f32_new(
             model.config.num_hidden_layers,
             blocks,
             model.config.block_size,

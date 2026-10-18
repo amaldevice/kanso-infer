@@ -251,10 +251,10 @@ fn test_decode_step_parity_hybrid_vs_monolithic() {
 
     let block_size = 16;
     let mut kv_mono =
-        kanso_infer::kv_cache::KvStorage::new(2, 4, block_size, 2, 8, &model_mono.device)
+        kanso_infer::kv_cache::KvStorageKind::f32_new(2, 4, block_size, 2, 8, &model_mono.device)
             .expect("kv mono");
     let mut kv_hyb =
-        kanso_infer::kv_cache::KvStorage::new(2, 4, block_size, 2, 8, &model_hyb.device)
+        kanso_infer::kv_cache::KvStorageKind::f32_new(2, 4, block_size, 2, 8, &model_hyb.device)
             .expect("kv hyb");
 
     let mut bt_mono = kanso_infer::kv_cache::BlockTable::new();

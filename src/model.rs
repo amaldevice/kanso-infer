@@ -1,7 +1,7 @@
 use crate::config::{ModelArchitecture, ModelConfig};
 use crate::error::EngineError;
 use crate::hardware::Backend;
-use crate::kv_cache::{BlockTable, KvStorage};
+use crate::kv_cache::{BlockTable, KvSlotPlan, KvStorageKind, PaddedBatch};
 use crate::weights::{LayerWeights, LinearWeight, ModelWeights};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use rand::rngs::StdRng;
@@ -24,6 +24,10 @@ struct RopeTable {
 struct DecodeLayout {
     /// `[num_seqs * max_blocks]` physical block ids, padded to the batch's longest table.
     indices: Tensor,
+    /// The same ids on the host, for the quantized pool's per-block dequantized gather.
+    blocks: Vec<u32>,
+    /// Blocks per sequence in `indices` / `blocks`.
+    max_blocks: usize,
     /// `[num_seqs * num_kv_heads, 1, padded_ctx]` additive attention mask.
     mask: Tensor,
     num_seqs: usize,
@@ -50,12 +54,12 @@ impl PagedAttnContext {
     /// The context of a pure-decode batch: every sequence's block table padded to the
     /// batch's longest, its context length, and the pool row its token landed in.
     fn decode_batch(
-        kv_storage: &KvStorage,
+        kv_storage: &KvStorageKind,
         block_tables: &[Vec<usize>],
         context_lens: &[usize],
         slot_mapping: &[usize],
     ) -> Self {
-        let block_size = kv_storage.block_size;
+        let block_size = kv_storage.block_size();
         let max_blocks = context_lens
             .iter()
             .map(|&ctx| ctx.div_ceil(block_size).max(1))
@@ -689,7 +693,7 @@ impl Model {
         &self,
         q: &Tensor, // [n_heads, 1, head_dim]
         paged: &PagedAttnContext,
-        kv_storage: &KvStorage,
+        kv_storage: &KvStorageKind,
         layer_idx: usize,
     ) -> Result<Tensor, EngineError> {
         // #86: Metal reads K/V straight out of the block pool through the kernel instead of
@@ -754,10 +758,13 @@ impl Model {
     pub fn metal_paged_attention(
         &self,
         q: &Tensor,
-        kv_storage: &KvStorage,
+        kv_storage: &KvStorageKind,
         layer_idx: usize,
         paged: &PagedAttnContext,
     ) -> Result<Tensor, EngineError> {
+        // Ticket #88: the kernel reads an F32 pool buffer; a quantized pool is refused
+        // here (one place) instead of being dequantized behind the kernel's back.
+        let kv_storage = kv_storage.f32_pool()?;
         let head_dim = self.config.head_dim();
         let shape = AttnShape {
             num_heads: self.config.num_attention_heads,
@@ -880,7 +887,7 @@ impl Model {
         tokens: &[u32],
         start_pos: usize,
         block_table: &BlockTable,
-        kv_storage: &mut KvStorage,
+        kv_storage: &mut KvStorageKind,
     ) -> Result<Tensor, EngineError> {
         let chunk_len = tokens.len();
         if chunk_len == 0 {
@@ -893,7 +900,7 @@ impl Model {
         let head_dim = self.config.head_dim();
         let num_q_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
-        let block_size = kv_storage.block_size;
+        let block_size = kv_storage.block_size();
 
         let positions: Vec<usize> = (start_pos..start_pos + chunk_len).collect();
         let (cos, sin) = self.rope_cos_sin(&positions)?;
@@ -979,7 +986,7 @@ impl Model {
         token: u32,
         pos: usize,
         block_table: &BlockTable,
-        kv_storage: &mut KvStorage,
+        kv_storage: &mut KvStorageKind,
     ) -> Result<Tensor, EngineError> {
         let head_dim = self.config.head_dim();
         let num_q_heads = self.config.num_attention_heads;
@@ -989,7 +996,7 @@ impl Model {
         let token_ids = Tensor::from_slice(&[token], (1,), &self.device)?;
         let mut hidden = self.embed(&token_ids)?;
 
-        let block_size = kv_storage.block_size;
+        let block_size = kv_storage.block_size();
         let block_idx = pos / block_size;
         let offset = pos % block_size;
 
@@ -1101,7 +1108,7 @@ impl Model {
         tokens: &[u32],
         start_pos: usize,
         block_table: &BlockTable,
-        kv_storage: &mut KvStorage,
+        kv_storage: &mut KvStorageKind,
     ) -> Result<Tensor, EngineError> {
         let seq_len = tokens.len();
         if seq_len == 0 {
@@ -1111,7 +1118,7 @@ impl Model {
         let head_dim = self.config.head_dim();
         let num_q_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
-        let block_size = kv_storage.block_size;
+        let block_size = kv_storage.block_size();
         let total_tokens = start_pos + seq_len;
 
         let token_ids = Tensor::from_slice(tokens, (seq_len,), &self.device)?;
@@ -1229,7 +1236,7 @@ impl Model {
         tokens: &[u32],
         positions: &[usize],
         slot_mapping: &[usize],
-        kv_storage: &mut KvStorage,
+        kv_storage: &mut KvStorageKind,
         block_tables: &[Vec<usize>],
         context_lens: &[usize],
         query_lens: &[usize],
@@ -1329,7 +1336,7 @@ impl Model {
         // Per-step, not per-layer (ticket #61 F11): the scatter index tensor and the padded
         // decode layout (block indices + `-1e9` mask) depend only on the step's shapes and
         // block tables, so `num_layers` rebuilds of each are pure waste.
-        let slot_ids = kv_storage.slot_id_tensor(slot_mapping, &self.device)?;
+        let slot_plan = KvSlotPlan::new(kv_storage, slot_mapping, &self.device)?;
         let decode_layout = pure_decode
             .then(|| self.decode_layout(kv_storage, block_tables, context_lens))
             .transpose()?;
@@ -1357,7 +1364,7 @@ impl Model {
             let k = self.rope_apply(&k, &cos, &sin)?;
 
             // Scatter this step's K/V into the physical blocks the scheduler mapped.
-            kv_storage.write_kv_slots(layer_idx, &slot_ids, &k, &v)?;
+            kv_storage.write_kv_slots(layer_idx, &slot_plan, &k, &v)?;
 
             let attn_out = match (&paged_decode, &decode_layout) {
                 (Some(paged), _) => {
@@ -1434,7 +1441,7 @@ impl Model {
     fn batch_decode_attention(
         &self,
         q: &Tensor,
-        kv_storage: &KvStorage,
+        kv_storage: &KvStorageKind,
         layer_idx: usize,
         layout: &DecodeLayout,
     ) -> Result<Tensor, EngineError> {
@@ -1448,14 +1455,22 @@ impl Model {
         // The two GEMMs below are 3D (batch = sequence x KV head), which keeps them on
         // the accelerated path instead of the 4D fallback. Both right-hand sides have to
         // be contiguous: candle's CPU kernel rejects a permuted one outright.
-        let k = kv_storage.kv_k[layer_idx]
-            .index_select(&layout.indices, 0)?
+        // Ticket #88: the padded history comes from the pool through the enum, so this
+        // function has no idea whether it is attending over F32 or dequantized KV.
+        let batch = PaddedBatch::new(
+            layout.indices.clone(),
+            layout.blocks.clone(),
+            num_seqs,
+            layout.max_blocks,
+            padded_ctx,
+        );
+        let (k_all, v_all) = kv_storage.padded_batch_kv(layer_idx, &batch)?;
+        let k = k_all
             .reshape((num_seqs, padded_ctx, num_kv_heads, head_dim))?
             .permute((0, 2, 3, 1))?
             .contiguous()?
             .reshape((num_seqs * num_kv_heads, head_dim, padded_ctx))?;
-        let v = kv_storage.kv_v[layer_idx]
-            .index_select(&layout.indices, 0)?
+        let v = v_all
             .reshape((num_seqs, padded_ctx, num_kv_heads, head_dim))?
             .permute((0, 2, 1, 3))?
             .contiguous()?
@@ -1479,13 +1494,13 @@ impl Model {
     /// every sequence's context is read with, and the same for every layer (ticket #61 F11).
     fn decode_layout(
         &self,
-        kv_storage: &KvStorage,
+        kv_storage: &KvStorageKind,
         block_tables: &[Vec<usize>],
         context_lens: &[usize],
     ) -> Result<DecodeLayout, EngineError> {
         let num_kv_heads = self.config.num_key_value_heads;
         let num_seqs = block_tables.len();
-        let block_size = kv_storage.block_size;
+        let block_size = kv_storage.block_size();
 
         let max_blocks = context_lens
             .iter()
@@ -1495,6 +1510,7 @@ impl Model {
         let padded_ctx = max_blocks * block_size;
 
         let mut indices = Vec::with_capacity(num_seqs * max_blocks);
+        let mut blocks_padded = Vec::with_capacity(num_seqs * max_blocks);
         let mut mask_data = vec![0.0f32; num_seqs * num_kv_heads * padded_ctx];
         for s in 0..num_seqs {
             let blocks = &block_tables[s];
@@ -1510,7 +1526,9 @@ impl Model {
                 )));
             }
             for b in 0..max_blocks {
-                indices.push(blocks[b.min(needed - 1)] as u32);
+                let block = blocks[b.min(needed - 1)];
+                indices.push(block as u32);
+                blocks_padded.push(block as u32);
             }
             for g in 0..num_kv_heads {
                 let row = (s * num_kv_heads + g) * padded_ctx;
@@ -1522,6 +1540,8 @@ impl Model {
 
         Ok(DecodeLayout {
             indices: Tensor::from_vec(indices, (num_seqs * max_blocks,), &self.device)?,
+            blocks: blocks_padded,
+            max_blocks,
             mask: Tensor::from_vec(
                 mask_data,
                 (num_seqs * num_kv_heads, 1, padded_ctx),
