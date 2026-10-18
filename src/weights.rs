@@ -359,7 +359,11 @@ impl ModelWeights {
                     .cloned()
                     .map_err(|e| EngineError::Config(e.to_string()))
             })
-            .unwrap_or_else(|_| "llama".to_string());
+            .map_err(|_| {
+                EngineError::Config(
+                    "Missing GGUF metadata key 'general.architecture': architecture must be explicitly specified (supported: 'llama', 'granite')".to_string(),
+                )
+            })?;
         // Only dense decoder architectures are wired: hybrid SSM/conv layers have no
         // production caller, so loading one as llama would silently produce garbage.
         let prefix = match arch.as_str() {
