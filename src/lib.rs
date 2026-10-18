@@ -1,6 +1,6 @@
 // mini_engine library root
 pub mod accelerate;
-pub mod ane;
+pub mod ffn_offload;
 pub mod bench;
 pub mod chat;
 pub mod config;

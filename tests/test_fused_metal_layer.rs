@@ -290,7 +290,7 @@ mod fused_metal_layer_tests {
 
         // (hidden_dim, num_q_heads, num_kv_heads, head_dim)
         let configs: [(usize, usize, usize, usize); 3] = [
-            (960, 15, 3, 64),   // SmolLM2-360M
+            (960, 15, 5, 64),   // SmolLM2-360M
             (2048, 16, 4, 128), // exactly the old threadgroup array bound
             (4096, 32, 8, 128), // Llama-3-8B: silently corrupted before #50
         ];
@@ -680,7 +680,7 @@ mod fused_metal_layer_tests {
         let dims = FusedLayerDimensions {
             hidden_dim: model_cfg.hidden_size,           // 960
             num_q_heads: model_cfg.num_attention_heads,  // 15
-            num_kv_heads: model_cfg.num_key_value_heads, // 3
+            num_kv_heads: model_cfg.num_key_value_heads, // 5
             head_dim: model_cfg.head_dim(),              // 64
         };
         let pos = 12;

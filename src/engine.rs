@@ -73,7 +73,7 @@ impl Engine {
         self.model.enable_ane_hybrid();
     }
 
-    pub fn set_hybrid_pipeline(&mut self, pipeline: crate::ane::HybridExecutionPipeline) {
+    pub fn set_hybrid_pipeline(&mut self, pipeline: crate::ffn_offload::HybridExecutionPipeline) {
         self.model.set_hybrid_pipeline(pipeline);
     }
 

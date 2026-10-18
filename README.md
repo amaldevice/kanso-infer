@@ -27,7 +27,7 @@ A minimalist, high-performance LLM inference engine written in Rust, engineered 
 
 ### 3. Multi-Model Architecture Matrix (~350M Compact Class)
 Supports dense Transformer decoders and next-generation hybrid linear-attention architectures:
-- **SmolLM2-360M** (Hugging Face / Llama architecture: 32 layers, GQA $15:3$, RMSNorm, RoPE rotate-half, SwiGLU).
+- **SmolLM2-360M** (Hugging Face / Llama architecture: 32 layers, GQA $15:5$, RMSNorm, RoPE rotate-half, SwiGLU).
 - **IBM Granite-4.0-350M (Dense)** (28 layers, GQA $16:4$).
 - **IBM Granite-4.0-h-350M (Hybrid Mamba-2)** (4 attention layers + 28 Mamba-2 SSM recurrent layers, achieving **87.5% KV cache memory reduction**).
 - **Liquid AI LFM2.5-350M (Hybrid LIV Conv)** (6 attention layers + 10 rolling convolution layers, achieving **62% memory reduction**).
@@ -48,6 +48,42 @@ Supports dense Transformer decoders and next-generation hybrid linear-attention 
   - Time-to-First-Token (`TTFT` mean and max in ms)
   - Inter-Token Latency (`ITL` mean and $p99$ in ms)
   - Decode duration (`ms/step`) and prefill rate (`tok/s`)
+
+## Feature Status
+
+Every claim below resolves to one status. ✅ wired = reachable from `kanso cli` / `chat` / `serve`;
+🧪 kernel-only = implemented and tested, but no production caller yet; 📝 planned = roadmap, not code.
+Status is machine-audited by `tests/test_honesty_fase3.rs` (every row carries an exec pointer).
+
+| Feature | Status | Exec pointer |
+| :--- | :---: | :--- |
+| CLI / chat / serve (Axum + SSE, 429 backpressure) | ✅ | `src/main.rs`, `src/server/engine_loop.rs` |
+| Incremental $O(1)$ decode over paged KV blocks | ✅ | `src/model.rs` (`forward_decode_step`), `src/kv_cache/storage.rs` |
+| Continuous batching + Sarathi chunked prefill | ✅ | `src/engine.rs` (`Engine::step`), `src/scheduler/` |
+| Prefix-cache block reuse | ✅ | `src/engine.rs`, `src/kv_cache/prefix_cache.rs` |
+| Quantized-resident weights (Q8_0/Q4_K/F16 stay packed; per-row embedding dequant) | ✅ | `src/weights.rs`, `tests/test_quantized_weights.rs` |
+| Granite dense multipliers (`embedding_scale`, `attention.scale`, `residual_scale`, `logit_scale`) | ✅ | `src/weights.rs`, `src/model.rs`, `src/config.rs` |
+| Loader arch gate (rejects non-llama/non-granite GGUF) | ✅ | `src/weights.rs` (`load_from_gguf`) |
+| Speculative verification (argmax + `min(1,p/q)` rejection sampling, draft KV rollback) | ✅ | `src/engine.rs` (`speculative_step_sampled`), `src/speculative/verifier.rs` |
+| Metal UMA buffers + startup pipeline cache | ✅ | `src/metal/context.rs`, `src/metal/pipeline.rs` |
+| AMX/Accelerate GEMM path (dense weights) | ✅ | `src/accelerate/amx.rs`, `src/model.rs` (`Model::linear`) |
+| FFN offload seam (per-layer SwiGLU adapters, CPU/AMX execution) | ✅ | `src/ffn_offload/adapter.rs`, `src/model.rs` (`forward_mlp_block`) |
+| Real Core ML / ANE execution (`.mlpackage`, `MLModel`) | 📝 | roadmap |
+| Fused PagedAttention v2 Metal kernel | 🧪 | `src/metal/paged_attention.rs`, `src/metal/kernels/paged_attention_v2.metal` |
+| Fused Metal llama-layer kernel | 🧪 | `src/metal/fused_layer.rs` |
+| Hand-written NEON Q8_0/Q4_K GEMV kernels | 🧪 | `src/quant/neon.rs` (reference/benchmark path; production decode runs off candle's kernels) |
+| Quantized (INT8/FP8) paged KV cache | 🧪 | `src/kv_cache/quantized_storage.rs` |
+| Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation | 🧪 | `src/hybrid/`, `src/kv_cache/` (`SparseBlockTable`); loader rejects hybrid GGUF until wired |
+| `granite-h` / `lfm` bench profiles | 🧪 | `src/config.rs` (mock shapes for bench comparison, not loaded weights) |
+
+## Roadmap
+
+- Real Core ML / ANE execution: compile per-layer SwiGLU to `.mlpackage` and run via `MLModel`, behind the `src/ffn_offload` seam.
+- Wire the fused PagedAttention v2 kernel into the Metal decode path (`src/model.rs` names the call site).
+- Wire quantized KV storage into `Engine` (currently always F32 `KvStorage`).
+- Wire hybrid SSM/conv layers into the forward pass and lift the loader arch gate for them.
+- Promote hand-written NEON GEMV kernels from reference path to production decode path.
+
 ---
 
 ## Project Structure
@@ -56,7 +92,7 @@ Supports dense Transformer decoders and next-generation hybrid linear-attention 
 kanso-infer/
 ├── Cargo.toml
 ├── README.md
-├── SPEC.md               # Complete architecture and low-level specification
+├── docs/SPEC.md          # Canonical architecture and low-level specification
 ├── src/
 │   ├── main.rs           # Main CLI binary (cli, chat, serve)
 │   ├── lib.rs            # Core library root
@@ -69,11 +105,9 @@ kanso-infer/
 │   ├── hardware.rs       # User-space hardware profiler, peak RSS, thermal state & bus util
 │   ├── engine.rs         # Continuous batching & chunked prefill scheduler
 │   ├── error.rs          # Stdlib EngineError
-│   ├── kv_cache/
-│   │   ├── block_pool.rs # Physical memory block pool & ref-counting
-│   │   ├── block_table.rs# Virtual-to-physical block table translation
-│   │   ├── prefix_cache.rs# Trie/hash prompt prefix caching
-│   │   └── storage.rs    # KvStorage physical block tensor buffer
+│   ├── ffn_offload/
+│   │   ├── adapter.rs  # Per-layer SwiGLU offload seam (CPU/AMX; Core ML target planned)
+│   │   └── mod.rs      # Re-exports (renamed from `ane`, ticket #54)
 │   ├── metal/
 │   │   ├── context.rs    # Metal device, command queue & UMA buffer allocator
 │   │   ├── pipeline.rs   # Compute pipeline state compilation & caching

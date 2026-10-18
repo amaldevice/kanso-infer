@@ -2,7 +2,7 @@
 //! (Q8_0 blocks) instead of being dequantized to F32 at load.
 //!
 //! No SmolLM2 GGUF is downloadable in this environment, so these tests write a
-//! **synthetic** GGUF with the real SmolLM2-360M shapes (hidden 960, 15/3 heads,
+//! **synthetic** GGUF with the real SmolLM2-360M shapes (hidden 960, 15/5 heads,
 //! 32 layers, intermediate 2560, vocab 49152) and load it back through the
 //! production loader and decode loop. Storage format, block layout, loader and
 //! matmul path are all real; only the weight values are random.
@@ -47,11 +47,11 @@ static HEAVY: Mutex<()> = Mutex::new(());
 // Synthetic GGUF fixture
 // ---------------------------------------------------------------------------
 
-/// SmolLM2-360M-Instruct: hidden 960, 15 q heads / 3 kv heads, 32 layers,
+/// SmolLM2-360M-Instruct: hidden 960, 15 q heads / 5 kv heads, 32 layers,
 /// intermediate 2560, vocab 49152.
 const HIDDEN: usize = 960;
 const Q_HEADS: usize = 15;
-const KV_HEADS: usize = 3;
+const KV_HEADS: usize = 5;
 const INTERMEDIATE: usize = 2560;
 const VOCAB: usize = 49_152;
 const LAYERS: usize = 32;

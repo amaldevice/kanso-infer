@@ -20,23 +20,24 @@ const INTER: usize = 128;
 const VOCAB: usize = 256;
 const LAYERS: usize = 2;
 
-fn tiny_tensor(rows: usize, cols: usize, fill: f32) -> Tensor {
-    Tensor::from_vec(
-        vec![fill; rows * cols],
-        (rows, cols),
-        &Device::Cpu,
-    )
-    .unwrap()
+fn tiny_tensor(rng: &mut rand::rngs::StdRng, rows: usize, cols: usize) -> Tensor {
+    use rand::{Rng, SeedableRng};
+    let data: Vec<f32> = (0..rows * cols)
+        .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * 0.05)
+        .collect();
+    Tensor::from_vec(data, (rows, cols), &Device::Cpu).unwrap()
 }
 
 /// Minimal synthetic GGUF: `arch` goes in `general.architecture`, shape keys under `prefix`.
 fn write_gguf(path: &Path, arch: &str, prefix: &str, extra_meta: &[(String, Value)]) {
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x54_5EED);
     let dev = Device::Cpu;
     let head_dim = HIDDEN / Q_HEADS;
     let mut tensors: Vec<(String, QTensor)> = vec![
         (
             "token_embd.weight".to_string(),
-            QTensor::quantize(&tiny_tensor(VOCAB, HIDDEN, 0.02), GgmlDType::F32).unwrap(),
+            QTensor::quantize(&tiny_tensor(&mut rng, VOCAB, HIDDEN), GgmlDType::F32).unwrap(),
         ),
         (
             "output_norm.weight".to_string(),
@@ -52,19 +53,19 @@ fn write_gguf(path: &Path, arch: &str, prefix: &str, extra_meta: &[(String, Valu
             ),
             (
                 format!("blk.{i}.attn_q.weight"),
-                tiny_tensor(Q_HEADS * head_dim, HIDDEN, 0.02),
+                tiny_tensor(&mut rng, Q_HEADS * head_dim, HIDDEN),
             ),
             (
                 format!("blk.{i}.attn_k.weight"),
-                tiny_tensor(KV_HEADS * head_dim, HIDDEN, 0.02),
+                tiny_tensor(&mut rng, KV_HEADS * head_dim, HIDDEN),
             ),
             (
                 format!("blk.{i}.attn_v.weight"),
-                tiny_tensor(KV_HEADS * head_dim, HIDDEN, 0.02),
+                tiny_tensor(&mut rng, KV_HEADS * head_dim, HIDDEN),
             ),
             (
                 format!("blk.{i}.attn_output.weight"),
-                tiny_tensor(HIDDEN, Q_HEADS * head_dim, 0.02),
+                tiny_tensor(&mut rng, HIDDEN, Q_HEADS * head_dim),
             ),
             (
                 format!("blk.{i}.ffn_norm.weight"),
@@ -72,15 +73,15 @@ fn write_gguf(path: &Path, arch: &str, prefix: &str, extra_meta: &[(String, Valu
             ),
             (
                 format!("blk.{i}.ffn_gate.weight"),
-                tiny_tensor(INTER, HIDDEN, 0.02),
+                tiny_tensor(&mut rng, INTER, HIDDEN),
             ),
             (
                 format!("blk.{i}.ffn_up.weight"),
-                tiny_tensor(INTER, HIDDEN, 0.02),
+                tiny_tensor(&mut rng, INTER, HIDDEN),
             ),
             (
                 format!("blk.{i}.ffn_down.weight"),
-                tiny_tensor(HIDDEN, INTER, 0.02),
+                tiny_tensor(&mut rng, HIDDEN, INTER),
             ),
         ] {
             tensors.push((name, QTensor::quantize(&t, GgmlDType::F32).unwrap()));
@@ -176,7 +177,17 @@ fn readme_feature_status_audit() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for row in rows {
         let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        // status cell is index 1, pointer cell is second-to-last (leading/trailing `|` split empty).
+        let status = cells.get(2).copied().unwrap_or("");
         let pointer = cells.get(cells.len() - 2).copied().unwrap_or("");
+        // Planned rows point at the roadmap instead of code.
+        if status.contains("📝") {
+            assert!(
+                pointer.contains("roadmap"),
+                "planned row must point at the roadmap: {row}"
+            );
+            continue;
+        }
         let mut found = false;
         let mut start = 0;
         while let Some(i) = pointer[start..].find("src/").or_else(|| pointer[start..].find("tests/")).or_else(|| pointer[start..].find("docs/")) {
@@ -185,7 +196,7 @@ fn readme_feature_status_audit() {
                 .find(|c: char| c == '`' || c == ' ' || c == ',' || c == ')')
                 .map(|e| abs + e)
                 .unwrap_or(pointer.len());
-            if root.join(&pointer[abs..end]).is_file() {
+            if root.join(&pointer[abs..end]).exists() {
                 found = true;
                 break;
             }
