@@ -47,6 +47,11 @@ pub struct Model {
     /// Grown on demand, dropped by [`Model::to_device`] because its rows live on the
     /// device the model was built for.
     rope_table: RefCell<Option<RopeTable>>,
+    /// Reused decode-path matmul outputs (ticket #93 / spec #82 D16): the AMX path fills
+    /// these slots in place instead of returning a fresh `Vec` per projection per layer.
+    /// Interior mutability because decode takes `&self`; see
+    /// [`crate::accelerate::amx::AmxWorkspace`] for the aliasing contract.
+    amx_workspace: RefCell<crate::accelerate::amx::AmxWorkspace>,
 }
 
 /// Fixed seed for mock-model weights so tests are reproducible.
@@ -91,6 +96,7 @@ impl Model {
             hybrid_pipeline: None,
             forward_batch_calls: std::sync::atomic::AtomicU64::new(0),
             rope_table: RefCell::new(None),
+            amx_workspace: RefCell::new(crate::accelerate::amx::AmxWorkspace::default()),
         }
     }
 
@@ -127,6 +133,7 @@ impl Model {
         self.weights = self.weights.to_device(device)?;
         self.device = device.clone();
         self.rope_table.borrow_mut().take();
+        self.amx_workspace.borrow_mut().clear();
         Ok(())
     }
 
@@ -142,6 +149,27 @@ impl Model {
     #[deprecated(note = "use enable_ffn_offload")]
     pub fn enable_ane_hybrid(&mut self) {
         self.enable_ffn_offload();
+    }
+
+    /// [`Model::forward_mlp_block`] with the three projections written into workspace
+    /// slots (ticket #93). The MLP is the widest allocation site of a decode step, so it
+    /// benefits most from the reused buffers. Falls back to the plain path when a hybrid
+    /// pipeline owns the layer.
+    fn forward_mlp_block_into(
+        &self,
+        layer_idx: usize,
+        ffn_normed: &Tensor,
+        layer: &LayerWeights,
+    ) -> Result<Tensor, EngineError> {
+        if self.hybrid_pipeline.is_some() {
+            return self.forward_mlp_block(layer_idx, ffn_normed, layer);
+        }
+        use crate::accelerate::amx::AmxWorkspace;
+        let gate = self.linear_into(&layer.ffn_gate, ffn_normed, AmxWorkspace::SLOT_FFN_GATE)?;
+        let up = self.linear_into(&layer.ffn_up, ffn_normed, AmxWorkspace::SLOT_FFN_UP)?;
+        let silu_gate = candle_nn::ops::silu(&gate)?;
+        let ffn_hidden = (silu_gate * up)?;
+        self.linear_into(&layer.ffn_down, &ffn_hidden, AmxWorkspace::SLOT_FFN_DOWN)
     }
 
     pub fn forward_mlp_block(
@@ -176,6 +204,30 @@ impl Model {
         w.forward(x)
     }
 
+    /// [`Model::linear`] writing into AMX workspace `slot` instead of returning a fresh
+    /// output buffer (ticket #93 / spec #82 D16).
+    ///
+    /// The returned tensor aliases `slot`, so the caller must consume it before the next
+    /// `linear_into` on the same slot. Only the AMX backend has an in-place GEMM; every
+    /// other backend (and quantized storage, which never reaches AMX) delegates to
+    /// [`Model::linear`], so the numbers are the same on every path.
+    pub fn linear_into(
+        &self,
+        w: &LinearWeight,
+        x: &Tensor,
+        slot: usize,
+    ) -> Result<Tensor, EngineError> {
+        if matches!(self.backend, crate::hardware::Backend::Amx)
+            && let Some(dense) = w.as_dense_f32()
+        {
+            return self
+                .amx_workspace
+                .borrow_mut()
+                .matmul_weight_into(slot, x, dense);
+        }
+        w.forward(x)
+    }
+
     /// Dequantizes an embedding row per token id instead of the whole table.
     /// Granite `embedding_scale` multiplies the rows (llama.cpp `llama-graph.cpp`).
     pub fn embed(&self, ids: &Tensor) -> Result<Tensor, EngineError> {
@@ -195,12 +247,33 @@ impl Model {
         layer: &LayerWeights,
         normed: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor), EngineError> {
+        let (q, k) = self.project_qk(layer, normed, None)?;
+        Ok((q, k, self.linear(&layer.attn_v, normed)?))
+    }
+
+    /// Q/K projections with Q/K in rotate-half head order. When `slots` is given, the
+    /// projections are written into those workspace slots (ticket #93) and the returned
+    /// tensors alias them.
+    fn project_qk(
+        &self,
+        layer: &LayerWeights,
+        normed: &Tensor,
+        slots: Option<(usize, usize)>,
+    ) -> Result<(Tensor, Tensor), EngineError> {
         let (q_perm, k_perm) = match &self.weights.qk_perm {
             Some(p) => (Some(&p.q), Some(&p.k)),
             None => (None, None),
         };
-        let q = self.linear(&layer.attn_q, normed)?;
-        let k = self.linear(&layer.attn_k, normed)?;
+        let (q, k) = match slots {
+            Some((q_slot, k_slot)) => (
+                self.linear_into(&layer.attn_q, normed, q_slot)?,
+                self.linear_into(&layer.attn_k, normed, k_slot)?,
+            ),
+            None => (
+                self.linear(&layer.attn_q, normed)?,
+                self.linear(&layer.attn_k, normed)?,
+            ),
+        };
         let q = match q_perm {
             Some(idx) => q.index_select(idx, 1)?,
             None => q,
@@ -209,7 +282,7 @@ impl Model {
             Some(idx) => k.index_select(idx, 1)?,
             None => k,
         };
-        Ok((q, k, self.linear(&layer.attn_v, normed)?))
+        Ok((q, k))
     }
 
     pub fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor, EngineError> {
@@ -556,9 +629,16 @@ impl Model {
                 .contiguous()?
                 .reshape((n_kv_heads, group_size * q_len, head_dim))?;
             let scale = self.attention_scale(head_dim);
-            if let Some(out) =
-                crate::accelerate::amx::amx_paged_decode_attention(&q_folded, k, v, scale as f32)
-            {
+            // Ticket #93: the three scratch buffers this kernel used to allocate per
+            // layer per token come from the workspace instead.
+            let in_workspace = self.amx_workspace.borrow_mut().paged_decode_attention_into(
+                crate::accelerate::amx::AmxWorkspace::SLOT_PAGED_ATTN,
+                &q_folded,
+                k,
+                v,
+                scale as f32,
+            );
+            if let Some(out) = in_workspace {
                 // [n_kv_heads, group * q_len, head_dim] -> [n_heads, q_len, head_dim]
                 return Ok(out?.reshape((n_heads, q_len, head_dim))?);
             }
@@ -799,8 +879,22 @@ impl Model {
             // Attention Norm
             let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
 
-            // Linear Q, K, V for single token
-            let (q, k, v) = self.project_qkv(layer, &normed)?;
+            // Linear Q, K, V for single token. Q/K/V outputs land in workspace slots
+            // (ticket #93): the AMX GEMM writes them in place instead of returning a
+            // fresh `[out]` Vec per projection per layer per token.
+            let (q, k) = self.project_qk(
+                layer,
+                &normed,
+                Some((
+                    crate::accelerate::amx::AmxWorkspace::SLOT_Q,
+                    crate::accelerate::amx::AmxWorkspace::SLOT_K,
+                )),
+            )?;
+            let v = self.linear_into(
+                &layer.attn_v,
+                &normed,
+                crate::accelerate::amx::AmxWorkspace::SLOT_V,
+            )?;
 
             let q = q.reshape((1, num_q_heads, head_dim))?;
             let k = k.reshape((1, num_kv_heads, head_dim))?;
@@ -830,7 +924,11 @@ impl Model {
             let attn_out = attn_out
                 .transpose(0, 1)?
                 .reshape((1, num_q_heads * head_dim))?;
-            let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
+            let attn_proj = self.linear_into(
+                &layer.attn_output,
+                &attn_out,
+                crate::accelerate::amx::AmxWorkspace::SLOT_ATTN_OUT,
+            )?;
 
             // Residual connection
             hidden = (hidden + &self.scale_residual(attn_proj)?)?;
@@ -838,7 +936,7 @@ impl Model {
             // FFN Norm
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
 
-            let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
+            let ffn_out = self.forward_mlp_block_into(layer_idx, &ffn_normed, layer)?;
             // Residual connection
             hidden = (hidden + &self.scale_residual(ffn_out)?)?;
         }
@@ -847,8 +945,20 @@ impl Model {
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
 
         // LM Head projection: [1, vocab_size]
-        let logits = self.scale_logits(self.linear(&self.weights.lm_head, &final_normed)?)?;
+        let logits = self.scale_logits(self.linear_into(
+            &self.weights.lm_head,
+            &final_normed,
+            crate::accelerate::amx::AmxWorkspace::SLOT_LOGITS,
+        )?)?;
 
+        // The AMX path wrote those logits into a workspace slot, so the tensor aliases a
+        // buffer the next decode step overwrites. Every caller in this crate consumes
+        // logits before stepping again, but this method is public: hand back an owned copy
+        // rather than a slice of the workspace. One allocation against the ~230 the
+        // workspace saves per step.
+        if matches!(self.backend, Backend::Amx) {
+            return Ok(logits.copy()?);
+        }
         Ok(logits)
     }
 
