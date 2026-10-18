@@ -9,7 +9,7 @@
 //!    token (Fase-2 F9 threaded the seed via `StdRng`; this pins it), at both
 //!    the sampler and the engine level.
 //! 4. `ane_claim_requires_real_dispatch`: `has_ane_support()` must stay false
-//!    while `CoreMlAneAdapter` has no Core ML execution path — the old
+//!    while `PlannedCoreMlAdapter` has no Core ML execution path — the old
 //!    chip-name string match claimed ANE on every Mac.
 
 use candle_core::quantized::gguf_file::{self, Value};

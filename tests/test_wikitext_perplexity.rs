@@ -219,3 +219,33 @@ fn test_perplexity_report_ascii_and_json_serialization() {
     assert_eq!(deserialized.backends.len(), 4);
     assert_eq!(deserialized.quantized_evals.len(), 3);
 }
+
+/// Legacy reports (ticket #92) wrote `backend` as a lowercase free-form string
+/// (`"cpu"`, `"amx"`, ...). The field is now a typed `Backend` enum, so the
+/// enum must still accept that exact wire form — otherwise every archived
+/// report on disk stops deserializing.
+#[test]
+fn test_legacy_string_backend_report_still_deserializes() {
+    let legacy = r#"{
+        "dataset": "wikitext2",
+        "num_tokens": 64,
+        "stride": 32,
+        "baseline_ppl": 12.5,
+        "backends": [
+            {"backend": "cpu", "perplexity": 12.5, "delta_vs_fp32": 0.0},
+            {"backend": "amx", "perplexity": 12.6, "delta_vs_fp32": 0.1}
+        ],
+        "quantized_evals": [],
+        "delta_threshold": 0.15,
+        "all_passed": true
+    }"#;
+    let report: PerplexityReport =
+        serde_json::from_str(legacy).expect("legacy report must deserialize");
+    assert_eq!(report.backends.len(), 2);
+    assert_eq!(report.backends[0].backend, kanso_infer::Backend::Cpu);
+    assert_eq!(report.backends[1].backend, kanso_infer::Backend::Amx);
+
+    // New reports must keep writing the same lowercase wire form.
+    let json = serde_json::to_string(&report).expect("serialize");
+    assert!(json.contains("\"backend\":\"cpu\""), "got: {json}");
+}

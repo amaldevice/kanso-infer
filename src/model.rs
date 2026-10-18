@@ -146,11 +146,6 @@ impl Model {
         self.hybrid_pipeline = Some(pipeline);
     }
 
-    #[deprecated(note = "use enable_ffn_offload")]
-    pub fn enable_ane_hybrid(&mut self) {
-        self.enable_ffn_offload();
-    }
-
     /// [`Model::forward_mlp_block`] with the three projections written into workspace
     /// slots (ticket #93). The MLP is the widest allocation site of a decode step, so it
     /// benefits most from the reused buffers. Falls back to the plain path when a hybrid
