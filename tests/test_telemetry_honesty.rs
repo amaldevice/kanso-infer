@@ -27,7 +27,7 @@ fn tiny_engine() -> (Engine, usize, usize) {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).expect("mock model");
     let weights_bytes = model.weights.storage_bytes();
     let kv_per_token = model.config.kv_cache_bytes_per_token_f32();
-    let engine = Engine::new(model, 4, 30, 4);
+    let engine = Engine::new(model, 4, 30, 4).expect("engine");
     (engine, weights_bytes, kv_per_token)
 }
 
@@ -80,7 +80,7 @@ fn same_seed_same_tokens_sampler() {
 fn same_seed_same_tokens_engine() {
     fn run(seed: u64) -> Vec<u32> {
         let model = Model::create_mock_tiny(16, 4, 2, 2, 50).expect("mock model");
-        let mut engine = Engine::new(model, 4, 30, 4);
+        let mut engine = Engine::new(model, 4, 30, 4).expect("engine");
         engine.add_request_with_sampling(
             vec![1, 2, 3],
             5,
@@ -236,7 +236,7 @@ fn report_weighs_real_gguf_quantized_storage() {
     );
 
     let kv_per_token = model.config.kv_cache_bytes_per_token_f32();
-    let mut engine = Engine::new(model, 4, 64, 16);
+    let mut engine = Engine::new(model, 4, 64, 16).expect("engine");
     let (prompt_len, gen_len) = (4, 4);
     let batch_size = 2;
     let report = run_synthetic_benchmark(&mut engine, batch_size, prompt_len, gen_len, false)

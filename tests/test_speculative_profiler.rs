@@ -246,7 +246,8 @@ fn test_speculative_engine_profiler_automatic_tracking() {
         30,
         4,
         3, // gamma = 3
-    );
+    )
+    .expect("engine");
 
     let prompt = vec![1, 2, 3];
     spec_engine.add_request(prompt, 6);

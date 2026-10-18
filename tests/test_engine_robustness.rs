@@ -40,7 +40,7 @@ fn run_to_completion(engine: &mut Engine, step_cap: usize) -> HashMap<u64, Vec<u
 /// instead of silently skipping block allocation, which aborted the whole batch.
 #[test]
 fn test_small_block_pool_four_long_requests_all_finish() {
-    let mut engine = Engine::new_with_budget(mock(), 2, 8, 4, usize::MAX);
+    let mut engine = Engine::new_with_budget(mock(), 2, 8, 4, usize::MAX).expect("engine");
     let ids: Vec<u64> = (0..4)
         .map(|i| {
             let prompt: Vec<u32> = (0..12).map(|t| ((i * 9 + t) % 40) as u32).collect();
@@ -73,7 +73,7 @@ fn test_eos_stops_sequence_and_frees_blocks_in_same_step() {
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
 
     // Discover the deterministic greedy token this prompt produces.
-    let mut probe = Engine::new_with_budget(mock(), 1, 8, 4, usize::MAX);
+    let mut probe = Engine::new_with_budget(mock(), 1, 8, 4, usize::MAX).expect("engine");
     let probe_id = probe.add_request(prompt.clone(), 32);
     let first = probe
         .step()
@@ -87,7 +87,7 @@ fn test_eos_stops_sequence_and_frees_blocks_in_same_step() {
         "probe has no stop token configured and must keep running"
     );
 
-    let mut engine = Engine::new_with_budget(mock(), 1, 8, 4, usize::MAX);
+    let mut engine = Engine::new_with_budget(mock(), 1, 8, 4, usize::MAX).expect("engine");
     let id = engine.add_request_with_stops(prompt, 32, vec![first]);
     let outputs = engine.step().expect("step failed");
     let out = outputs
@@ -117,7 +117,7 @@ fn test_eos_stops_sequence_and_frees_blocks_in_same_step() {
 /// work — `cancel_request` retires the sequence and returns its blocks to the pool.
 #[test]
 fn test_cancel_request_retires_sequence_and_frees_blocks() {
-    let mut engine = Engine::new_with_budget(mock(), 2, 16, 4, usize::MAX);
+    let mut engine = Engine::new_with_budget(mock(), 2, 16, 4, usize::MAX).expect("engine");
     let keep = engine.add_request(vec![1, 2, 3, 4], 8);
     let doomed = engine.add_request(vec![5, 6, 7, 8], 64);
 

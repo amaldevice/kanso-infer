@@ -22,6 +22,47 @@ impl KvStorage {
         head_dim: usize,
         device: &Device,
     ) -> Result<Self, EngineError> {
+        // A KV pool the machine cannot hold is a startup configuration error the caller
+        // reports (ticket #85), not an overflow or an allocation abort inside candle.
+        if num_blocks == 0 {
+            return Err(EngineError::Config(format!(
+                "cannot allocate KV storage: received {num_blocks} total blocks; the pool must hold at least one block"
+            )));
+        }
+        if block_size == 0 {
+            return Err(EngineError::Config(format!(
+                "cannot allocate KV storage: block size {block_size} holds no token"
+            )));
+        }
+        if n_kv_heads == 0 || head_dim == 0 {
+            return Err(EngineError::Config(format!(
+                "cannot allocate KV storage: model declares {n_kv_heads} KV heads of head_dim {head_dim}"
+            )));
+        }
+
+        let elements = num_blocks
+            .checked_mul(block_size)
+            .and_then(|n| n.checked_mul(n_kv_heads))
+            .and_then(|n| n.checked_mul(head_dim))
+            .and_then(|n| n.checked_mul(num_layers))
+            .and_then(|n| n.checked_mul(2));
+        let bytes = elements
+            .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                EngineError::Config(format!(
+                    "cannot allocate KV storage: {num_layers} layers x {num_blocks} blocks x {block_size} tokens x {n_kv_heads} KV heads x {head_dim} head_dim overflows the addressable size"
+                ))
+            })?;
+        let host_gb = crate::hardware::get_hardware_info().total_ram_gb;
+        let host_bytes = (host_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        if bytes as u64 > host_bytes {
+            return Err(EngineError::Config(format!(
+                "cannot allocate KV storage: request of {:.1} GiB exceeds the {:.1} GiB of physical memory on this machine",
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                host_gb
+            )));
+        }
+
         let shape = (num_blocks, block_size, n_kv_heads, head_dim);
         let mut kv_k = Vec::with_capacity(num_layers);
         let mut kv_v = Vec::with_capacity(num_layers);

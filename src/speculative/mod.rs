@@ -29,15 +29,15 @@ impl SpeculativeEngine {
         total_blocks: usize,
         block_size: usize,
         gamma: usize,
-    ) -> Self {
-        let engine = Engine::new(target_model, max_running, total_blocks, block_size);
-        Self {
+    ) -> Result<Self, EngineError> {
+        let engine = Engine::new(target_model, max_running, total_blocks, block_size)?;
+        Ok(Self {
             engine,
             draft_model,
             gamma,
             profiler: SpeculativeProfiler::new(),
             draft_cache: None,
-        }
+        })
     }
 
     pub fn add_request(&mut self, prompt_tokens: Vec<u32>, max_tokens: usize) -> u64 {

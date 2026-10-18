@@ -3,7 +3,8 @@ fn test_continuous_batching_staggered_arrival() {
     let model = kanso_infer::model::Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     let mut engine = kanso_infer::engine::Engine::new(
         model, /* max_running */ 2, /* total_blocks */ 20, /* block_size */ 4,
-    );
+    )
+    .expect("engine");
 
     let id1 = engine.add_request(vec![1, 2], 3);
     assert_eq!(engine.waiting_count(), 1);

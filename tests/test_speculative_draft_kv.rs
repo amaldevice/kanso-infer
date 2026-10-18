@@ -245,14 +245,15 @@ fn speculative_decode_beats_non_spec_at_ctx_512() {
         .unwrap()
     };
     let (plain_time, plain_tokens) = {
-        let mut engine = Engine::new(target_plain, 1, TOTAL_BLOCKS, BLOCK_SIZE);
+        let mut engine = Engine::new(target_plain, 1, TOTAL_BLOCKS, BLOCK_SIZE).expect("engine");
         engine.add_request(prompt.clone(), GENERATE);
         decode_phase(WARMUP, || step_tokens(&mut engine))
     };
 
     let (spec_time, spec_tokens, alpha) = {
         let mut engine =
-            SpeculativeEngine::new(target, Some(draft), 1, TOTAL_BLOCKS, BLOCK_SIZE, GAMMA);
+            SpeculativeEngine::new(target, Some(draft), 1, TOTAL_BLOCKS, BLOCK_SIZE, GAMMA)
+                .expect("engine");
         engine.add_request(prompt.clone(), GENERATE);
         let (duration, tokens) = decode_phase(WARMUP, || {
             if !engine.has_unfinished_requests() {
@@ -333,7 +334,8 @@ fn temperature_sampling_verifies_draft_distributions() {
 
     let (target, draft) = mock_pair();
     let mut engine =
-        SpeculativeEngine::new(target, Some(draft), 1, TOTAL_BLOCKS, BLOCK_SIZE, GAMMA);
+        SpeculativeEngine::new(target, Some(draft), 1, TOTAL_BLOCKS, BLOCK_SIZE, GAMMA)
+            .expect("engine");
     engine.add_request_with_sampling(
         (0..64).map(|i| (i % VOCAB) as u32).collect(),
         64,
