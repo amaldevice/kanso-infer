@@ -10,6 +10,8 @@ pub mod sharegpt;
 pub use sharegpt::*;
 pub mod perplexity;
 pub use perplexity::*;
+pub mod gate;
+pub use gate::*;
 
 /// Order-sensitive 64-bit FNV-1a hash over token sequence.
 /// Offset basis: 0xcbf29ce484222325, Prime: 0x100000001b3.
