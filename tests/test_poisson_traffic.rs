@@ -147,7 +147,7 @@ fn test_concurrency_sweep_rates_and_execution() {
     assert_eq!(CONCURRENCY_SWEEP_RATES, [2.0, 5.0, 10.0, 20.0, 40.0]);
 
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-    let mut engine = Engine::new(model, 4, 40, 4);
+    let mut engine = Engine::new(model, 4, 40, 4).expect("engine");
 
     let sweep_results = run_poisson_concurrency_sweep(
         &mut engine,
@@ -180,7 +180,7 @@ async fn test_graceful_http_429_backpressure_under_burst() {
         .unwrap()
         .get_vocab_size(true);
     let model = Model::create_mock_tiny(64, 4, 2, 2, vocab_size).unwrap();
-    let engine = Engine::new(model, 2, 32, 16);
+    let engine = Engine::new(model, 2, 32, 16).expect("engine");
 
     // Server with queue limit = 1: max 1 waiting request allowed, subsequent get 429
     let app = create_app_with_queue_limit(engine, tokenizer, Some(1));

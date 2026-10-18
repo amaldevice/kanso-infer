@@ -11,6 +11,7 @@ use candle_core::quantized::gguf_file::{self, Value};
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Tensor};
 use kanso_infer::engine::Engine;
+use kanso_infer::error::EngineError;
 use kanso_infer::model::Model;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -19,10 +20,18 @@ fn mock() -> Model {
     Model::create_mock_tiny(16, 4, 2, 2, 50).expect("mock model")
 }
 
+/// `Engine` holds device tensors and is not `Debug`, so failures are read through
+/// `Result::err` rather than `expect_err`.
+fn construct_err(total_blocks: usize, block_size: usize) -> EngineError {
+    Engine::new(mock(), 4, total_blocks, block_size)
+        .err()
+        .expect("an impossible KV request must be rejected")
+}
+
 /// Without blocks there is no KV to allocate: the engine can never admit a request.
 #[test]
 fn zero_total_blocks_is_rejected() {
-    let err = Engine::new(mock(), 4, 0, 4).expect_err("a pool with zero blocks cannot serve");
+    let err = construct_err(0, 4);
     let msg = err.to_string();
     assert!(
         msg.contains("KV") && msg.contains('0'),
@@ -33,7 +42,7 @@ fn zero_total_blocks_is_rejected() {
 /// A block holds `block_size` tokens; zero slots per block is not representable.
 #[test]
 fn zero_block_size_is_rejected() {
-    let err = Engine::new(mock(), 4, 8, 0).expect_err("block_size 0 holds no token");
+    let err = construct_err(8, 0);
     assert!(
         err.to_string().contains("KV"),
         "error must name the KV storage, got: {err}"
@@ -44,8 +53,7 @@ fn zero_block_size_is_rejected() {
 /// panics; it must be reported as a configuration error instead.
 #[test]
 fn overflowing_total_blocks_is_rejected_not_panicked() {
-    let err = Engine::new(mock(), 4, usize::MAX, 4096)
-        .expect_err("an element count that overflows usize cannot be allocated");
+    let err = construct_err(usize::MAX, 4096);
     assert!(
         err.to_string().contains("KV"),
         "error must name the KV storage, got: {err}"
@@ -57,8 +65,7 @@ fn overflowing_total_blocks_is_rejected_not_panicked() {
 #[test]
 fn kv_allocation_beyond_physical_memory_is_rejected() {
     const BLOCKS: usize = 1_000_000_000_000;
-    let err = Engine::new(mock(), 4, BLOCKS, 4)
-        .expect_err("a petabyte of KV slots cannot be allocated");
+    let err = construct_err(BLOCKS, 4);
     let msg = err.to_string();
     assert!(
         msg.contains("KV"),
@@ -268,56 +275,49 @@ fn write_synthetic_gguf(path: &Path, kv_heads: usize) {
             .unwrap(),
         ),
     ];
+    // K/V tensors always keep a real shape; `kv_heads` only changes the declared
+    // metadata, which is what the engine reads to size KV storage. Writing zero-row
+    // tensors would trip candle's zero-slice check instead of testing the engine.
     for i in 0..LAYERS {
-        for (name, tensor, is_norm) in [
+        for (name, tensor) in [
             (
                 format!("blk.{i}.attn_norm.weight"),
                 Tensor::ones(HIDDEN, DType::F32, &dev).unwrap(),
-                true,
             ),
             (
                 format!("blk.{i}.attn_q.weight"),
                 rand_tensor(&mut rng, Q_HEADS * head_dim, HIDDEN),
-                false,
             ),
             (
                 format!("blk.{i}.attn_k.weight"),
-                rand_tensor(&mut rng, kv_heads * head_dim, HIDDEN),
-                false,
+                rand_tensor(&mut rng, 2 * head_dim, HIDDEN),
             ),
             (
                 format!("blk.{i}.attn_v.weight"),
-                rand_tensor(&mut rng, kv_heads * head_dim, HIDDEN),
-                false,
+                rand_tensor(&mut rng, 2 * head_dim, HIDDEN),
             ),
             (
                 format!("blk.{i}.attn_output.weight"),
                 rand_tensor(&mut rng, HIDDEN, Q_HEADS * head_dim),
-                false,
             ),
             (
                 format!("blk.{i}.ffn_norm.weight"),
                 Tensor::ones(HIDDEN, DType::F32, &dev).unwrap(),
-                true,
             ),
             (
                 format!("blk.{i}.ffn_gate.weight"),
                 rand_tensor(&mut rng, INTER, HIDDEN),
-                false,
             ),
             (
                 format!("blk.{i}.ffn_up.weight"),
                 rand_tensor(&mut rng, INTER, HIDDEN),
-                false,
             ),
             (
                 format!("blk.{i}.ffn_down.weight"),
                 rand_tensor(&mut rng, HIDDEN, INTER),
-                false,
             ),
         ] {
-            let dtype = if is_norm { GgmlDType::F32 } else { GgmlDType::F32 };
-            tensors.push((name, QTensor::quantize(&tensor, dtype).unwrap()));
+            tensors.push((name, QTensor::quantize(&tensor, GgmlDType::F32).unwrap()));
         }
     }
 
@@ -329,10 +329,7 @@ fn write_synthetic_gguf(path: &Path, kv_heads: usize) {
         ("llama.embedding_length", Value::U32(HIDDEN as u32)),
         ("llama.feed_forward_length", Value::U32(INTER as u32)),
         ("llama.rope.freq_base", Value::F32(10000.0)),
-        (
-            "llama.attention.layer_norm_rms_epsilon",
-            Value::F32(1e-5),
-        ),
+        ("llama.attention.layer_norm_rms_epsilon", Value::F32(1e-5)),
     ];
     let meta_refs: Vec<(&str, &Value)> = meta.iter().map(|(k, v)| (*k, v)).collect();
     let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();

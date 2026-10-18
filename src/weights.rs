@@ -382,6 +382,13 @@ impl ModelWeights {
         let num_kv_heads =
             metadata(&format!("{}.attention.head_count_kv", prefix))?.to_u32()? as usize;
         let hidden_size = metadata(&format!("{}.embedding_length", prefix))?.to_u32()? as usize;
+        // A model with no KV heads has no KV storage shape: reject it here with the
+        // reason rather than letting a zero-sized tensor reach the allocator (#85).
+        if num_attention_heads == 0 || num_kv_heads == 0 || hidden_size < num_attention_heads {
+            return Err(EngineError::Config(format!(
+                "cannot build KV storage: model declares {num_attention_heads} attention heads, {num_kv_heads} KV heads and hidden size {hidden_size}"
+            )));
+        }
         let intermediate_size =
             metadata(&format!("{}.feed_forward_length", prefix))?.to_u32()? as usize;
         let rms_norm_eps = metadata(&format!("{}.attention.layer_norm_rms_epsilon", prefix))

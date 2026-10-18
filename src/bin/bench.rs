@@ -131,7 +131,7 @@ fn create_engine_for_workload(
     let blocks_per_seq = max_tokens_per_seq.div_ceil(block_size) + 1;
     let total_blocks = (blocks_per_seq * num_requests.max(1)).max(128);
 
-    Ok(Engine::new(model, max_running, total_blocks, block_size))
+    Engine::new(model, max_running, total_blocks, block_size)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

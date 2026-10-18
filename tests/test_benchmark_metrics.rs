@@ -38,7 +38,7 @@ fn test_bench_itl_metrics_calculation() {
 #[test]
 fn test_run_synthetic_sweep_execution() {
     let model = kanso_infer::model::Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-    let mut engine = kanso_infer::engine::Engine::new(model, 4, 30, 4);
+    let mut engine = kanso_infer::engine::Engine::new(model, 4, 30, 4).expect("engine");
 
     let report = kanso_infer::bench::run_synthetic_sweep(
         &mut engine,

@@ -153,7 +153,8 @@ fn test_multiturn_generation_parity_with_reference() {
     // 2. Incremental engine generation
     let mut engine = kanso_infer::engine::Engine::new(
         model, /* max_running */ 1, /* total_blocks */ 10, /* block_size */ 2,
-    );
+    )
+    .expect("engine");
     let req_id = engine.add_request(prompt.clone(), num_tokens_to_gen);
 
     let mut engine_generated = Vec::new();

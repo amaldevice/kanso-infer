@@ -17,6 +17,7 @@ fn engine() -> Engine {
         /* block_size */ 4,
         usize::MAX,
     )
+    .expect("engine")
 }
 
 fn drain(engine: &mut Engine) {

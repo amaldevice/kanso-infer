@@ -20,7 +20,8 @@ fn test_one_forward_call_per_step_regardless_of_batch() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     let mut engine = Engine::new(
         model, /* max_running */ 4, /* blocks */ 40, /* block_size */ 4,
-    );
+    )
+    .expect("engine");
     for i in 0..4u32 {
         engine.add_request(vec![i, i + 1, i + 2, i + 3], 8);
     }
@@ -234,8 +235,8 @@ fn mock_model(backend: kanso_infer::Backend) -> Model {
 /// and the ratio between them survives. Returns `(batch-1 tok/s, batch-8 tok/s)`,
 /// where a rate is tokens emitted over the wall time actually spent stepping.
 fn lockstep_rates(backend: kanso_infer::Backend) -> (f64, f64) {
-    let mut single = Engine::new(mock_model(backend), 1, 64, 16);
-    let mut batched = Engine::new(mock_model(backend), 8, 128, 16);
+    let mut single = Engine::new(mock_model(backend), 1, 64, 16).expect("engine");
+    let mut batched = Engine::new(mock_model(backend), 8, 128, 16).expect("engine");
     single.add_request(vec![1; PROMPT], GEN);
     for i in 0..8u32 {
         batched.add_request(vec![1 + i; PROMPT], GEN);

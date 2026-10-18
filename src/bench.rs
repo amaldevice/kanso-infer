@@ -463,6 +463,5 @@ pub fn create_engine_for_model_profile(
     let total_blocks = (blocks_per_seq * num_requests.max(1)).max(128);
     let mut model = crate::model::Model::create_mock_from_config(&config)?;
     model.set_backend(backend);
-    let engine = Engine::new(model, max_running, total_blocks, block_size);
-    Ok(engine)
+    Engine::new(model, max_running, total_blocks, block_size)
 }
