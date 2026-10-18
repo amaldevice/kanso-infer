@@ -4,10 +4,17 @@ use serde::{Deserialize, Serialize};
 /// Execution backend selected via `--backend`. Parsed once by clap;
 /// an unknown string fails CLI parsing instead of silently running CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Backend {
+    // PascalCase aliases keep any report serialized before the wire form was
+    // pinned to lowercase (ticket #92) readable.
+    #[serde(alias = "Cpu")]
     Cpu,
+    #[serde(alias = "Metal")]
     Metal,
+    #[serde(alias = "Neon")]
     Neon,
+    #[serde(alias = "Amx")]
     Amx,
 }
 
