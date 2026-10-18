@@ -84,6 +84,22 @@ pub fn parse_trace_file(path: &str) -> Result<Vec<TraceEntry>, EngineError> {
     Ok(entries)
 }
 
+/// Whether the report's byte telemetry was actually weighed (#91).
+///
+/// A report whose `bytes_read_per_step` is zero was built from numbers alone:
+/// nothing was weighed, so the zero means "not measured yet", not "small".
+/// Every report carries this marker, and the gate refuses to pass an unweighed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TelemetryStatus {
+    /// Bytes were weighed from the model that ran.
+    Measured,
+    /// No weighing happened; the byte fields carry no information.
+    /// Also the reading of a report written before the marker existed.
+    #[default]
+    Unmeasured,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkReport {
     pub total_tokens: usize,
@@ -117,6 +133,9 @@ pub struct BenchmarkReport {
     /// How `peak_bandwidth_gb_s` was obtained (e.g. the STREAM-triad microbench).
     #[serde(default)]
     pub peak_bandwidth_source: String,
+    /// Whether the byte fields above came from a weighing (#91).
+    #[serde(default)]
+    pub telemetry: TelemetryStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speculative: Option<crate::speculative::profiler::SpeculativeReport>,
 }
@@ -134,6 +153,7 @@ impl BenchmarkReport {
     #[must_use]
     pub fn with_telemetry(mut self, bytes_read_per_step: usize) -> Self {
         self.bytes_read_per_step = bytes_read_per_step;
+        self.telemetry = TelemetryStatus::from_bytes(bytes_read_per_step);
         let (peak, source) = crate::hardware::measure_peak_bandwidth_gb_s();
         self.peak_bandwidth_gb_s = peak;
         self.peak_bandwidth_source = source;
@@ -144,10 +164,28 @@ impl BenchmarkReport {
         serde_json::to_string(self)
     }
 
+    /// True when nothing was weighed, so the byte fields mean nothing (#91).
+    pub fn is_unweighed(&self) -> bool {
+        self.telemetry == TelemetryStatus::Unmeasured
+    }
+
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
 }
+/// A zero byte count is never a measurement: a resident model weighs something.
+impl TelemetryStatus {
+    pub fn from_bytes(bytes_read_per_step: usize) -> Self {
+        if bytes_read_per_step > 0 {
+            Self::Measured
+        } else {
+            Self::Unmeasured
+        }
+    }
+}
+
+/// Numbers-only report: no weighing happens here, so the result is marked
+/// [`TelemetryStatus::Unmeasured`] and the gate will not pass it (#91).
 pub fn evaluate_run(
     total_tokens: usize,
     total_duration_secs: f64,
@@ -281,6 +319,7 @@ pub fn evaluate_run_with_timings(
         bytes_read_per_step,
         peak_bandwidth_gb_s,
         peak_bandwidth_source,
+        telemetry: TelemetryStatus::from_bytes(bytes_read_per_step),
         speculative: None,
     }
 }
