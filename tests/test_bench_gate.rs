@@ -360,11 +360,7 @@ fn write_tiny_gguf(path: &Path) {
     let mut tensors: Vec<(String, QTensor)> = vec![
         (
             "token_embd.weight".to_string(),
-            QTensor::quantize(
-                &rand_tensor(&mut rng, VOCAB, HIDDEN),
-                GgmlDType::Q8_0,
-            )
-            .unwrap(),
+            QTensor::quantize(&rand_tensor(&mut rng, VOCAB, HIDDEN), GgmlDType::Q8_0).unwrap(),
         ),
         (
             "output_norm.weight".to_string(),
@@ -443,8 +439,7 @@ fn write_tiny_gguf(path: &Path) {
         ("llama.attention.layer_norm_rms_epsilon", Value::F32(1e-5)),
     ];
     let meta_refs: Vec<(&str, &Value)> = meta.iter().map(|(k, v)| (*k, v)).collect();
-    let tensor_refs: Vec<(&str, &QTensor)> =
-        tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();
+    let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();
     let file = std::fs::File::create(path).expect("create tiny gguf");
     gguf_file::write(&mut BufWriter::new(file), &meta_refs, &tensor_refs).expect("write tiny gguf");
 }
@@ -492,7 +487,11 @@ fn bench_gate_run_exits_0_when_the_measured_report_is_within_budget() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(stdout.contains("passed"), "{stdout}");
     assert!(
         report.is_file(),
@@ -510,7 +509,11 @@ fn bench_gate_run_exits_1_when_the_measured_report_breaks_budget() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(stdout.contains("violated"), "{stdout}");
 
     let evidence = std::fs::read_to_string(&report)

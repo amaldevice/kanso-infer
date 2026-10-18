@@ -209,7 +209,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
     let warmup = !args.no_warmup;
 
-    if let Some(gate_path) = &args.gate {
+    if args.gate_report.is_some() {
+        let gate_path = args
+            .gate
+            .as_deref()
+            .expect("clap requires --gate alongside --gate-report");
         return run_gate(gate_path, args.gate_report.as_deref());
     }
     let model_path = match &args.model {
