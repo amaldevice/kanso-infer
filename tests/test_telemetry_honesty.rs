@@ -101,7 +101,7 @@ fn same_seed_same_tokens_engine() {
 #[test]
 fn ane_claim_requires_real_dispatch() {
     assert!(
-        !kanso_infer::ane::has_ane_support(),
+        !kanso_infer::ffn_offload::has_ane_support(),
         "no Core ML execution path exists yet; claiming ANE support lies"
     );
 }

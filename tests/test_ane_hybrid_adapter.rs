@@ -1,8 +1,8 @@
 use candle_core::Tensor;
+use kanso_infer::engine::Engine;
 use kanso_infer::ffn_offload::{
     AneLayerAdapter, CoreMlAneAdapter, CpuFallbackAneAdapter, HybridExecutionPipeline,
 };
-use kanso_infer::engine::Engine;
 use kanso_infer::model::Model;
 
 #[test]

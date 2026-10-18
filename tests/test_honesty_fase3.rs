@@ -21,7 +21,7 @@ const VOCAB: usize = 256;
 const LAYERS: usize = 2;
 
 fn tiny_tensor(rng: &mut rand::rngs::StdRng, rows: usize, cols: usize) -> Tensor {
-    use rand::{Rng, SeedableRng};
+    use rand::Rng;
     let data: Vec<f32> = (0..rows * cols)
         .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * 0.05)
         .collect();
@@ -41,8 +41,11 @@ fn write_gguf(path: &Path, arch: &str, prefix: &str, extra_meta: &[(String, Valu
         ),
         (
             "output_norm.weight".to_string(),
-            QTensor::quantize(&Tensor::ones(HIDDEN, DType::F32, &dev).unwrap(), GgmlDType::F32)
-                .unwrap(),
+            QTensor::quantize(
+                &Tensor::ones(HIDDEN, DType::F32, &dev).unwrap(),
+                GgmlDType::F32,
+            )
+            .unwrap(),
         ),
     ];
     for i in 0..LAYERS {
@@ -88,21 +91,38 @@ fn write_gguf(path: &Path, arch: &str, prefix: &str, extra_meta: &[(String, Valu
         }
     }
     let mut meta: Vec<(String, Value)> = vec![
-        ("general.architecture".to_string(), Value::String(arch.to_string())),
+        (
+            "general.architecture".to_string(),
+            Value::String(arch.to_string()),
+        ),
         (format!("{prefix}.block_count"), Value::U32(LAYERS as u32)),
-        (format!("{prefix}.attention.head_count"), Value::U32(Q_HEADS as u32)),
-        (format!("{prefix}.attention.head_count_kv"), Value::U32(KV_HEADS as u32)),
-        (format!("{prefix}.embedding_length"), Value::U32(HIDDEN as u32)),
-        (format!("{prefix}.feed_forward_length"), Value::U32(INTER as u32)),
+        (
+            format!("{prefix}.attention.head_count"),
+            Value::U32(Q_HEADS as u32),
+        ),
+        (
+            format!("{prefix}.attention.head_count_kv"),
+            Value::U32(KV_HEADS as u32),
+        ),
+        (
+            format!("{prefix}.embedding_length"),
+            Value::U32(HIDDEN as u32),
+        ),
+        (
+            format!("{prefix}.feed_forward_length"),
+            Value::U32(INTER as u32),
+        ),
         (format!("{prefix}.rope.freq_base"), Value::F32(10000.0)),
-        (format!("{prefix}.attention.layer_norm_rms_epsilon"), Value::F32(1e-5)),
+        (
+            format!("{prefix}.attention.layer_norm_rms_epsilon"),
+            Value::F32(1e-5),
+        ),
     ];
     for (k, v) in extra_meta {
         meta.push((k.clone(), v.clone()));
     }
     let meta_refs: Vec<(&str, &Value)> = meta.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    let tensor_refs: Vec<(&str, &QTensor)> =
-        tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();
+    let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();
     let file = std::fs::File::create(path).expect("create synthetic gguf");
     gguf_file::write(&mut BufWriter::new(file), &meta_refs, &tensor_refs)
         .expect("write synthetic gguf");
@@ -126,7 +146,10 @@ fn loader_rejects_foreign_arch() {
         err.to_string().contains("unsupported"),
         "error must say unsupported, got: {err}"
     );
-    assert!(err.to_string().contains("mamba"), "error must name the arch, got: {err}");
+    assert!(
+        err.to_string().contains("mamba"),
+        "error must name the arch, got: {err}"
+    );
 }
 
 #[test]
@@ -150,7 +173,11 @@ fn granite_embedding_scale_changes_logits() {
         a.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
         b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
     );
-    let max_diff = va.iter().zip(&vb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let max_diff = va
+        .iter()
+        .zip(&vb)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
     assert!(
         max_diff > 1e-3,
         "granite.embedding_scale=2.0 must move logits, max diff {max_diff}"
@@ -190,10 +217,14 @@ fn readme_feature_status_audit() {
         }
         let mut found = false;
         let mut start = 0;
-        while let Some(i) = pointer[start..].find("src/").or_else(|| pointer[start..].find("tests/")).or_else(|| pointer[start..].find("docs/")) {
+        while let Some(i) = pointer[start..]
+            .find("src/")
+            .or_else(|| pointer[start..].find("tests/"))
+            .or_else(|| pointer[start..].find("docs/"))
+        {
             let abs = start + i;
             let end = pointer[abs..]
-                .find(|c: char| c == '`' || c == ' ' || c == ',' || c == ')')
+                .find(['`', ' ', ',', ')'])
                 .map(|e| abs + e)
                 .unwrap_or(pointer.len());
             if root.join(&pointer[abs..end]).exists() {
@@ -202,9 +233,6 @@ fn readme_feature_status_audit() {
             }
             start = end;
         }
-        assert!(
-            found,
-            "feature row has no existing exec pointer: {row}"
-        );
+        assert!(found, "feature row has no existing exec pointer: {row}");
     }
 }

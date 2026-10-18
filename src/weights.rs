@@ -387,13 +387,9 @@ impl ModelWeights {
             .and_then(|v| v.to_f32().map_err(|e| EngineError::Config(e.to_string())))
             .unwrap_or(10000.0);
         // Granite multipliers (llama.cpp `granite.cpp` semantics); absent = None = identity.
-        let opt_f32 = |key: &str| {
-            content
-                .metadata
-                .get(key)
-                .and_then(|v| v.to_f32().ok())
-        };
-        let (embedding_scale, attention_scale, residual_scale, logit_scale) = if prefix == "granite" {
+        let opt_f32 = |key: &str| content.metadata.get(key).and_then(|v| v.to_f32().ok());
+        let (embedding_scale, attention_scale, residual_scale, logit_scale) = if prefix == "granite"
+        {
             (
                 opt_f32("granite.embedding_scale"),
                 opt_f32("granite.attention.scale"),
