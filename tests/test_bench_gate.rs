@@ -552,7 +552,11 @@ fn bench_gate_run_leaves_evidence_behind_without_explicit_json_output() {
         .expect("run bench --gate without --json-output");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 
     // The verdict must be re-checkable without re-running the workload.
     let report_line = stdout

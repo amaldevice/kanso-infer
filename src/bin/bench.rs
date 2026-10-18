@@ -170,7 +170,9 @@ fn run_gate(
 }
 
 /// Gate the reports just produced by a run. A violation anywhere outranks a
-/// skip; every report gets its own table.
+/// skip; every report gets its own table. The report JSON is always written:
+/// to `--json-output` when given, otherwise to a temp file whose path is
+/// printed, so the verdict can be re-checked without re-running the workload.
 fn gate_reports(
     gate_path: &str,
     labeled: &[(String, &BenchmarkReport)],
@@ -188,13 +190,27 @@ fn gate_reports(
         violated |= outcome.code() == 1;
         skipped |= outcome.code() == 2;
     }
+
+    let evidence_path = match json_output {
+        Some(path) => std::path::PathBuf::from(path),
+        None => {
+            let path = std::env::temp_dir().join(format!(
+                "kanso-gate-{}-{}.json",
+                budget.name,
+                std::process::id()
+            ));
+            let json = if labeled.len() == 1 {
+                serde_json::to_string_pretty(labeled[0].1)?
+            } else {
+                let reports: Vec<&BenchmarkReport> = labeled.iter().map(|(_, r)| *r).collect();
+                serde_json::to_string_pretty(&reports)?
+            };
+            std::fs::write(&path, json)?;
+            path
+        }
+    };
     println!("evidence: budget JSON {gate_path}");
-    match json_output {
-        Some(path) => println!("evidence: report JSON {path}"),
-        None => println!(
-            "evidence: report JSON not written (pass --json-output <path> to keep the numbers)"
-        ),
-    }
+    println!("evidence: report JSON {}", evidence_path.display());
     std::io::stdout().flush()?;
     std::process::exit(if violated {
         1
