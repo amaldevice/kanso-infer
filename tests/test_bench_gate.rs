@@ -522,3 +522,53 @@ fn bench_gate_run_exits_1_when_the_measured_report_breaks_budget() {
     assert!(parsed.decode_ms_per_step > 0.0);
     let _ = std::fs::remove_file(&report);
 }
+
+#[test]
+fn bench_gate_run_leaves_evidence_behind_without_explicit_json_output() {
+    let gguf = write_tmp("evidence.gguf", "");
+    write_tiny_gguf(&gguf);
+    let budget = write_tmp(
+        "evidence-budget.json",
+        r#"{"name":"evidence","rows":[{"metric":"decode_ms_per_step","bound":"max","budget":1000000.0}]}"#,
+    );
+
+    let out = std::process::Command::new(bench_bin())
+        .args([
+            "--gate",
+            budget.to_str().unwrap(),
+            "--model",
+            gguf.to_str().unwrap(),
+            "--backend",
+            "cpu",
+            "--batch-sizes",
+            "1",
+            "--prompt-len",
+            "2",
+            "--gen-len",
+            "2",
+            "--no-warmup",
+        ])
+        .output()
+        .expect("run bench --gate without --json-output");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // The verdict must be re-checkable without re-running the workload.
+    let report_line = stdout
+        .lines()
+        .find(|line| line.starts_with("evidence: report JSON "))
+        .unwrap_or_else(|| panic!("no evidence report line in:\n{stdout}"));
+    let report_path = report_line
+        .trim_start_matches("evidence: report JSON ")
+        .trim()
+        .to_string();
+    let evidence = std::fs::read_to_string(&report_path)
+        .unwrap_or_else(|e| panic!("evidence report '{report_path}' unreadable: {e}\n{stdout}"));
+    let parsed: BenchmarkReport = serde_json::from_str(&evidence).expect("report JSON parses");
+    assert!(parsed.decode_ms_per_step > 0.0);
+
+    let _ = std::fs::remove_file(&report_path);
+    let _ = std::fs::remove_file(&budget);
+    let _ = std::fs::remove_file(&gguf);
+}
