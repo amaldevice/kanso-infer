@@ -15,7 +15,7 @@ fn test_bench_itl_metrics_calculation() {
     let ttfts = vec![10.0, 15.0];
     let itls = vec![5.0, 10.0, 15.0, 20.0];
     let report = kanso_infer::bench::evaluate_run_with_timings(
-        100, 1.0, 2, &ttfts, &itls, 10, 0.1, 20, 0.5, 12345,
+        100, 1.0, 2, &ttfts, &itls, 10, 0.1, 20, 0.5, 12345, 50_000_000,
     );
 
     assert_eq!(report.itl_mean_ms, 12.5);
@@ -24,7 +24,17 @@ fn test_bench_itl_metrics_calculation() {
     assert_eq!(report.itl_p99_ms, 20.0);
     assert_eq!(report.ttft_p50_ms, 10.0);
     assert_eq!(report.ttft_p90_ms, 15.0);
+    assert_eq!(report.bytes_read_per_step, 50_000_000);
+    assert!(report.peak_bandwidth_gb_s > 0.0);
+    assert!(report.peak_bandwidth_source.contains("measured"));
+    let (eff, util) = kanso_infer::hardware::calculate_bandwidth_utilization(
+        report.bytes_read_per_step,
+        report.decode_ms_per_step,
+        report.peak_bandwidth_gb_s,
+    );
+    assert!(eff > 0.0 && util > 0.0);
 }
+
 #[test]
 fn test_run_synthetic_sweep_execution() {
     let model = kanso_infer::model::Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
@@ -50,7 +60,7 @@ fn test_benchmark_report_json_serialization_percentiles() {
     let ttfts = vec![12.0, 18.0, 24.0];
     let itls = vec![4.0, 6.0, 8.0, 10.0];
     let report = kanso_infer::bench::evaluate_run_with_timings(
-        50, 0.5, 3, &ttfts, &itls, 15, 0.1, 10, 0.4, 999,
+        50, 0.5, 3, &ttfts, &itls, 15, 0.1, 10, 0.4, 999, 25_000_000,
     );
     let json_str = report.to_json().unwrap();
     assert!(json_str.contains("\"ttft_p50_ms\":"));

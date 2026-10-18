@@ -91,10 +91,6 @@ fn write_gguf(path: &Path, arch: &str, prefix: &str, extra_meta: &[(String, Valu
         }
     }
     let mut meta: Vec<(String, Value)> = vec![
-        (
-            "general.architecture".to_string(),
-            Value::String(arch.to_string()),
-        ),
         (format!("{prefix}.block_count"), Value::U32(LAYERS as u32)),
         (
             format!("{prefix}.attention.head_count"),
@@ -118,6 +114,12 @@ fn write_gguf(path: &Path, arch: &str, prefix: &str, extra_meta: &[(String, Valu
             Value::F32(1e-5),
         ),
     ];
+    if !arch.is_empty() {
+        meta.push((
+            "general.architecture".to_string(),
+            Value::String(arch.to_string()),
+        ));
+    }
     for (k, v) in extra_meta {
         meta.push((k.clone(), v.clone()));
     }
@@ -153,6 +155,20 @@ fn loader_rejects_foreign_arch() {
 }
 
 #[test]
+fn loader_rejects_missing_arch_key() {
+    let path = tmp("no-arch");
+    write_gguf(&path, "", "llama", &[]);
+    let err = match ModelWeights::load_from_gguf(&path, &Device::Cpu) {
+        Ok(_) => panic!("missing general.architecture must not load as llama"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("general.architecture"),
+        "error must mention general.architecture, got: {err}"
+    );
+}
+
+#[test]
 fn granite_embedding_scale_changes_logits() {
     let plain = tmp("granite-plain");
     write_gguf(&plain, "granite", "granite", &[]);
@@ -181,6 +197,134 @@ fn granite_embedding_scale_changes_logits() {
     assert!(
         max_diff > 1e-3,
         "granite.embedding_scale=2.0 must move logits, max diff {max_diff}"
+    );
+}
+
+#[test]
+fn granite_residual_scale_changes_logits() {
+    let plain = tmp("granite-plain-res");
+    write_gguf(&plain, "granite", "granite", &[]);
+    let scaled = tmp("granite-scaled-res");
+    write_gguf(
+        &scaled,
+        "granite",
+        "granite",
+        &[("granite.residual_scale".to_string(), Value::F32(2.0))],
+    );
+    let load = |p: &Path| {
+        let (w, c) = ModelWeights::load_from_gguf(p, &Device::Cpu).expect("load granite");
+        Model::new(w, c, Device::Cpu)
+    };
+    let a = load(&plain).forward_tokens(&[1, 2, 3]).unwrap();
+    let b = load(&scaled).forward_tokens(&[1, 2, 3]).unwrap();
+    let (va, vb) = (
+        a.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+    );
+    let max_diff = va
+        .iter()
+        .zip(&vb)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff > 1e-3,
+        "granite.residual_scale=2.0 must move logits, max diff {max_diff}"
+    );
+}
+
+#[test]
+fn granite_logit_scale_changes_logits() {
+    let plain = tmp("granite-plain-logit");
+    write_gguf(&plain, "granite", "granite", &[]);
+    let scaled = tmp("granite-scaled-logit");
+    write_gguf(
+        &scaled,
+        "granite",
+        "granite",
+        &[("granite.logit_scale".to_string(), Value::F32(2.0))],
+    );
+    let load = |p: &Path| {
+        let (w, c) = ModelWeights::load_from_gguf(p, &Device::Cpu).expect("load granite");
+        Model::new(w, c, Device::Cpu)
+    };
+    let a = load(&plain).forward_tokens(&[1, 2, 3]).unwrap();
+    let b = load(&scaled).forward_tokens(&[1, 2, 3]).unwrap();
+    let (va, vb) = (
+        a.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+    );
+    let max_diff = va
+        .iter()
+        .zip(&vb)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff > 1e-3,
+        "granite.logit_scale=2.0 must move logits, max diff {max_diff}"
+    );
+}
+
+#[test]
+fn granite_attention_scale_changes_logits() {
+    let plain = tmp("granite-plain-attn");
+    write_gguf(&plain, "granite", "granite", &[]);
+    let scaled = tmp("granite-scaled-attn");
+    write_gguf(
+        &scaled,
+        "granite",
+        "granite",
+        &[("granite.attention.scale".to_string(), Value::F32(0.5))],
+    );
+    let load = |p: &Path| {
+        let (w, c) = ModelWeights::load_from_gguf(p, &Device::Cpu).expect("load granite");
+        Model::new(w, c, Device::Cpu)
+    };
+    let a = load(&plain).forward_tokens(&[1, 2, 3]).unwrap();
+    let b = load(&scaled).forward_tokens(&[1, 2, 3]).unwrap();
+    let (va, vb) = (
+        a.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+    );
+    let max_diff = va
+        .iter()
+        .zip(&vb)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff > 1e-3,
+        "granite.attention.scale=0.5 must move logits, max diff {max_diff}"
+    );
+}
+
+#[test]
+fn granite_attention_scale_zero_pins_default_behavior() {
+    let plain = tmp("granite-plain-zero");
+    write_gguf(&plain, "granite", "granite", &[]);
+    let zero_scaled = tmp("granite-zero-attn");
+    write_gguf(
+        &zero_scaled,
+        "granite",
+        "granite",
+        &[("granite.attention.scale".to_string(), Value::F32(0.0))],
+    );
+    let load = |p: &Path| {
+        let (w, c) = ModelWeights::load_from_gguf(p, &Device::Cpu).expect("load granite");
+        Model::new(w, c, Device::Cpu)
+    };
+    let a = load(&plain).forward_tokens(&[1, 2, 3]).unwrap();
+    let b = load(&zero_scaled).forward_tokens(&[1, 2, 3]).unwrap();
+    let (va, vb) = (
+        a.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+    );
+    let max_diff = va
+        .iter()
+        .zip(&vb)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert_eq!(
+        max_diff, 0.0,
+        "granite.attention.scale=0.0 must fallback to 1/sqrt(head_dim) identically"
     );
 }
 
