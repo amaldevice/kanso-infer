@@ -576,3 +576,34 @@ fn bench_gate_run_leaves_evidence_behind_without_explicit_json_output() {
     let _ = std::fs::remove_file(&budget);
     let _ = std::fs::remove_file(&gguf);
 }
+
+#[test]
+fn cli_gate_report_accepts_the_sweep_array_a_run_writes() {
+    let sweep = format!(
+        "[{},{}]",
+        sample_report().to_json().unwrap(),
+        sample_report().to_json().unwrap()
+    );
+    let report = write_tmp("sweep-report.json", &sweep);
+    let budget = write_tmp(
+        "sweep-budget.json",
+        r#"{"name":"sweep","rows":[{"metric":"decode_ms_per_step","bound":"max","budget":20.0}]}"#,
+    );
+
+    let out = run_cli(&budget, &report);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a violated report inside a sweep must fail the gate:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        stdout.matches("decode_ms_per_step").count(),
+        2,
+        "every report in the sweep must be reported:\n{stdout}"
+    );
+    let _ = std::fs::remove_file(&budget);
+    let _ = std::fs::remove_file(&report);
+}
