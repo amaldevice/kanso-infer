@@ -62,6 +62,14 @@ pub struct Args {
     /// Path to export benchmark report in JSON format
     #[arg(long)]
     pub json_output: Option<String>,
+
+    /// Path to a gate budget JSON; exits 0 (passed), 1 (violated), 2 (skipped)
+    #[arg(long)]
+    pub gate: Option<String>,
+
+    /// Evaluate an existing BenchmarkReport JSON against `--gate` instead of running a workload
+    #[arg(long, requires = "gate")]
+    pub gate_report: Option<String>,
 }
 
 fn print_report(label: &str, report: &BenchmarkReport, backend: Backend) {
@@ -134,10 +142,76 @@ fn create_engine_for_workload(
     Ok(Engine::new(model, max_running, total_blocks, block_size))
 }
 
+/// `bench --gate <budget.json> --gate-report <report.json>`: re-checks an
+/// existing report without loading a model, then exits with the gate's code.
+fn run_gate(
+    gate_path: &str,
+    report_path: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::Write;
+
+    let Some(report_path) = report_path else {
+        eprintln!("Error: --gate requires --gate-report <report.json>, the evidence to re-check.");
+        std::process::exit(1);
+    };
+
+    let budget = kanso_infer::bench::GateBudget::from_file(std::path::Path::new(gate_path))?;
+    let evidence = std::fs::read_to_string(report_path)
+        .map_err(|e| format!("cannot read gate report '{report_path}': {e}"))?;
+    let report: BenchmarkReport = serde_json::from_str(&evidence)
+        .map_err(|e| format!("invalid gate report '{report_path}': {e}"))?;
+
+    let outcome = kanso_infer::bench::evaluate_gate(&budget, &report)?;
+    print!("{}", outcome.format_table());
+    println!("evidence: budget JSON {gate_path}");
+    println!("evidence: report JSON {report_path}");
+    std::io::stdout().flush()?;
+    std::process::exit(outcome.code());
+}
+
+/// Gate the reports just produced by a run. A violation anywhere outranks a
+/// skip; every report gets its own table.
+fn gate_reports(
+    gate_path: &str,
+    labeled: &[(String, &BenchmarkReport)],
+    json_output: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::Write;
+
+    let budget = kanso_infer::bench::GateBudget::from_file(std::path::Path::new(gate_path))?;
+    let mut violated = false;
+    let mut skipped = false;
+    for (label, report) in labeled {
+        let outcome = kanso_infer::bench::evaluate_gate(&budget, report)?;
+        println!("[{label}]");
+        print!("{}", outcome.format_table());
+        violated |= outcome.code() == 1;
+        skipped |= outcome.code() == 2;
+    }
+    println!("evidence: budget JSON {gate_path}");
+    match json_output {
+        Some(path) => println!("evidence: report JSON {path}"),
+        None => println!(
+            "evidence: report JSON not written (pass --json-output <path> to keep the numbers)"
+        ),
+    }
+    std::io::stdout().flush()?;
+    std::process::exit(if violated {
+        1
+    } else if skipped {
+        2
+    } else {
+        0
+    });
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
     let warmup = !args.no_warmup;
 
+    if let Some(gate_path) = &args.gate {
+        return run_gate(gate_path, args.gate_report.as_deref());
+    }
     let model_path = match &args.model {
         Some(m) => match kanso_infer::weights::resolve_model_path(m) {
             Ok(p) => p,
@@ -223,6 +297,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             std::fs::write(json_path, json_content)?;
             println!("Exported JSON trace benchmark report to {}", json_path);
         }
+        if let Some(gate_path) = &args.gate {
+            gate_reports(
+                gate_path,
+                &[("trace_replay".to_string(), &report)],
+                args.json_output.as_deref(),
+            )?;
+        }
         return Ok(());
     }
 
@@ -270,6 +351,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         std::fs::write(json_path, json_content)?;
         println!("Exported JSON benchmark sweep report to {}", json_path);
+    }
+
+    if let Some(gate_path) = &args.gate {
+        let labeled: Vec<(String, &BenchmarkReport)> = batch_sizes
+            .iter()
+            .zip(reports.iter())
+            .map(|(batch, report)| (format!("batch_size={batch}"), report))
+            .collect();
+        gate_reports(gate_path, &labeled, args.json_output.as_deref())?;
     }
 
     Ok(())

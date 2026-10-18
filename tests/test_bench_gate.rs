@@ -7,7 +7,7 @@
 use kanso_infer::bench::{
     BenchmarkReport, GateBudget, GateVerdict, evaluate_gate, evaluate_run_with_timings,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Synthetic report, no model and no hardware involved:
 /// `decode_ms_per_step` = 0.5 s / 20 steps x 1000 = 25 ms, `total_tokens_per_sec` = 100.
@@ -188,7 +188,10 @@ fn gate_table_prints_measured_budget_ratio_and_verdict() {
         .format_table();
 
     assert!(table.contains("decode_ms_per_step"), "{table}");
-    assert!(table.contains("25.0000"), "measured value missing:\n{table}");
+    assert!(
+        table.contains("25.0000"),
+        "measured value missing:\n{table}"
+    );
     assert!(table.contains("20.0000"), "budget missing:\n{table}");
     assert!(table.contains("1.250x"), "ratio missing:\n{table}");
     assert!(table.contains("violated"), "verdict missing:\n{table}");
@@ -223,7 +226,7 @@ fn bench_bin() -> &'static str {
     env!("CARGO_BIN_EXE_bench")
 }
 
-fn run_cli(budget_path: &PathBuf, report_path: &PathBuf) -> std::process::Output {
+fn run_cli(budget_path: &Path, report_path: &Path) -> std::process::Output {
     std::process::Command::new(bench_bin())
         .args([
             "--gate",
@@ -236,7 +239,10 @@ fn run_cli(budget_path: &PathBuf, report_path: &PathBuf) -> std::process::Output
 }
 
 fn cli_fixture(tag: &str, budget_rows: &str) -> (PathBuf, PathBuf) {
-    let report = write_tmp(&format!("{tag}-report.json"), &sample_report().to_json_pretty().unwrap());
+    let report = write_tmp(
+        &format!("{tag}-report.json"),
+        &sample_report().to_json_pretty().unwrap(),
+    );
     let budget = write_tmp(
         &format!("{tag}-budget.json"),
         &format!(r#"{{"name":"cli-{tag}","rows":[{budget_rows}]}}"#),
@@ -255,7 +261,11 @@ fn cli_gate_exits_0_when_the_report_is_within_budget() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(stdout.contains("decode_ms_per_step"), "{stdout}");
     assert!(
         stdout.contains(report.to_str().unwrap()),
@@ -280,7 +290,11 @@ fn cli_gate_exits_1_when_the_report_breaks_budget() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(stdout.contains("violated"), "{stdout}");
     assert!(
         !stderr.contains("--model"),
@@ -307,7 +321,11 @@ fn cli_gate_exits_2_when_a_required_asset_is_missing() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    assert_eq!(out.status.code(), Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert!(stdout.contains("skipped"), "{stdout}");
     let _ = std::fs::remove_file(&budget);
     let _ = std::fs::remove_file(&report);
