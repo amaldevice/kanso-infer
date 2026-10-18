@@ -32,7 +32,7 @@ pub struct Args {
     #[arg(long, default_value_t = 64)]
     pub gen_len: usize,
 
-    /// Execution backend: "cpu", "metal", "neon", or "amx" (unknown values are rejected)
+    /// Execution backend: "cpu", "metal", or "amx". "neon" parses but errors: its\n    /// hand-written kernels are not wired to the packed-weight decode path (ticket #89).
     #[arg(long, default_value_t = Backend::default())]
     pub backend: Backend,
 

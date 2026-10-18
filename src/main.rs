@@ -60,7 +60,7 @@ enum Commands {
         #[arg(short, long)]
         model: String,
 
-        /// Hardware backend: cpu, metal, neon, amx (unknown values are rejected)
+        /// Hardware backend: cpu, metal, amx. `neon` parses but errors: its hand-written\n        /// kernels are not wired to the packed-weight decode path (ticket #89).
         #[arg(long, default_value_t = kanso_infer::Backend::default())]
         backend: kanso_infer::Backend,
 
@@ -91,7 +91,7 @@ enum Commands {
         #[arg(short, long)]
         model: String,
 
-        /// Hardware backend: cpu, metal, neon, amx (unknown values are rejected)
+        /// Hardware backend: cpu, metal, amx. `neon` parses but errors: its hand-written\n        /// kernels are not wired to the packed-weight decode path (ticket #89).
         #[arg(long, default_value_t = kanso_infer::Backend::default())]
         backend: kanso_infer::Backend,
 
@@ -118,7 +118,7 @@ enum Commands {
         #[arg(short, long)]
         model: String,
 
-        /// Hardware backend: cpu, metal, neon, amx (unknown values are rejected)
+        /// Hardware backend: cpu, metal, amx. `neon` parses but errors: its hand-written\n        /// kernels are not wired to the packed-weight decode path (ticket #89).
         #[arg(long, default_value_t = kanso_infer::Backend::default())]
         backend: kanso_infer::Backend,
 
@@ -148,7 +148,7 @@ enum Commands {
         #[arg(long, default_value_t = 64)]
         gen_len: usize,
 
-        /// Hardware backend: cpu, metal, neon, amx (unknown values are rejected)
+        /// Hardware backend: cpu, metal, amx. `neon` parses but errors: its hand-written\n        /// kernels are not wired to the packed-weight decode path (ticket #89).
         #[arg(long, default_value_t = kanso_infer::Backend::default())]
         backend: kanso_infer::Backend,
 
