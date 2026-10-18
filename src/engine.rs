@@ -77,11 +77,6 @@ impl Engine {
         self.model.enable_ffn_offload();
     }
 
-    #[deprecated(note = "use enable_ffn_offload")]
-    pub fn enable_ane_hybrid(&mut self) {
-        self.enable_ffn_offload();
-    }
-
     pub fn set_hybrid_pipeline(&mut self, pipeline: crate::ffn_offload::HybridExecutionPipeline) {
         self.model.set_hybrid_pipeline(pipeline);
     }
