@@ -1,5 +1,5 @@
 use crate::error::EngineError;
-use candle_core::{DType, Device, Layout, Storage, Tensor};
+use candle_core::{CpuStorage, DType, Device, InplaceOp1, Layout, Storage, Tensor};
 
 #[cfg(target_os = "macos")]
 #[link(name = "Accelerate", kind = "framework")]
@@ -475,6 +475,9 @@ fn gemm_3d_in_place(
 ///
 /// Returns `None` for non-CPU-F32 or unexpected layouts; the caller falls back to the
 /// generic attention path.
+///
+/// Allocates its own output and scratch buffers; the decode path instead uses
+/// [`AmxWorkspace::paged_decode_attention_into`], which reuses them across layers.
 #[allow(clippy::too_many_lines)]
 pub fn amx_paged_decode_attention(
     q: &Tensor,
@@ -483,12 +486,37 @@ pub fn amx_paged_decode_attention(
     scale: f32,
 ) -> Option<Result<Tensor, EngineError>> {
     let (kv_heads, m, head_dim) = q.dims3().ok()?;
+    let (ctx, ..) = k.dims3().ok()?;
+    let mut out = vec![0.0f32; kv_heads * m * head_dim];
+    let mut scores_t = vec![0.0f32; ctx * m];
+    let mut probs = vec![0.0f32; m * ctx];
+    paged_decode_attention_core(q, k, v, scale, &mut out, &mut scores_t, &mut probs)?;
+    Some(Tensor::from_vec(out, (kv_heads, m, head_dim), &Device::Cpu).map_err(EngineError::from))
+}
+
+/// The paged decode attention kernel over caller-provided buffers: `out` is
+/// `[n_kv_heads * m * head_dim]`, `scores_t` is `[ctx * m]`, `probs` is `[m * ctx]`.
+///
+/// `None` for non-CPU-F32 or unexpected layouts; `out` is then left untouched.
+fn paged_decode_attention_core(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    out: &mut [f32],
+    scores_t: &mut [f32],
+    probs: &mut [f32],
+) -> Option<()> {
+    let (kv_heads, m, head_dim) = q.dims3().ok()?;
     let (ctx, kv_k, hd_k) = k.dims3().ok()?;
     let (ctx_v, kv_v, hd_v) = v.dims3().ok()?;
     if kv_k != kv_heads || kv_v != kv_heads || hd_k != head_dim || hd_v != head_dim {
         return None;
     }
     if ctx_v != ctx || ctx == 0 || m == 0 || kv_heads == 0 {
+        return None;
+    }
+    if out.len() < kv_heads * m * head_dim || scores_t.len() < ctx * m || probs.len() < m * ctx {
         return None;
     }
     if q.dtype() != DType::F32 || k.dtype() != DType::F32 || v.dtype() != DType::F32 {
@@ -540,9 +568,8 @@ pub fn amx_paged_decode_attention(
     }
 
     let row_stride = kv_heads * head_dim;
-    let mut out = vec![0.0f32; kv_heads * m * head_dim];
-    let mut scores_t = vec![0.0f32; ctx * m];
-    let mut probs = vec![0.0f32; m * ctx];
+    let scores_t = &mut scores_t[..ctx * m];
+    let probs = &mut probs[..m * ctx];
     for h in 0..kv_heads {
         let q_h = &q_data[q_start + h * m * head_dim..q_start + (h + 1) * m * head_dim];
         let k_h = &k_data[k_start + h * head_dim..];
@@ -550,7 +577,7 @@ pub fn amx_paged_decode_attention(
         let out_h = &mut out[h * m * head_dim..(h + 1) * m * head_dim];
 
         // scores^T [ctx, m] = K_h [ctx, hd] x Q_h^T [hd, m]
-        amx_gemm_a_strided_b_trans(ctx, m, head_dim, k_h, row_stride, q_h, &mut scores_t);
+        amx_gemm_a_strided_b_trans(ctx, m, head_dim, k_h, row_stride, q_h, scores_t);
 
         // Scale + softmax over the ctx axis, one column per query row; the probabilities
         // land in `probs` as a contiguous [m, ctx] block for the GEMV below.
@@ -576,9 +603,269 @@ pub fn amx_paged_decode_attention(
         }
 
         // out_h [m, hd] = P [m, ctx] x V_h [ctx, hd]
-        amx_gemm_b_strided(m, head_dim, ctx, &probs, v_h, row_stride, out_h);
+        amx_gemm_b_strided(m, head_dim, ctx, probs, v_h, row_stride, out_h);
     }
-    Some(Tensor::from_vec(out, (kv_heads, m, head_dim), &Device::Cpu).map_err(EngineError::from))
+    Some(())
+}
+
+/// Reusable buffers for the AMX decode path (ticket #93 / spec #82 D16).
+///
+/// `amx_matmul` returns a fresh `[m, n]` `Vec` per call, so a decode step paid seven
+/// small allocations per layer per token for its projection outputs plus three more in
+/// the paged attention. This workspace keeps one output tensor per slot and fills it in
+/// place instead, so a token allocates nothing on those seams.
+///
+/// **Aliasing contract:** a tensor handed back by a `*_into` call aliases the slot it was
+/// written to, and stays valid only until the next `*_into` call on that same slot. Each
+/// live intermediate in a forward pass therefore owns a distinct slot; the decode path's
+/// slot numbers are fixed by [`AmxWorkspace::SLOT_*`] and never reused concurrently.
+#[derive(Default)]
+pub struct AmxWorkspace {
+    /// One reusable output tensor per slot, grown on demand.
+    slots: Vec<Option<Tensor>>,
+    /// `[ctx * group]` attention score scratch, reused across layers.
+    scores_t: Vec<f32>,
+    /// `[group * ctx]` softmax scratch, reused across layers.
+    probs: Vec<f32>,
+    /// `[kv_heads * group * head_dim]` paged-attention output staging.
+    attn_out: Vec<f32>,
+}
+
+impl std::fmt::Debug for AmxWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AmxWorkspace")
+            .field("slots", &self.slots.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Copies `data` into a tensor's own storage, row-major.
+struct WriteF32<'a> {
+    data: &'a [f32],
+}
+
+impl InplaceOp1 for WriteF32<'_> {
+    fn name(&self) -> &'static str {
+        "amx-workspace-write"
+    }
+
+    fn cpu_fwd(&self, storage: &mut CpuStorage, layout: &Layout) -> candle_core::Result<()> {
+        let CpuStorage::F32(dst) = storage else {
+            candle_core::bail!("amx workspace slot is not an F32 cpu tensor")
+        };
+        let Some((start, end)) = layout.contiguous_offsets() else {
+            candle_core::bail!("amx workspace slot is not contiguous")
+        };
+        if self.data.len() != end - start {
+            candle_core::bail!(
+                "amx workspace write of {} elements into a {}-element slot",
+                self.data.len(),
+                end - start
+            )
+        }
+        dst[start..end].copy_from_slice(self.data);
+        Ok(())
+    }
+}
+
+/// `C = A * W^T` written straight into a tensor's own storage: `a` is contiguous `[m, k]`,
+/// `w` contiguous `[n, k]`, and the slot holds `[m, n]`.
+struct GemmWeightInto<'a> {
+    a: &'a [f32],
+    w: &'a [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+}
+
+impl InplaceOp1 for GemmWeightInto<'_> {
+    fn name(&self) -> &'static str {
+        "amx-workspace-gemm"
+    }
+
+    fn cpu_fwd(&self, storage: &mut CpuStorage, layout: &Layout) -> candle_core::Result<()> {
+        let CpuStorage::F32(dst) = storage else {
+            candle_core::bail!("amx workspace slot is not an F32 cpu tensor")
+        };
+        let Some((start, end)) = layout.contiguous_offsets() else {
+            candle_core::bail!("amx workspace slot is not contiguous")
+        };
+        let elems = self.m * self.n;
+        if end - start != elems {
+            candle_core::bail!(
+                "amx workspace gemm writes {elems} elements into a {}-element slot",
+                end - start
+            )
+        }
+        amx_gemm_b_trans(
+            self.m,
+            self.n,
+            self.k,
+            self.a,
+            self.w,
+            &mut dst[start..start + elems],
+        );
+        Ok(())
+    }
+}
+
+impl AmxWorkspace {
+    /// Slot numbers the decode path uses. Each live intermediate owns one, so no two
+    /// tensors returned to a forward pass ever share storage.
+    pub const SLOT_Q: usize = 0;
+    pub const SLOT_K: usize = 1;
+    pub const SLOT_V: usize = 2;
+    pub const SLOT_ATTN_OUT: usize = 3;
+    pub const SLOT_FFN_GATE: usize = 4;
+    pub const SLOT_FFN_UP: usize = 5;
+    pub const SLOT_FFN_DOWN: usize = 6;
+    pub const SLOT_LOGITS: usize = 7;
+    pub const SLOT_PAGED_ATTN: usize = 8;
+
+    /// Returns slot `slot` sized to `dims`, allocating only when the shape changed.
+    fn slot(&mut self, slot: usize, dims: &[usize]) -> Result<Tensor, EngineError> {
+        while self.slots.len() <= slot {
+            self.slots.push(None);
+        }
+        if let Some(t) = &self.slots[slot]
+            && t.dims() == dims
+        {
+            return Ok(t.clone());
+        }
+        let t = Tensor::zeros(dims, DType::F32, &Device::Cpu)?;
+        self.slots[slot] = Some(t.clone());
+        Ok(t)
+    }
+
+    /// Drops every buffer. Called when the model changes device, so a workspace can
+    /// never outlive the device its slots were built for.
+    pub fn clear(&mut self) {
+        self.slots.clear();
+        self.scores_t = Vec::new();
+        self.probs = Vec::new();
+        self.attn_out = Vec::new();
+    }
+
+    /// `x @ w^T` written into `slot`: `x` is `[m, k]`, `w` is `[n, k]` (the loaded weight
+    /// layout, so no transposed view has to be built per call).
+    ///
+    /// Returns a tensor aliasing `slot` — see the type-level aliasing contract. Layouts
+    /// the in-place GEMM cannot read fall back to [`amx_matmul`] and store its result in
+    /// the slot, so callers never see a different answer, only a slower path.
+    pub fn matmul_weight_into(
+        &mut self,
+        slot: usize,
+        x: &Tensor,
+        w: &Tensor,
+    ) -> Result<Tensor, EngineError> {
+        if let Some(out) = self.try_matmul_weight_into(slot, x, w)? {
+            return Ok(out);
+        }
+        let out = amx_matmul(x, &w.t()?)?;
+        let target = self.slot(slot, out.dims())?;
+        target.inplace_op1(&WriteF32 {
+            data: &out.flatten_all()?.to_vec1::<f32>()?,
+        })?;
+        Ok(target)
+    }
+
+    /// The in-place path of [`AmxWorkspace::matmul_weight_into`]; `None` when the operand
+    /// layouts need a copy the workspace cannot avoid.
+    fn try_matmul_weight_into(
+        &mut self,
+        slot: usize,
+        x: &Tensor,
+        w: &Tensor,
+    ) -> Result<Option<Tensor>, EngineError> {
+        if x.dtype() != DType::F32
+            || w.dtype() != DType::F32
+            || !matches!(x.device(), Device::Cpu)
+            || !matches!(w.device(), Device::Cpu)
+        {
+            return Ok(None);
+        }
+        let x = x.contiguous()?;
+        let (x_dims, w_dims) = (x.dims(), w.dims());
+        if x_dims.len() != 2 || w_dims.len() != 2 || x_dims[1] != w_dims[1] {
+            return Ok(None);
+        }
+        let (m, k, n) = (x_dims[0], x_dims[1], w_dims[0]);
+
+        // Both operands are read out of their own storage; the slot is written in place.
+        let target = self.slot(slot, &[m, n])?;
+        let (x_guard, x_layout) = x.storage_and_layout();
+        let (w_guard, w_layout) = w.storage_and_layout();
+        let (Storage::Cpu(x_storage), Storage::Cpu(w_storage)) = (&*x_guard, &*w_guard) else {
+            return Ok(None);
+        };
+        let (Ok(x_data), Ok(w_data)) = (x_storage.as_slice::<f32>(), w_storage.as_slice::<f32>())
+        else {
+            return Ok(None);
+        };
+        let (Some(a_block), Some(w_block)) = (
+            contiguous_block(x_data, x_layout, m, k),
+            contiguous_block(w_data, w_layout, n, k),
+        ) else {
+            return Ok(None);
+        };
+
+        target.inplace_op1(&GemmWeightInto {
+            a: a_block,
+            w: w_block,
+            m,
+            n,
+            k,
+        })?;
+        Ok(Some(target))
+    }
+
+    /// Paged decode attention written into `slot` (ticket #93): the three scratch buffers
+    /// [`amx_paged_decode_attention`] allocated per call are reused across layers.
+    ///
+    /// Returns a tensor aliasing `slot`, or `None` for layouts the kernel cannot read —
+    /// the caller then takes its own fallback path.
+    pub fn paged_decode_attention_into(
+        &mut self,
+        slot: usize,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f32,
+    ) -> Option<Result<Tensor, EngineError>> {
+        let (kv_heads, group, head_dim) = q.dims3().ok()?;
+        let (ctx, ..) = k.dims3().ok()?;
+
+        self.attn_out.clear();
+        self.attn_out.resize(kv_heads * group * head_dim, 0.0f32);
+        self.scores_t.clear();
+        self.scores_t.resize(ctx * group, 0.0f32);
+        self.probs.clear();
+        self.probs.resize(group * ctx, 0.0f32);
+
+        paged_decode_attention_core(
+            q,
+            k,
+            v,
+            scale,
+            &mut self.attn_out,
+            &mut self.scores_t,
+            &mut self.probs,
+        )?;
+
+        let target = self
+            .slot(slot, &[kv_heads, group, head_dim])
+            .map_err(EngineError::from);
+        let target = match target {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Err(e) = target.inplace_op1(&WriteF32 {
+            data: &self.attn_out,
+        }) {
+            return Some(Err(EngineError::from(e)));
+        }
+        Some(Ok(target))
+    }
 }
 
 /// AMX-accelerated matrix multiplication for Candle Tensors.
