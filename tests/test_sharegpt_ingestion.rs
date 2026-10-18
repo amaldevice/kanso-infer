@@ -115,7 +115,7 @@ fn test_sharegpt_prefix_cache_hit_rate_above_60_percent() {
         .max()
         .unwrap_or(256);
     let model = Model::create_mock_tiny(64, 4, 2, 2, 256).expect("Model creation failed");
-    let mut engine = Engine::new(model, 16, 256, 16);
+    let mut engine = Engine::new(model, 16, 256, 16).expect("engine");
 
     let report =
         run_trace_benchmark(&mut engine, &trace, false).expect("Trace benchmark execution failed");

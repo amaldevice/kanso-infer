@@ -22,7 +22,7 @@ fn test_model_config_from_model_type_selection() {
 #[test]
 fn test_chat_session_multi_turn_history() {
     let model = kanso_infer::model::Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-    let engine = kanso_infer::engine::Engine::new(model, 4, 100, 4);
+    let engine = kanso_infer::engine::Engine::new(model, 4, 100, 4).expect("engine");
 
     let mut session = kanso_infer::chat::ChatSession::new(
         engine,

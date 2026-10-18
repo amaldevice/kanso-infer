@@ -37,7 +37,7 @@ fn test_stream_decoder_incremental_utf8() {
 #[test]
 fn test_chat_session_streaming_callback_and_stop_token() {
     let model = kanso_infer::model::Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-    let engine = kanso_infer::engine::Engine::new(model, 4, 100, 4);
+    let engine = kanso_infer::engine::Engine::new(model, 4, 100, 4).expect("engine");
 
     let mut session = kanso_infer::chat::ChatSession::new(
         engine,

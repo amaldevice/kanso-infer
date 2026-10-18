@@ -6,7 +6,7 @@ use kanso_infer::speculative::SpeculativeEngine;
 #[test]
 fn test_draft_candidate_verification_acceptance_and_rejection() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-    let mut engine = Engine::new(model, 1, 20, 4);
+    let mut engine = Engine::new(model, 1, 20, 4).expect("engine");
 
     let prompt = vec![1, 2, 3];
     let req_id = engine.add_request(prompt.clone(), 10);
@@ -93,7 +93,7 @@ fn test_atomic_rollback_and_zero_memory_leak() {
 
     // Repeated speculation and rejection cycles on Engine
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-    let mut engine = Engine::new(model, 1, 15, 2); // small block_size=2 to force frequent allocations
+    let mut engine = Engine::new(model, 1, 15, 2).expect("engine"); // small block_size=2 to force frequent allocations
     let req_id = engine.add_request(vec![1, 2], 20);
     engine.step().unwrap();
 
@@ -119,7 +119,7 @@ fn test_greedy_token_parity_with_autoregressive_generation() {
     let mut autoregressive_tokens = Vec::new();
     {
         let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-        let mut engine = Engine::new(model, 1, 30, 4);
+        let mut engine = Engine::new(model, 1, 30, 4).expect("engine");
         engine.add_request(prompt.clone(), num_tokens_to_generate);
 
         while engine.has_unfinished_requests() {
@@ -142,7 +142,8 @@ fn test_greedy_token_parity_with_autoregressive_generation() {
             /* total_blocks */ 30,
             /* block_size */ 4,
             /* gamma */ 3,
-        );
+        )
+        .expect("engine");
 
         let id = spec_engine.add_request(prompt.clone(), num_tokens_to_generate);
         while spec_engine.has_unfinished_requests() {
@@ -164,7 +165,7 @@ fn test_greedy_token_parity_with_autoregressive_generation() {
 #[test]
 fn test_speculative_multi_candidate_acceptance_rate_greater_than_one() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-    let mut engine = Engine::new(model, 1, 30, 4);
+    let mut engine = Engine::new(model, 1, 30, 4).expect("engine");
 
     let prompt = vec![2, 4, 6];
     let req_id = engine.add_request(prompt, 15);
@@ -204,7 +205,7 @@ fn test_speculative_multi_candidate_acceptance_rate_greater_than_one() {
 fn test_partial_candidate_acceptance_and_kv_rollback() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     // Small block_size=2 so adding candidates triggers block allocation
-    let mut engine = Engine::new(model, 1, 30, 2);
+    let mut engine = Engine::new(model, 1, 30, 2).expect("engine");
 
     let prompt = vec![1, 3];
     let req_id = engine.add_request(prompt, 15);
@@ -243,7 +244,7 @@ fn test_speculative_finish_returns_blocks_to_pool() {
     // #56/F3: a sequence finished by `speculative_step` gets no stage-4 retirement,
     // so that path must hand its KV blocks back itself.
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-    let mut engine = Engine::new(model, 1, 8, 2);
+    let mut engine = Engine::new(model, 1, 8, 2).expect("engine");
     let req_id = engine.add_request(vec![1, 2], 3);
     engine.step().expect("prefill failed"); // prefill + first token
 
@@ -276,7 +277,7 @@ fn test_speculative_parity_with_adversarial_draft_candidates() {
     let mut ar_tokens = Vec::new();
     {
         let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-        let mut engine = Engine::new(model, 1, 30, 4);
+        let mut engine = Engine::new(model, 1, 30, 4).expect("engine");
         engine.add_request(prompt.clone(), num_tokens);
         while engine.has_unfinished_requests() {
             for out in engine.step().unwrap() {
@@ -298,7 +299,8 @@ fn test_speculative_parity_with_adversarial_draft_candidates() {
             30,
             4,
             /* gamma */ 2,
-        );
+        )
+        .expect("engine");
         let id = spec_engine.add_request(prompt.clone(), num_tokens);
         while spec_engine.has_unfinished_requests() {
             for out in spec_engine.step().unwrap() {

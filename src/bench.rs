@@ -10,6 +10,8 @@ pub mod sharegpt;
 pub use sharegpt::*;
 pub mod perplexity;
 pub use perplexity::*;
+pub mod gate;
+pub use gate::*;
 
 /// Order-sensitive 64-bit FNV-1a hash over token sequence.
 /// Offset basis: 0xcbf29ce484222325, Prime: 0x100000001b3.
@@ -463,6 +465,5 @@ pub fn create_engine_for_model_profile(
     let total_blocks = (blocks_per_seq * num_requests.max(1)).max(128);
     let mut model = crate::model::Model::create_mock_from_config(&config)?;
     model.set_backend(backend);
-    let engine = Engine::new(model, max_running, total_blocks, block_size);
-    Ok(engine)
+    Engine::new(model, max_running, total_blocks, block_size)
 }

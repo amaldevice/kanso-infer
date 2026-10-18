@@ -224,7 +224,7 @@ fn test_engine_hybrid_layer_synchronization_and_decode() {
     let mut model = Model::create_mock_tiny(32, 4, 2, 2, 100).expect("failed to create mock model");
     model.enable_ffn_offload();
 
-    let mut engine = Engine::new(model, 4, 16, 16);
+    let mut engine = Engine::new(model, 4, 16, 16).expect("engine");
     engine.enable_ffn_offload();
 
     let request_id = engine.add_request(vec![10, 20, 30], 10);

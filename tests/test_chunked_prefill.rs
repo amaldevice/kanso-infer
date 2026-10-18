@@ -6,7 +6,7 @@ use std::time::Instant;
 fn test_chunked_prefill_admission_and_budget_enforcement() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     // token_budget = 4, block_size = 4, total_blocks = 30
-    let mut engine = Engine::new_with_budget(model, 2, 30, 4, 4);
+    let mut engine = Engine::new_with_budget(model, 2, 30, 4, 4).expect("engine");
     assert_eq!(engine.token_budget, 4);
 
     // Prompt of 10 tokens: will need ceil(10/4) = 3 steps (chunk 4, chunk 4, chunk 2)
@@ -53,7 +53,7 @@ fn test_chunked_prefill_admission_and_budget_enforcement() {
 fn test_co_scheduling_active_decode_and_prefill_chunks() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     // token_budget = 5, max_running = 2
-    let mut engine = Engine::new_with_budget(model, 2, 30, 4, 5);
+    let mut engine = Engine::new_with_budget(model, 2, 30, 4, 5).expect("engine");
 
     // Request 1: prompt len 2, gen len 4. Admitted in step 1.
     let id1 = engine.add_request(vec![1, 2], 4);
@@ -97,7 +97,7 @@ fn test_co_scheduling_active_decode_and_prefill_chunks() {
 fn test_prefix_cache_lookup_reused_before_first_chunk() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     // block_size = 4. Prompt of 8 tokens = exactly 2 blocks.
-    let mut engine = Engine::new_with_budget(model, 2, 30, 4, 16);
+    let mut engine = Engine::new_with_budget(model, 2, 30, 4, 16).expect("engine");
 
     let prefix_prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let _id1 = engine.add_request(prefix_prompt.clone(), 1);
@@ -127,7 +127,7 @@ fn test_prefix_cache_lookup_reused_before_first_chunk() {
 fn test_streaming_benchmark_2048_prompt_no_itl_spike() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     // token_budget = 256 tokens per step, max_running = 4, total_blocks = 600, block_size = 16
-    let mut engine = Engine::new_with_budget(model, 4, 600, 16, 256);
+    let mut engine = Engine::new_with_budget(model, 4, 600, 16, 256).expect("engine");
 
     // Active generating request 1
     let id_active = engine.add_request(vec![1, 2, 3, 4], 30);

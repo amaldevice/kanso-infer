@@ -31,7 +31,12 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(model: Model, max_running: usize, total_blocks: usize, block_size: usize) -> Self {
+    pub fn new(
+        model: Model,
+        max_running: usize,
+        total_blocks: usize,
+        block_size: usize,
+    ) -> Result<Self, EngineError> {
         Self::new_with_budget(model, max_running, total_blocks, block_size, usize::MAX)
     }
 
@@ -41,7 +46,7 @@ impl Engine {
         total_blocks: usize,
         block_size: usize,
         token_budget: usize,
-    ) -> Self {
+    ) -> Result<Self, EngineError> {
         let kv_storage = KvStorage::new(
             model.config.num_hidden_layers,
             total_blocks,
@@ -49,10 +54,9 @@ impl Engine {
             model.config.num_key_value_heads,
             model.config.head_dim(),
             &model.device,
-        )
-        .expect("failed to initialize kv storage");
+        )?;
 
-        Self {
+        Ok(Self {
             model,
             block_pool: BlockPool::new(total_blocks),
             prefix_cache: PrefixCache::new(block_size),
@@ -67,7 +71,7 @@ impl Engine {
             total_prompt_tokens_admitted: 0,
             prefix_cache_hits: 0,
             prefix_cache_lookups: 0,
-        }
+        })
     }
     pub fn enable_ffn_offload(&mut self) {
         self.model.enable_ffn_offload();
