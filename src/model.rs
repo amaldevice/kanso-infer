@@ -134,9 +134,14 @@ impl Model {
         self.hybrid_pipeline = Some(pipeline);
     }
 
-    pub fn enable_ane_hybrid(&mut self) {
+    pub fn enable_ffn_offload(&mut self) {
         let pipeline = crate::ffn_offload::HybridExecutionPipeline::from_model(self);
         self.hybrid_pipeline = Some(pipeline);
+    }
+
+    #[deprecated(note = "use enable_ffn_offload")]
+    pub fn enable_ane_hybrid(&mut self) {
+        self.enable_ffn_offload();
     }
 
     pub fn forward_mlp_block(
