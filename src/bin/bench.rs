@@ -68,11 +68,11 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: Backend) {
     let peak_rss_mb = kanso_infer::hardware::get_peak_rss_mb();
     let thermal = kanso_infer::hardware::get_thermal_state();
 
-    // Compute effective bandwidth utilization (assuming ~380 MB weights on a 150 GB/s bus)
+    // Effective bandwidth vs the measured peak carried on the report (#53).
     let (effective_gb_s, util_pct) = kanso_infer::hardware::calculate_bandwidth_utilization(
-        380_000_000,
+        report.bytes_read_per_step,
         report.decode_ms_per_step,
-        150.0,
+        report.peak_bandwidth_gb_s,
     );
 
     println!(
@@ -80,7 +80,7 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: Backend) {
         report.num_requests, report.total_tokens_per_sec, report.tokens_per_sec_per_request,
     );
     println!(
-        "{:<24} ttft_ms(p50/p90/mean/max)={:.1}/{:.1}/{:.1}/{:.1} itl_ms(p50/p90/p99)={:.1}/{:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} prefix_hit={:.1}% checksum={:016x}",
+        "{:<24} ttft_ms(p50/p90/mean/max)={:.1}/{:.1}/{:.1}/{:.1} itl_ms(p50/p90/p99)={:.1}/{:.1}/{:.1} prefill_tok/s={:.1} decode_ms/step={:.2} (decode_ms/tok={:.2}) prefix_hit={:.1}% checksum={:016x}",
         "",
         report.ttft_p50_ms,
         report.ttft_p90_ms,
@@ -91,16 +91,19 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: Backend) {
         report.itl_p99_ms,
         report.prefill_tokens_per_sec,
         report.decode_ms_per_step,
+        report.decode_ms_per_token,
         report.prefix_hit_rate * 100.0,
         report.checksum,
     );
     println!(
-        "{:<24} peak_rss={:.1}MB thermal=\"{}\" bus_est={:.1}GB/s ({:.1}% bus util)",
+        "{:<24} peak_rss={:.1}MB thermal=\"{}\" bus_est={:.1}GB/s ({:.1}% of {:.1}GB/s {})",
         "",
         peak_rss_mb,
         thermal.as_str(),
         effective_gb_s,
         util_pct,
+        report.peak_bandwidth_gb_s,
+        report.peak_bandwidth_source,
     );
     if let Some(spec) = &report.speculative {
         println!("{}", spec.format_report());

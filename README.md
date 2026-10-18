@@ -27,7 +27,7 @@ A minimalist, high-performance LLM inference engine written in Rust, engineered 
 
 ### 3. Multi-Model Architecture Matrix (~350M Compact Class)
 Supports dense Transformer decoders and next-generation hybrid linear-attention architectures:
-- **SmolLM2-360M** (Hugging Face / Llama architecture: 32 layers, GQA $15:3$, RMSNorm, RoPE rotate-half, SwiGLU).
+- **SmolLM2-360M** (Hugging Face / Llama architecture: 32 layers, GQA $15:5$, RMSNorm, RoPE rotate-half, SwiGLU).
 - **IBM Granite-4.0-350M (Dense)** (28 layers, GQA $16:4$).
 - **IBM Granite-4.0-h-350M (Hybrid Mamba-2)** (4 attention layers + 28 Mamba-2 SSM recurrent layers, achieving **87.5% KV cache memory reduction**).
 - **Liquid AI LFM2.5-350M (Hybrid LIV Conv)** (6 attention layers + 10 rolling convolution layers, achieving **62% memory reduction**).
@@ -48,6 +48,42 @@ Supports dense Transformer decoders and next-generation hybrid linear-attention 
   - Time-to-First-Token (`TTFT` mean and max in ms)
   - Inter-Token Latency (`ITL` mean and $p99$ in ms)
   - Decode duration (`ms/step`) and prefill rate (`tok/s`)
+
+## Feature Status
+
+Every claim below resolves to one status. ✅ wired = reachable from `kanso cli` / `chat` / `serve`;
+🧪 kernel-only = implemented and tested, but no production caller yet; 📝 planned = roadmap, not code.
+Status is machine-audited by `tests/test_honesty_fase3.rs` (every row carries an exec pointer).
+
+| Feature | Status | Exec pointer |
+| :--- | :---: | :--- |
+| CLI / chat / serve (Axum + SSE, 429 backpressure) | ✅ | `src/main.rs`, `src/server/engine_loop.rs` |
+| Incremental $O(1)$ decode over paged KV blocks | ✅ | `src/model.rs` (`forward_decode_step`), `src/kv_cache/storage.rs` |
+| Continuous batching + Sarathi chunked prefill | ✅ | `src/engine.rs` (`Engine::step`), `src/scheduler/` |
+| Prefix-cache block reuse | ✅ | `src/engine.rs`, `src/kv_cache/prefix_cache.rs` |
+| Quantized-resident weights (Q8_0/Q4_K/F16 stay packed; per-row embedding dequant) | ✅ | `src/weights.rs`, `tests/test_quantized_weights.rs` |
+| Granite dense multipliers (`embedding_scale`, `attention.scale`, `residual_scale`, `logit_scale`) | ✅ | `src/weights.rs`, `src/model.rs`, `src/config.rs` |
+| Loader arch gate (rejects non-llama/non-granite GGUF) | ✅ | `src/weights.rs` (`load_from_gguf`) |
+| Speculative verification (argmax + `min(1,p/q)` rejection sampling, draft KV rollback) | ✅ | `src/engine.rs` (`speculative_step_sampled`), `src/speculative/verifier.rs` |
+| Metal UMA buffers + startup pipeline cache | ✅ | `src/metal/context.rs`, `src/metal/pipeline.rs` |
+| AMX/Accelerate GEMM path (dense weights) | ✅ | `src/accelerate/amx.rs`, `src/model.rs` (`Model::linear`) |
+| FFN offload seam (per-layer SwiGLU adapters, CPU/AMX execution) | ✅ | `src/ffn_offload/adapter.rs`, `src/model.rs` (`forward_mlp_block`) |
+| Real Core ML / ANE execution (`.mlpackage`, `MLModel`) | 📝 | roadmap |
+| Fused PagedAttention v2 Metal kernel | 🧪 | `src/metal/paged_attention.rs`, `src/metal/kernels/paged_attention_v2.metal` |
+| Fused Metal llama-layer kernel | 🧪 | `src/metal/fused_layer.rs` |
+| Hand-written NEON Q8_0/Q4_K GEMV kernels | 🧪 | `src/quant/neon.rs` (reference/benchmark path; production decode runs off candle's kernels) |
+| Quantized (INT8/FP8) paged KV cache | 🧪 | `src/kv_cache/quantized_storage.rs` |
+| Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation | 🧪 | `src/hybrid/`, `src/kv_cache/` (`SparseBlockTable`); loader rejects hybrid GGUF until wired |
+| `granite-h` / `lfm` bench profiles | 🧪 | `src/config.rs` (mock shapes for bench comparison, not loaded weights) |
+
+## Roadmap
+
+- Real Core ML / ANE execution: compile per-layer SwiGLU to `.mlpackage` and run via `MLModel`, behind the `src/ffn_offload` seam.
+- Wire the fused PagedAttention v2 kernel into the Metal decode path (`src/model.rs` names the call site).
+- Wire quantized KV storage into `Engine` (currently always F32 `KvStorage`).
+- Wire hybrid SSM/conv layers into the forward pass and lift the loader arch gate for them.
+- Promote hand-written NEON GEMV kernels from reference path to production decode path.
+
 ---
 
 ## Project Structure
@@ -56,7 +92,7 @@ Supports dense Transformer decoders and next-generation hybrid linear-attention 
 kanso-infer/
 ├── Cargo.toml
 ├── README.md
-├── SPEC.md               # Complete architecture and low-level specification
+├── docs/SPEC.md          # Canonical architecture and low-level specification
 ├── src/
 │   ├── main.rs           # Main CLI binary (cli, chat, serve)
 │   ├── lib.rs            # Core library root
@@ -69,11 +105,9 @@ kanso-infer/
 │   ├── hardware.rs       # User-space hardware profiler, peak RSS, thermal state & bus util
 │   ├── engine.rs         # Continuous batching & chunked prefill scheduler
 │   ├── error.rs          # Stdlib EngineError
-│   ├── kv_cache/
-│   │   ├── block_pool.rs # Physical memory block pool & ref-counting
-│   │   ├── block_table.rs# Virtual-to-physical block table translation
-│   │   ├── prefix_cache.rs# Trie/hash prompt prefix caching
-│   │   └── storage.rs    # KvStorage physical block tensor buffer
+│   ├── ffn_offload/
+│   │   ├── adapter.rs  # Per-layer SwiGLU offload seam (CPU/AMX; Core ML target planned)
+│   │   └── mod.rs      # Re-exports (renamed from `ane`, ticket #54)
 │   ├── metal/
 │   │   ├── context.rs    # Metal device, command queue & UMA buffer allocator
 │   │   ├── pipeline.rs   # Compute pipeline state compilation & caching
@@ -212,49 +246,12 @@ batch_size=1    backend=cpu    batch=1    tok/s(total)=245.2    tok/s/req=245.17
 
 ---
 
-## Empirical Benchmark Results (Apple Silicon Testbed)
+## Empirical Benchmarking
 
-**Testbed Specifications:**
-- **Hardware**: Apple A18 Pro (6 cores, 8.0 GB Unified Memory, Model: `Mac17,5`)
-- **OS / Target**: macOS Darwin (arm64)
-- **Workload**: Prompt length = 32 tokens, Generation length = 16 tokens, Block size = 16 tokens
-- **Thermal State**: Fair (Elevated, no thermal throttling active)
+Benchmarks run against real GGUF weights via `cargo run --release --bin bench -- --model <path>` (shadow/mock model execution has been removed; see section 5 above).
 
-### 1. Single-User Low Latency (`batch_size = 1`)
-
-| Model Architecture | Category | Backend | Throughput (tok/s) | Decode (ms/step) | TTFT (ms) | ITL p99 (ms) | Peak RSS | Bus Util | Checksum (FNV-1a) |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`smollm2`** | Dense Llama (32L) | **`metal`** | **69.0** | **14.5** | 160.9 | 5.4 | 92.4 MB | 17.5% | `88201fb960ff6465` |
-| | | `neon` | 68.2 | 14.7 | 165.8 | 5.1 | 92.7 MB | 17.3% | `88201fb960ff6465` |
-| | | `cpu` | 48.1 | 20.8 | 232.2 | 7.9 | 93.0 MB | 12.2% | `88201fb960ff6465` |
-| **`granite-dense`** | Dense Llama (28L) | **`neon`** | **57.6** | **17.4** | 191.9 | 6.7 | 112.5 MB | 14.6% | `88201fb960ff6465` |
-| | | `metal` | 54.4 | 18.4 | 203.5 | 8.2 | 112.4 MB | 13.8% | `88201fb960ff6465` |
-| | | `cpu` | 52.4 | 19.1 | 214.5 | 6.6 | 112.2 MB | 13.3% | `88201fb960ff6465` |
-| **`granite-h`** 🚀 | Hybrid Mamba-2 (4L Attn) | **`neon`** | **107.5** | **9.3** | **102.4** | **3.5** | **65.3 MB** | 27.2% | `88201fb960ff6465` |
-| | | `metal` | 97.5 | 10.3 | 116.1 | 3.9 | **65.5 MB** | 24.7% | `88201fb960ff6465` |
-| | | `cpu` | 95.3 | 10.5 | 120.2 | 3.5 | **65.4 MB** | 24.2% | `88201fb960ff6465` |
-| **`lfm`** | Hybrid LIV Conv (6L Attn) | **`metal`** | **63.4** | **15.8** | 167.3 | 7.7 | 100.3 MB | 16.1% | `88201fb960ff6465` |
-| | | `cpu` | 61.4 | 16.3 | 183.9 | 5.7 | 100.2 MB | 15.6% | `88201fb960ff6465` |
-| | | `neon` | 57.0 | 17.5 | 191.2 | 7.1 | 100.2 MB | 14.4% | `88201fb960ff6465` |
-
-### 2. Multi-User Concurrent Serving (`batch_size = 4`)
-
-| Model Architecture | Category | Backend | Total tok/s | Per-Req tok/s | Decode (ms/step) | TTFT p99 (ms) | Peak RSS | Checksum (FNV-1a) |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`smollm2`** | Dense Llama (32L) | **`neon`** | **73.0** | 18.25 | 54.8 | 593.7 | 97.5 MB | `b9b23f3a46fd0825` |
-| | | `metal` | 71.3 | 17.83 | 56.1 | 614.3 | 96.1 MB | `b9b23f3a46fd0825` |
-| | | `cpu` | 44.2 | 11.04 | 90.6 | 868.7 | 97.1 MB | `b9b23f3a46fd0825` |
-| **`granite-dense`** | Dense Llama (28L) | **`neon`** | **59.0** | 14.76 | 67.8 | 744.4 | 112.6 MB | `b9b23f3a46fd0825` |
-| | | `metal` | 58.0 | 14.49 | 69.0 | 741.6 | 117.1 MB | `b9b23f3a46fd0825` |
-| | | `cpu` | 55.7 | 13.92 | 71.8 | 779.5 | 117.1 MB | `b9b23f3a46fd0825` |
-| **`granite-h`** 🚀 | Hybrid Mamba-2 (4L Attn) | **`metal`** | **105.1** | **26.28** | **38.1** | **407.7** | **70.0 MB** | `b9b23f3a46fd0825` |
-| | | `cpu` | 102.9 | 25.73 | 38.9 | 427.5 | **70.5 MB** | `b9b23f3a46fd0825` |
-| | | `neon` | 99.2 | 24.79 | 40.3 | 426.4 | **72.1 MB** | `b9b23f3a46fd0825` |
-| **`lfm`** | Hybrid LIV Conv (6L Attn) | **`metal`** | **66.8** | 16.71 | 59.9 | 652.3 | 101.4 MB | `b9b23f3a46fd0825` |
-| | | `cpu` | 66.5 | 16.63 | 60.1 | 653.6 | 104.8 MB | `b9b23f3a46fd0825` |
-| | | `neon` | 55.3 | 13.81 | 72.4 | 782.4 | 101.3 MB | `b9b23f3a46fd0825` |
-
-### Key Performance Insights
-1. **Hybrid Architecture Memory & Latency Superiority**: `granite-h` achieves the lowest peak memory footprint (**65.3 MB**) and highest generation throughput (**107.5 tok/s**), outperforming dense models by up to **$2\times$** through 87.5% sparse KV cache reduction on Mamba-2 layers.
-2. **Apple Silicon Hardware Acceleration**: `metal` (69.0 tok/s) and `neon` (68.2 tok/s) deliver **$\approx 1.43\times$** acceleration over scalar CPU (48.1 tok/s) on dense workloads.
-3. **Strict Determinism**: 100% identical 64-bit FNV-1a checksums across CPU, NEON, and Metal backends confirm numerical consistency.
+Reported metrics:
+- **Throughput**: Total tokens/s and per-request tokens/s.
+- **Latency**: Mean/max/p50/p90 Time-to-First-Token (TTFT), p50/p90/p99 Inter-Token Latency (ITL), decode ms/step, and per-token decode latency (ms/token).
+- **Traceable Bus Utilization**: Derived from resident model weight bytes plus active KV cache bytes summed across sequences, evaluated against host DRAM bandwidth measured via the STREAM-triad microbench.
+- **Determinism**: 64-bit FNV-1a checksums over generated tokens to verify greedy output parity.

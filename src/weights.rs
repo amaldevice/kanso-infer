@@ -359,10 +359,21 @@ impl ModelWeights {
                     .cloned()
                     .map_err(|e| EngineError::Config(e.to_string()))
             })
-            .unwrap_or_else(|_| "llama".to_string());
+            .map_err(|_| {
+                EngineError::Config(
+                    "Missing GGUF metadata key 'general.architecture': architecture must be explicitly specified (supported: 'llama', 'granite')".to_string(),
+                )
+            })?;
+        // Only dense decoder architectures are wired: hybrid SSM/conv layers have no
+        // production caller, so loading one as llama would silently produce garbage.
         let prefix = match arch.as_str() {
+            "llama" => "llama",
             "granite" => "granite",
-            _ => "llama",
+            other => {
+                return Err(EngineError::Config(format!(
+                    "unsupported GGUF architecture '{other}': only 'llama' and 'granite' (dense) load; hybrid SSM/conv models are roadmap, not wired"
+                )));
+            }
         };
 
         let num_layers = metadata(&format!("{}.block_count", prefix))?.to_u32()? as usize;
@@ -379,6 +390,19 @@ impl ModelWeights {
         let rope_theta = metadata(&format!("{}.rope.freq_base", prefix))
             .and_then(|v| v.to_f32().map_err(|e| EngineError::Config(e.to_string())))
             .unwrap_or(10000.0);
+        // Granite multipliers (llama.cpp `granite.cpp` semantics); absent = None = identity.
+        let opt_f32 = |key: &str| content.metadata.get(key).and_then(|v| v.to_f32().ok());
+        let (embedding_scale, attention_scale, residual_scale, logit_scale) = if prefix == "granite"
+        {
+            (
+                opt_f32("granite.embedding_scale"),
+                opt_f32("granite.attention.scale"),
+                opt_f32("granite.residual_scale"),
+                opt_f32("granite.logit_scale"),
+            )
+        } else {
+            (None, None, None, None)
+        };
         let token_embd = LinearWeight::from_qtensor(load_qtensor("token_embd.weight")?)?;
         let vocab_size = token_embd.dim(0);
         let head_dim = hidden_size / num_attention_heads;
@@ -441,6 +465,10 @@ impl ModelWeights {
             architecture: ModelArchitecture::DenseLlama,
             attention_layers: None,
             rope_theta,
+            embedding_scale,
+            attention_scale,
+            residual_scale,
+            logit_scale,
         };
         let weights = Self {
             embed_tokens: token_embd,

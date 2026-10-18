@@ -69,11 +69,16 @@ impl Engine {
             prefix_cache_lookups: 0,
         }
     }
-    pub fn enable_ane_hybrid(&mut self) {
-        self.model.enable_ane_hybrid();
+    pub fn enable_ffn_offload(&mut self) {
+        self.model.enable_ffn_offload();
     }
 
-    pub fn set_hybrid_pipeline(&mut self, pipeline: crate::ane::HybridExecutionPipeline) {
+    #[deprecated(note = "use enable_ffn_offload")]
+    pub fn enable_ane_hybrid(&mut self) {
+        self.enable_ffn_offload();
+    }
+
+    pub fn set_hybrid_pipeline(&mut self, pipeline: crate::ffn_offload::HybridExecutionPipeline) {
         self.model.set_hybrid_pipeline(pipeline);
     }
 

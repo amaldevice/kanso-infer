@@ -1,8 +1,9 @@
 use candle_core::Tensor;
-use kanso_infer::ane::{
-    AneLayerAdapter, CoreMlAneAdapter, CpuFallbackAneAdapter, HybridExecutionPipeline,
-};
 use kanso_infer::engine::Engine;
+use kanso_infer::ffn_offload::{
+    AneLayerAdapter, CoreMlAneAdapter, CpuFallbackAdapter, HybridExecutionPipeline,
+    PlannedCoreMlAdapter,
+};
 use kanso_infer::model::Model;
 
 #[test]
@@ -13,8 +14,8 @@ fn test_ane_layer_adapter_interface_and_dispatch() {
     let hidden_size = model.config.hidden_size;
     let intermediate_size = model.config.intermediate_size;
 
-    // 1. CpuFallbackAneAdapter implements AneLayerAdapter
-    let mut cpu_adapter = CpuFallbackAneAdapter::from_layer_weights(
+    // 1. CpuFallbackAdapter implements FfnOffloadAdapter
+    let mut cpu_adapter = CpuFallbackAdapter::from_layer_weights(
         layer_idx,
         layer_weights,
         hidden_size,
@@ -36,8 +37,8 @@ fn test_ane_layer_adapter_interface_and_dispatch() {
         .dispatch_weights(layer_weights)
         .expect("dispatch_weights failed");
 
-    // 2. CoreMlAneAdapter implements AneLayerAdapter
-    let coreml_adapter = CoreMlAneAdapter::new(
+    // 2. PlannedCoreMlAdapter implements FfnOffloadAdapter
+    let coreml_adapter = PlannedCoreMlAdapter::new(
         layer_idx,
         hidden_size,
         intermediate_size,
@@ -70,19 +71,16 @@ fn test_ane_adapter_fallback_mechanism() {
     let hidden_size = model.config.hidden_size;
     let intermediate_size = model.config.intermediate_size;
 
-    let mut coreml_adapter = CoreMlAneAdapter::new(
+    let coreml_adapter = CoreMlAneAdapter::new(
         layer_idx,
         hidden_size,
         intermediate_size,
         layer_weights,
         kanso_infer::Backend::Cpu,
     );
-
-    // Simulate ANE hardware unavailable
-    coreml_adapter.set_ane_available(false);
+    // Honest availability (#62 F1): has_ane_support() is false so adapter defaults unavailable
     assert!(!coreml_adapter.is_available());
     assert_eq!(coreml_adapter.backend_name(), "cpu");
-
     let dummy_input = vec![0.25f32; hidden_size];
     let fallback_out = coreml_adapter
         .forward_mlp(&dummy_input)
@@ -91,14 +89,14 @@ fn test_ane_adapter_fallback_mechanism() {
 
     // Check with AMX fallback if Accelerate is available
     if kanso_infer::accelerate::amx::has_accelerate_support() {
-        let mut amx_fallback_adapter = CoreMlAneAdapter::new(
+        let amx_fallback_adapter = CoreMlAneAdapter::new(
             layer_idx,
             hidden_size,
             intermediate_size,
             layer_weights,
             kanso_infer::Backend::Amx,
         );
-        amx_fallback_adapter.set_ane_available(false);
+        assert!(!amx_fallback_adapter.is_available());
         assert_eq!(amx_fallback_adapter.backend_name(), "amx_cpu");
 
         let amx_out = amx_fallback_adapter
@@ -180,8 +178,8 @@ fn test_model_forward_parity_hybrid_vs_monolithic() {
     model_monolithic.set_backend(attention_backend);
     model_hybrid.set_backend(attention_backend);
 
-    // Enable ANE hybrid pipeline on model_hybrid
-    model_hybrid.enable_ane_hybrid();
+    // Enable FFN offload pipeline on model_hybrid
+    model_hybrid.enable_ffn_offload();
 
     let prompt = vec![12u32, 34u32, 56u32];
 
@@ -224,10 +222,10 @@ fn test_model_forward_parity_hybrid_vs_monolithic() {
 #[test]
 fn test_engine_hybrid_layer_synchronization_and_decode() {
     let mut model = Model::create_mock_tiny(32, 4, 2, 2, 100).expect("failed to create mock model");
-    model.enable_ane_hybrid();
+    model.enable_ffn_offload();
 
     let mut engine = Engine::new(model, 4, 16, 16);
-    engine.enable_ane_hybrid();
+    engine.enable_ffn_offload();
 
     let request_id = engine.add_request(vec![10, 20, 30], 10);
 
@@ -249,7 +247,7 @@ fn test_engine_hybrid_layer_synchronization_and_decode() {
 fn test_decode_step_parity_hybrid_vs_monolithic() {
     let model_mono = Model::create_mock_tiny(32, 4, 2, 2, 100).expect("model mono");
     let mut model_hyb = Model::create_mock_tiny(32, 4, 2, 2, 100).expect("model hyb");
-    model_hyb.enable_ane_hybrid();
+    model_hyb.enable_ffn_offload();
 
     let block_size = 16;
     let mut kv_mono =

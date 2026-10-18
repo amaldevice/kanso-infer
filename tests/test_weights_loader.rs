@@ -3,11 +3,11 @@ fn test_load_model_configs_smollm2_and_granite() {
     let smol = kanso_infer::config::ModelConfig::smollm2_360m();
     assert_eq!(smol.hidden_size, 960);
     assert_eq!(smol.num_attention_heads, 15);
-    assert_eq!(smol.num_key_value_heads, 3);
+    assert_eq!(smol.num_key_value_heads, 5);
     assert_eq!(smol.num_hidden_layers, 32);
     assert_eq!(smol.head_dim(), 64);
-    // 2 * 32 layers * 3 kv_heads * 64 head_dim * 4 bytes (f32) = 49152 bytes = 48 KB
-    assert_eq!(smol.kv_cache_bytes_per_token_f32(), 49152);
+    // 2 * 32 layers * 5 kv_heads * 64 head_dim * 4 bytes (f32) = 81920 bytes = 80 KB
+    assert_eq!(smol.kv_cache_bytes_per_token_f32(), 81920);
 
     let granite_dense = kanso_infer::config::ModelConfig::granite_4_0_350m_dense();
     assert_eq!(granite_dense.hidden_size, 1024);

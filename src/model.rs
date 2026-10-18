@@ -35,7 +35,7 @@ pub struct Model {
     pub config: ModelConfig,
     pub device: Device,
     pub backend: crate::hardware::Backend,
-    pub hybrid_pipeline: Option<crate::ane::HybridExecutionPipeline>,
+    pub hybrid_pipeline: Option<crate::ffn_offload::HybridExecutionPipeline>,
     /// #45: batched forward passes issued so far. One per engine step is the whole
     /// point of continuous batching — a per-sequence loop shows up here as a count
     /// that grows with the batch size.
@@ -130,13 +130,18 @@ impl Model {
         Ok(())
     }
 
-    pub fn set_hybrid_pipeline(&mut self, pipeline: crate::ane::HybridExecutionPipeline) {
+    pub fn set_hybrid_pipeline(&mut self, pipeline: crate::ffn_offload::HybridExecutionPipeline) {
         self.hybrid_pipeline = Some(pipeline);
     }
 
-    pub fn enable_ane_hybrid(&mut self) {
-        let pipeline = crate::ane::HybridExecutionPipeline::from_model(self);
+    pub fn enable_ffn_offload(&mut self) {
+        let pipeline = crate::ffn_offload::HybridExecutionPipeline::from_model(self);
         self.hybrid_pipeline = Some(pipeline);
+    }
+
+    #[deprecated(note = "use enable_ffn_offload")]
+    pub fn enable_ane_hybrid(&mut self) {
+        self.enable_ffn_offload();
     }
 
     pub fn forward_mlp_block(
@@ -172,8 +177,13 @@ impl Model {
     }
 
     /// Dequantizes an embedding row per token id instead of the whole table.
+    /// Granite `embedding_scale` multiplies the rows (llama.cpp `llama-graph.cpp`).
     pub fn embed(&self, ids: &Tensor) -> Result<Tensor, EngineError> {
-        self.weights.embed_tokens.embed(ids)
+        let e = self.weights.embed_tokens.embed(ids)?;
+        match self.config.embedding_scale {
+            Some(s) => Ok((e * s as f64)?),
+            None => Ok(e),
+        }
     }
 
     /// Q/K/V projections for `normed`, with Q/K put into rotate-half head order.
@@ -302,6 +312,10 @@ impl Model {
             architecture: ModelArchitecture::DenseLlama,
             attention_layers: None,
             rope_theta: 10000.0,
+            embedding_scale: None,
+            attention_scale: None,
+            residual_scale: None,
+            logit_scale: None,
         };
 
         Ok(Self::new(weights, config, dev))
@@ -457,6 +471,31 @@ impl Model {
         )?)
     }
 
+    /// Granite `residual_scale` scales the attention/FFN outputs before each residual add
+    /// (llama.cpp `granite.cpp` scales both `cur` branches).
+    fn scale_residual(&self, t: Tensor) -> Result<Tensor, EngineError> {
+        match self.config.residual_scale {
+            Some(s) => Ok((t * s as f64)?),
+            None => Ok(t),
+        }
+    }
+
+    /// Granite `logit_scale` divides the final logits (llama.cpp `granite.cpp`).
+    fn scale_logits(&self, t: Tensor) -> Result<Tensor, EngineError> {
+        match self.config.logit_scale {
+            Some(s) => Ok((t * (1.0 / s as f64))?),
+            None => Ok(t),
+        }
+    }
+
+    /// Granite `attention_scale` replaces `1/sqrt(head_dim)` when nonzero (llama.cpp `granite.cpp`).
+    fn attention_scale(&self, head_dim: usize) -> f64 {
+        match self.config.attention_scale {
+            Some(s) if s != 0.0 => s as f64,
+            _ => 1.0 / (head_dim as f64).sqrt(),
+        }
+    }
+
     pub fn gqa_attention(
         &self,
         q: &Tensor,            // [n_heads, q_len, head_dim]
@@ -474,7 +513,7 @@ impl Model {
             .reshape((n_kv_heads, group_size * q_len, head_dim))?;
 
         // Attention scores: [n_kv_heads, group_size * q_len, ctx_len]
-        let scale = 1.0 / (head_dim as f64).sqrt();
+        let scale = self.attention_scale(head_dim);
         let mut scores = (self.matmul(&q_folded, &k.t()?)? * scale)?;
 
         if let Some(m) = mask {
@@ -516,7 +555,7 @@ impl Model {
             let q_folded = q
                 .contiguous()?
                 .reshape((n_kv_heads, group_size * q_len, head_dim))?;
-            let scale = 1.0 / (head_dim as f64).sqrt();
+            let scale = self.attention_scale(head_dim);
             if let Some(out) =
                 crate::accelerate::amx::amx_paged_decode_attention(&q_folded, k, v, scale as f32)
             {
@@ -596,21 +635,21 @@ impl Model {
             let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
 
             // Residual connection
-            hidden = (hidden + attn_proj)?;
+            hidden = (hidden + &self.scale_residual(attn_proj)?)?;
 
             // FFN Norm
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
 
             let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
             // Residual connection
-            hidden = (hidden + ffn_out)?;
+            hidden = (hidden + &self.scale_residual(ffn_out)?)?;
         }
 
         // Final RMSNorm
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
 
         // LM Head projection for all tokens: [seq_len, hidden_size] @ W_head^T -> [seq_len, vocab_size]
-        let logits = self.linear(&self.weights.lm_head, &final_normed)?;
+        let logits = self.scale_logits(self.linear(&self.weights.lm_head, &final_normed)?)?;
         Ok(logits)
     }
 
@@ -710,16 +749,16 @@ impl Model {
                 .reshape((chunk_len, num_q_heads * head_dim))?;
             let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
 
-            hidden = (hidden + attn_proj)?;
+            hidden = (hidden + &self.scale_residual(attn_proj)?)?;
 
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
             let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
-            hidden = (hidden + ffn_out)?;
+            hidden = (hidden + &self.scale_residual(ffn_out)?)?;
         }
 
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
         let last_hidden = final_normed.i(chunk_len - 1)?.unsqueeze(0)?;
-        let logits = self.linear(&self.weights.lm_head, &last_hidden)?;
+        let logits = self.scale_logits(self.linear(&self.weights.lm_head, &last_hidden)?)?;
         Ok(logits)
     }
 
@@ -794,21 +833,21 @@ impl Model {
             let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
 
             // Residual connection
-            hidden = (hidden + attn_proj)?;
+            hidden = (hidden + &self.scale_residual(attn_proj)?)?;
 
             // FFN Norm
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
 
             let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
             // Residual connection
-            hidden = (hidden + ffn_out)?;
+            hidden = (hidden + &self.scale_residual(ffn_out)?)?;
         }
 
         // Final RMSNorm
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
 
         // LM Head projection: [1, vocab_size]
-        let logits = self.linear(&self.weights.lm_head, &final_normed)?;
+        let logits = self.scale_logits(self.linear(&self.weights.lm_head, &final_normed)?)?;
 
         Ok(logits)
     }
@@ -906,15 +945,15 @@ impl Model {
                 .transpose(0, 1)?
                 .reshape((seq_len, num_q_heads * head_dim))?;
             let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
-            hidden = (hidden + attn_proj)?;
+            hidden = (hidden + &self.scale_residual(attn_proj)?)?;
 
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
             let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
-            hidden = (hidden + ffn_out)?;
+            hidden = (hidden + &self.scale_residual(ffn_out)?)?;
         }
 
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
-        let logits = self.linear(&self.weights.lm_head, &final_normed)?;
+        let logits = self.scale_logits(self.linear(&self.weights.lm_head, &final_normed)?)?;
         Ok(logits)
     }
 
@@ -1102,11 +1141,11 @@ impl Model {
                 }
             };
             let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
-            hidden = (hidden + attn_proj)?;
+            hidden = (hidden + &self.scale_residual(attn_proj)?)?;
 
             let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
             let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
-            hidden = (hidden + ffn_out)?;
+            hidden = (hidden + &self.scale_residual(ffn_out)?)?;
         }
 
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
@@ -1118,7 +1157,7 @@ impl Model {
             .collect();
         let last_indices = Tensor::from_vec(last_indices, (num_seqs,), &self.device)?;
         let last_hidden = final_normed.index_select(&last_indices, 0)?;
-        self.linear(&self.weights.lm_head, &last_hidden)
+        self.scale_logits(self.linear(&self.weights.lm_head, &last_hidden)?)
     }
 
     /// Attention for a whole decode batch in a handful of tensor ops.
@@ -1165,7 +1204,7 @@ impl Model {
         let q = q
             .reshape((num_seqs, num_kv_heads, group, head_dim))?
             .reshape((num_seqs * num_kv_heads, group, head_dim))?;
-        let scale = 1.0 / (head_dim as f64).sqrt();
+        let scale = self.attention_scale(head_dim);
         let scores = (self.matmul(&q, &k)? * scale)?;
         let scores = scores.broadcast_add(&layout.mask)?;
         let probs = candle_nn::ops::softmax_last_dim(&scores.contiguous()?)?;

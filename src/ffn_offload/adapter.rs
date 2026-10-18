@@ -5,23 +5,18 @@ use parking_lot::Mutex;
 use std::path::PathBuf;
 
 /// Checks whether Apple Neural Engine (ANE) hardware is present on current platform.
+///
+/// Always false: there is no Core ML execution path yet (`CoreMlAneAdapter`
+/// runs the CPU/AMX fallback unconditionally), so claiming ANE on the basis
+/// of a chip-name string match would lie on every Mac. Flip this only when a
+/// real dispatch path lands behind it.
 pub fn has_ane_support() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        crate::hardware::get_hardware_info()
-            .chip_name
-            .to_lowercase()
-            .contains("apple")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
+    false
 }
 
 /// Architectural adapter trait for dispatching feedforward (SwiGLU/FFN) layer computation
-/// to Apple Neural Engine (ANE) via Core ML or platform fallback backends.
-pub trait AneLayerAdapter: Send + Sync {
+/// to an offload backend or platform fallback.
+pub trait FfnOffloadAdapter: Send + Sync {
     /// Forward pass for MLP / SwiGLU computation on activations.
     /// Input is a 1D slice representing [seq_len * hidden_size] or [hidden_size].
     /// Returns a 1D vector of output activations of the same size.
@@ -35,7 +30,7 @@ pub trait AneLayerAdapter: Send + Sync {
     /// Name of the execution backend.
     fn backend_name(&self) -> &str;
 
-    /// Dispatches or updates layer weights for Core ML / ANE execution.
+    /// Dispatches or updates layer weights for offloaded execution.
     fn dispatch_weights(&mut self, _weights: &LayerWeights) -> Result<(), EngineError> {
         Ok(())
     }
@@ -46,9 +41,11 @@ pub trait AneLayerAdapter: Send + Sync {
     }
 }
 
+pub use FfnOffloadAdapter as AneLayerAdapter;
+
 /// Fallback adapter executing SwiGLU FFN on CPU or AMX (Accelerate) cores.
 #[derive(Clone)]
-pub struct CpuFallbackAneAdapter {
+pub struct CpuFallbackAdapter {
     pub layer_index: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -59,7 +56,9 @@ pub struct CpuFallbackAneAdapter {
     pub device: Device,
 }
 
-impl CpuFallbackAneAdapter {
+pub use CpuFallbackAdapter as CpuFallbackAneAdapter;
+
+impl CpuFallbackAdapter {
     #[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
     pub fn new(
         layer_index: usize,
@@ -107,7 +106,7 @@ impl CpuFallbackAneAdapter {
     }
 }
 
-impl AneLayerAdapter for CpuFallbackAneAdapter {
+impl FfnOffloadAdapter for CpuFallbackAdapter {
     fn forward_mlp(&self, input: &[f32]) -> Result<Vec<f32>, EngineError> {
         if input.is_empty() {
             return Err(EngineError::Model("Empty input to forward_mlp".to_string()));
@@ -169,17 +168,20 @@ impl AneLayerAdapter for CpuFallbackAneAdapter {
     }
 }
 
-/// Core ML adapter dispatching SwiGLU layer weights to Apple Neural Engine (ANE)
-/// with graceful fallback to CPU/AMX/Metal.
+/// Planned Core ML adapter dispatching SwiGLU layer weights to Apple Neural Engine (ANE)
+/// once `.mlpackage` compilation lands. Until then, unconditionally executes the CPU/AMX
+/// fallback and honestly reports the fallback backend name.
 #[derive(Clone)]
-pub struct CoreMlAneAdapter {
+pub struct PlannedCoreMlAdapter {
     pub layer_index: usize,
     pub is_ane_available: bool,
-    pub fallback: CpuFallbackAneAdapter,
+    pub fallback: CpuFallbackAdapter,
     pub compiled_model_path: Option<PathBuf>,
 }
 
-impl CoreMlAneAdapter {
+pub use PlannedCoreMlAdapter as CoreMlAneAdapter;
+
+impl PlannedCoreMlAdapter {
     pub fn new(
         layer_index: usize,
         hidden_size: usize,
@@ -188,7 +190,7 @@ impl CoreMlAneAdapter {
         backend_fallback: crate::hardware::Backend,
     ) -> Self {
         let ane_supported = has_ane_support();
-        let fallback = CpuFallbackAneAdapter::from_layer_weights(
+        let fallback = CpuFallbackAdapter::from_layer_weights(
             layer_index,
             weights,
             hidden_size,
@@ -203,28 +205,16 @@ impl CoreMlAneAdapter {
         }
     }
 
-    pub fn set_ane_available(&mut self, available: bool) {
-        self.is_ane_available = available;
-    }
-
     pub fn set_compiled_model_path(&mut self, path: impl Into<PathBuf>) {
         self.compiled_model_path = Some(path.into());
     }
 }
 
-impl AneLayerAdapter for CoreMlAneAdapter {
+impl FfnOffloadAdapter for PlannedCoreMlAdapter {
     fn forward_mlp(&self, input: &[f32]) -> Result<Vec<f32>, EngineError> {
-        if !self.is_ane_available {
-            // Smoothly default to CPU or AMX fallback execution
-            return self.fallback.forward_mlp(input);
-        }
-
-        // When ANE is available, run Core ML / ANE execution seam:
-        // In scaffolding mode, executes target SwiGLU computation and falls back if any runtime issue arises.
-        match self.fallback.forward_mlp(input) {
-            Ok(res) => Ok(res),
-            Err(_) => self.fallback.forward_mlp(input),
-        }
+        // Honest dispatch (#62 F1): until real Core ML .mlpackage execution lands,
+        // unconditionally execute through the fallback adapter.
+        self.fallback.forward_mlp(input)
     }
 
     fn is_available(&self) -> bool {
@@ -232,11 +222,8 @@ impl AneLayerAdapter for CoreMlAneAdapter {
     }
 
     fn backend_name(&self) -> &str {
-        if self.is_ane_available {
-            "coreml_ane"
-        } else {
-            self.fallback.backend_name()
-        }
+        // Honest backend name (#62 F1): never report "coreml_ane" while executing CPU math.
+        self.fallback.backend_name()
     }
 
     fn dispatch_weights(&mut self, weights: &LayerWeights) -> Result<(), EngineError> {
@@ -247,7 +234,6 @@ impl AneLayerAdapter for CoreMlAneAdapter {
         self.layer_index
     }
 }
-
 /// Statistics tracking hybrid layer scheduling and synchronization events.
 #[derive(Debug, Clone, Default)]
 pub struct HybridSyncStats {
@@ -260,14 +246,14 @@ pub struct HybridSyncStats {
 /// MLP feedforward computation to the Core ML / ANE adapter.
 pub struct HybridExecutionPipeline {
     pub attention_backend: crate::hardware::Backend,
-    pub adapters: Vec<Box<dyn AneLayerAdapter>>,
+    pub adapters: Vec<Box<dyn FfnOffloadAdapter>>,
     stats: Mutex<HybridSyncStats>,
 }
 
 impl HybridExecutionPipeline {
     pub fn new(
         attention_backend: crate::hardware::Backend,
-        adapters: Vec<Box<dyn AneLayerAdapter>>,
+        adapters: Vec<Box<dyn FfnOffloadAdapter>>,
     ) -> Self {
         Self {
             attention_backend,
@@ -282,10 +268,10 @@ impl HybridExecutionPipeline {
         let hidden_size = model.config.hidden_size;
         let intermediate_size = model.config.intermediate_size;
 
-        let mut adapters: Vec<Box<dyn AneLayerAdapter>> =
+        let mut adapters: Vec<Box<dyn FfnOffloadAdapter>> =
             Vec::with_capacity(model.weights.layers.len());
         for (idx, layer) in model.weights.layers.iter().enumerate() {
-            let adapter = CoreMlAneAdapter::new(
+            let adapter = PlannedCoreMlAdapter::new(
                 idx,
                 hidden_size,
                 intermediate_size,

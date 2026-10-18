@@ -296,3 +296,33 @@ pub fn calculate_bandwidth_utilization(
     let util_pct = (effective_gb_s / peak_bandwidth_gb_s) * 100.0;
     (effective_gb_s, util_pct)
 }
+
+/// STREAM-like triad microbench (`a = b + s*c`, F32) over a ~64 MiB working
+/// set. Measures achievable single-threaded DRAM bandwidth on the
+/// machine that runs the bench — the denominator behind the bus-util figure.
+/// Single-threaded on this host; the source string says so when it matters.
+/// Cached in a LazyLock so the microbench runs once per process (#62 F4).
+pub fn measure_peak_bandwidth_gb_s() -> (f64, String) {
+    static PEAK_BW: std::sync::LazyLock<(f64, String)> = std::sync::LazyLock::new(|| {
+        const N: usize = 16 << 20; // 16M f32 = 64 MiB per array
+        let b = vec![1.0f32; N];
+        let c = vec![2.0f32; N];
+        let mut a = vec![0.0f32; N];
+        let start = std::time::Instant::now();
+        // `black_box` keeps LLVM from folding the loop into a memset.
+        for _ in 0..4 {
+            for i in 0..N {
+                a[i] = b[i] + 3.0 * c[i];
+            }
+            std::hint::black_box(&a[..]);
+        }
+        let secs = start.elapsed().as_secs_f64().max(1e-9);
+        // 3 arrays touched per iter (2 read + 1 write), 4 iters, 4 bytes/elem.
+        let bytes = 3.0 * 4.0 * (N as f64) * 4.0;
+        (
+            bytes / secs / 1e9,
+            "measured: single-thread STREAM-triad, 64MiB x4".to_string(),
+        )
+    });
+    PEAK_BW.clone()
+}
