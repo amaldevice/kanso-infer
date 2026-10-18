@@ -81,7 +81,7 @@ that every exec pointer resolves to a file in the tree.
 | FFN offload seam (per-layer SwiGLU adapters, CPU/AMX execution) | ✅ | `src/ffn_offload/adapter.rs`, `src/model.rs` (`forward_mlp_block`) |
 | Real Core ML / ANE execution (`.mlpackage`, `MLModel`) | 📝 | roadmap |
 | Fused PagedAttention v2 Metal kernel | ✅ | `src/metal/paged_attention.rs`, `src/model/paged_attn.rs`, `src/metal/kernels/paged_attention_v2.metal` (decode: `Model::metal_paged_attention`) |
-| Fused Metal llama-layer kernel | 🧪 | `src/metal/fused_layer.rs` |
+| Fused Metal llama-layer kernel | ✅ | `src/metal/fused_layer.rs`, `src/model/fused_decode.rs` — decode: `MetalWeights::decode_step` via `Model::forward_batch`. Wired for the layer **prologue** (fused RMSNorm + QKV + RoPE, one command buffer per layer); one command buffer per *step* covering attention/O/MLP is still debt, see `docs/adr/0002-fused-decode-scope.md` |
 | Hand-written NEON Q8_0/Q4_K GEMV kernels | 🧪 | `src/quant/neon.rs` (benchmark/parity-test path only; `--backend neon` refuses to start — see below) |
 | Quantized (INT8/FP8) paged KV cache | ✅ | `src/kv_cache/kind.rs` (`KvStorageKind`), `src/kv_cache/quantized_storage.rs` — selected by `Engine::new_with_budget_and_kv`; F32 is the default, Metal refuses INT8/FP8 with an `Err` (its paged-attention kernel reads an F32 pool) |
 | Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation | 📝 | roadmap |

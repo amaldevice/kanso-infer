@@ -158,10 +158,20 @@ pub const FEATURES: &[FeatureSpec] = &[
         wired: wired!(crate::model::Model::metal_paged_attention),
     },
     FeatureSpec {
+        // Ticket #87: the wired part is the layer *prologue* — fused RMSNorm + QKV + RoPE,
+        // one command buffer per layer, entered from `Model::forward_batch`. Attention
+        // stays on the #86 paged-attention path and O/MLP stay on the tensor path, so the
+        // "one command buffer per step covering attention/O/MLP" criterion is still debt:
+        // chaining it needs a residual-add and a SwiGLU kernel that do not exist yet
+        // (spec #82 puts new kernels out of scope). Recorded in
+        // `docs/adr/0002-fused-decode-scope.md`, not hidden behind the ✅.
         name: "Fused Metal llama-layer kernel",
-        status: FeatureStatus::KernelOnly,
-        exec_pointer: "src/metal/fused_layer.rs",
-        wired: None,
+        status: FeatureStatus::Wired,
+        exec_pointer: "src/metal/fused_layer.rs src/model/fused_decode.rs",
+        wired: wired!(
+            crate::metal::fused_layer::MetalWeights::decode_step,
+            crate::model::Model::forward_batch
+        ),
     },
     FeatureSpec {
         name: "Hand-written NEON Q8_0/Q4_K GEMV kernels",
