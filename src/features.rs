@@ -153,9 +153,9 @@ pub const FEATURES: &[FeatureSpec] = &[
     },
     FeatureSpec {
         name: "Fused PagedAttention v2 Metal kernel",
-        status: FeatureStatus::KernelOnly,
-        exec_pointer: "src/metal/paged_attention.rs src/metal/kernels/paged_attention_v2.metal",
-        wired: None,
+        status: FeatureStatus::Wired,
+        exec_pointer: "src/metal/paged_attention.rs src/model/paged_attn.rs src/metal/kernels/paged_attention_v2.metal",
+        wired: wired!(crate::model::Model::metal_paged_attention),
     },
     FeatureSpec {
         name: "Fused Metal llama-layer kernel",
@@ -170,10 +170,17 @@ pub const FEATURES: &[FeatureSpec] = &[
         wired: None,
     },
     FeatureSpec {
+        // Ticket #88: `Engine::new_with_budget_and_kv` picks the pool; `KvStorageKind` is
+        // the one seam the decode path reads through. F32 stays the default, and Metal
+        // refuses INT8/FP8 with an `Err` (its paged-attention kernel reads an F32 pool),
+        // so the wired claim covers the CPU/AMX backends that actually serve it.
         name: "Quantized (INT8/FP8) paged KV cache",
-        status: FeatureStatus::KernelOnly,
-        exec_pointer: "src/kv_cache/quantized_storage.rs",
-        wired: None,
+        status: FeatureStatus::Wired,
+        exec_pointer: "src/kv_cache/kind.rs src/kv_cache/quantized_storage.rs",
+        wired: wired!(
+            crate::engine::Engine::new_with_budget_and_kv,
+            crate::kv_cache::KvStorageKind::quantized
+        ),
     },
     FeatureSpec {
         name: "Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation",

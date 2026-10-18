@@ -144,12 +144,13 @@ fn argmax(v: &[f32]) -> u32 {
 #[test]
 fn verify_path_logits_match_the_decode_path() {
     use candle_core::Device;
-    use kanso_infer::kv_cache::{BlockTable, KvStorage};
+    use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
 
     let model = Model::create_mock_tiny(HIDDEN, HEADS, KV_HEADS, 2, VOCAB).unwrap();
     let prompt: Vec<u32> = (0..32).map(|i| (i % VOCAB) as u32).collect();
     let fresh = || {
-        let kv = KvStorage::new(2, 64, BLOCK_SIZE, KV_HEADS, HIDDEN / HEADS, &Device::Cpu).unwrap();
+        let kv = KvStorageKind::f32_new(2, 64, BLOCK_SIZE, KV_HEADS, HIDDEN / HEADS, &Device::Cpu)
+            .unwrap();
         let mut table = BlockTable::new();
         for b in 0..8 {
             table.push_block(b);

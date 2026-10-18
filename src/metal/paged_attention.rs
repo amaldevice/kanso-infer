@@ -33,10 +33,11 @@ pub fn paged_attention_num_partitions(params: &PagedAttentionParams) -> u32 {
 
 /// Host-side bounds: anything the kernel cannot represent must fail here instead of
 /// silently reading past the end of its per-lane registers (ticket #51).
-fn validate_paged_attention_params(
-    params: &PagedAttentionParams,
-    num_partitions: u32,
-) -> Result<(), EngineError> {
+///
+/// Public since ticket #86 so the decode path can reject an unrepresentable shape
+/// *before* it uploads a KV pool it would only throw away.
+pub fn validate_paged_attention_params(params: &PagedAttentionParams) -> Result<(), EngineError> {
+    let num_partitions = paged_attention_num_partitions(params);
     let invalid = |msg: String| Err(EngineError::Metal(msg));
 
     if params.num_seqs == 0 || params.num_heads == 0 || params.num_kv_heads == 0 {
@@ -200,7 +201,7 @@ pub fn gpu_paged_attention_v2_buffer(
         .ok_or_else(|| EngineError::Metal("Pipeline paged_attention_v2_reduce not found".into()))?;
 
     let num_partitions = paged_attention_num_partitions(params);
-    validate_paged_attention_params(params, num_partitions)?;
+    validate_paged_attention_params(params)?;
 
     let num_seqs = params.num_seqs as usize;
     let num_heads = params.num_heads as usize;

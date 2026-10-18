@@ -1,5 +1,5 @@
 use crate::error::EngineError;
-use crate::kv_cache::{BlockPool, BlockTable, KvStorage, PrefixCache};
+use crate::kv_cache::{BlockPool, BlockTable, KvStorageKind, PrefixCache};
 use crate::model::Model;
 use crate::sampler::{greedy_token, sample_from_probs, softmax_probs};
 use crate::scheduler::SamplingParams;
@@ -39,7 +39,7 @@ impl SpeculativeVerifier {
         block_table: &mut BlockTable,
         block_pool: &mut BlockPool,
         prefix_cache: &mut PrefixCache,
-        kv_storage: &mut KvStorage,
+        kv_storage: &mut KvStorageKind,
         block_size: usize,
     ) -> Result<VerificationResult, EngineError> {
         if candidates.is_empty() {

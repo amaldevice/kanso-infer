@@ -10,7 +10,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use kanso_infer::kv_cache::{BlockTable, KvStorage};
+use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
 use kanso_infer::model::Model;
 
 struct CountingAllocator;
@@ -51,7 +51,7 @@ const LONG_CTX: usize = 2048;
 fn step_allocations(model: &Model, ctx: usize, reps: usize) -> (usize, usize) {
     let block_size = model.config.block_size;
     let blocks = ctx.div_ceil(block_size);
-    let mut kv_storage = KvStorage::new(
+    let mut kv_storage = KvStorageKind::f32_new(
         model.config.num_hidden_layers,
         blocks,
         block_size,

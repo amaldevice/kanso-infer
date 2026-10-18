@@ -1,5 +1,5 @@
 use candle_core::{DType, Device, Tensor};
-use kanso_infer::kv_cache::{BlockTable, KvStorage};
+use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
 use kanso_infer::model::Model;
 
 #[test]
@@ -20,7 +20,7 @@ fn test_incremental_decode_matches_monolithic_forward() {
         .expect("monolithic forward failed");
 
     // Incremental decoding using KvStorage and BlockTable
-    let mut kv_storage = KvStorage::new(
+    let mut kv_storage = KvStorageKind::f32_new(
         model.config.num_hidden_layers,
         10,
         model.config.block_size,
@@ -78,7 +78,7 @@ fn test_physical_kv_cache_storage_write_and_gather() {
     let n_kv_heads = 2;
     let head_dim = 4;
 
-    let mut kv = KvStorage::new(
+    let mut kv = KvStorageKind::f32_new(
         num_layers, num_blocks, block_size, n_kv_heads, head_dim, &device,
     )
     .expect("failed to create kv storage");

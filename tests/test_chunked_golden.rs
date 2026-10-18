@@ -4,7 +4,7 @@
 //! Fixed by #43 (offset causal mask + full-context K/V gather); this test
 //! must stay green — reverting the fix turns it red.
 
-use kanso_infer::kv_cache::{BlockTable, KvStorage};
+use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
 use kanso_infer::model::Model;
 
 mod common;
@@ -16,12 +16,12 @@ fn mock() -> Model {
     Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap()
 }
 
-fn fresh_cache(model: &Model, num_blocks: usize) -> (BlockTable, KvStorage) {
+fn fresh_cache(model: &Model, num_blocks: usize) -> (BlockTable, KvStorageKind) {
     let mut table = BlockTable::new();
     for b in 0..num_blocks {
         table.push_block(b);
     }
-    let kv = KvStorage::new(
+    let kv = KvStorageKind::f32_new(
         model.config.num_hidden_layers,
         num_blocks,
         model.config.block_size,
