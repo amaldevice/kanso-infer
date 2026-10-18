@@ -102,6 +102,16 @@ pub struct BenchmarkReport {
     pub decode_ms_per_step: f64,
     pub checksum: u64,
     pub prefix_hit_rate: f64,
+    /// Resident weight bytes + KV bytes for the run's sequence context, weighed
+    /// from the model that actually ran (#53). Zero = predates the field.
+    #[serde(default)]
+    pub bytes_read_per_step: usize,
+    /// Denominator behind the bus-util figure: a measured number, never a literal.
+    #[serde(default)]
+    pub peak_bandwidth_gb_s: f64,
+    /// How `peak_bandwidth_gb_s` was obtained (e.g. the STREAM-triad microbench).
+    #[serde(default)]
+    pub peak_bandwidth_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speculative: Option<crate::speculative::profiler::SpeculativeReport>,
 }
@@ -239,6 +249,9 @@ pub fn evaluate_run_with_timings(
         decode_ms_per_step,
         checksum,
         prefix_hit_rate: 0.0,
+        bytes_read_per_step: 0,
+        peak_bandwidth_gb_s: 0.0,
+        peak_bandwidth_source: String::new(),
         speculative: None,
     }
 }
@@ -346,6 +359,19 @@ fn execute_engine_run(
         decode_duration.as_secs_f64(),
         checksum,
     );
+    // #53: weigh what the run actually reads per decode step — resident weight
+    // bytes (quantized blocks stay resident per #47) plus KV bytes for the
+    // sequence context — and measure the peak denominator on this machine.
+    let max_ctx = requests
+        .iter()
+        .map(|t| t.prompt_len + t.gen_len)
+        .max()
+        .unwrap_or(0);
+    report.bytes_read_per_step = engine.model.weights.storage_bytes()
+        + engine.model.config.kv_cache_bytes_per_token_f32() * max_ctx;
+    let (peak, source) = crate::hardware::measure_peak_bandwidth_gb_s();
+    report.peak_bandwidth_gb_s = peak;
+    report.peak_bandwidth_source = source;
     let delta_matched = engine.prefix_matched_tokens.saturating_sub(initial_matched);
     let delta_total = engine
         .total_prompt_tokens_admitted

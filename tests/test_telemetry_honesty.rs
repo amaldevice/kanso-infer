@@ -34,7 +34,8 @@ fn report_shows_derived_bytes() {
         run_synthetic_benchmark(&mut engine, 2, prompt_len, gen_len, false).expect("benchmark");
     let expected = weights_bytes + kv_per_token * (prompt_len + gen_len);
     assert_eq!(
-        report.bytes_read_per_step, expected,
+        report.bytes_read_per_step,
+        expected,
         "bytes_read_per_step must be derived from the weighed model \
          (weights {weights_bytes} + KV {kv_per_token}/tok x {} ctx), not a literal",
         prompt_len + gen_len,

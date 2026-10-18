@@ -5,18 +5,13 @@ use parking_lot::Mutex;
 use std::path::PathBuf;
 
 /// Checks whether Apple Neural Engine (ANE) hardware is present on current platform.
+///
+/// Always false: there is no Core ML execution path yet (`CoreMlAneAdapter`
+/// runs the CPU/AMX fallback unconditionally), so claiming ANE on the basis
+/// of a chip-name string match would lie on every Mac. Flip this only when a
+/// real dispatch path lands behind it.
 pub fn has_ane_support() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        crate::hardware::get_hardware_info()
-            .chip_name
-            .to_lowercase()
-            .contains("apple")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
+    false
 }
 
 /// Architectural adapter trait for dispatching feedforward (SwiGLU/FFN) layer computation
