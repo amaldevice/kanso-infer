@@ -330,3 +330,192 @@ fn cli_gate_exits_2_when_a_required_asset_is_missing() {
     let _ = std::fs::remove_file(&budget);
     let _ = std::fs::remove_file(&report);
 }
+
+/// Minimal Q8_0 GGUF so `bench` can run without a real model on disk.
+fn write_tiny_gguf(path: &Path) {
+    use candle_core::Device;
+    use candle_core::quantized::gguf_file::{self, Value};
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::{DType, Tensor};
+    use rand::{Rng, SeedableRng};
+    use std::io::BufWriter;
+
+    const HIDDEN: usize = 32;
+    const Q_HEADS: usize = 4;
+    const KV_HEADS: usize = 2;
+    const INTER: usize = 64;
+    const VOCAB: usize = 64;
+    const LAYERS: usize = 1;
+
+    let dev = Device::Cpu;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x84_5EED);
+    let head_dim = HIDDEN / Q_HEADS;
+    let rand_tensor = |rng: &mut rand::rngs::StdRng, rows: usize, cols: usize| -> Tensor {
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * 0.05)
+            .collect();
+        Tensor::from_vec(data, (rows, cols), &dev).unwrap()
+    };
+
+    let mut tensors: Vec<(String, QTensor)> = vec![
+        (
+            "token_embd.weight".to_string(),
+            QTensor::quantize(
+                &rand_tensor(&mut rng, VOCAB, HIDDEN),
+                GgmlDType::Q8_0,
+            )
+            .unwrap(),
+        ),
+        (
+            "output_norm.weight".to_string(),
+            QTensor::quantize(
+                &Tensor::ones(HIDDEN, DType::F32, &dev).unwrap(),
+                GgmlDType::F32,
+            )
+            .unwrap(),
+        ),
+    ];
+    for i in 0..LAYERS {
+        for (name, tensor, is_norm) in [
+            (
+                format!("blk.{i}.attn_norm.weight"),
+                Tensor::ones(HIDDEN, DType::F32, &dev).unwrap(),
+                true,
+            ),
+            (
+                format!("blk.{i}.attn_q.weight"),
+                rand_tensor(&mut rng, Q_HEADS * head_dim, HIDDEN),
+                false,
+            ),
+            (
+                format!("blk.{i}.attn_k.weight"),
+                rand_tensor(&mut rng, KV_HEADS * head_dim, HIDDEN),
+                false,
+            ),
+            (
+                format!("blk.{i}.attn_v.weight"),
+                rand_tensor(&mut rng, KV_HEADS * head_dim, HIDDEN),
+                false,
+            ),
+            (
+                format!("blk.{i}.attn_output.weight"),
+                rand_tensor(&mut rng, HIDDEN, Q_HEADS * head_dim),
+                false,
+            ),
+            (
+                format!("blk.{i}.ffn_norm.weight"),
+                Tensor::ones(HIDDEN, DType::F32, &dev).unwrap(),
+                true,
+            ),
+            (
+                format!("blk.{i}.ffn_gate.weight"),
+                rand_tensor(&mut rng, INTER, HIDDEN),
+                false,
+            ),
+            (
+                format!("blk.{i}.ffn_up.weight"),
+                rand_tensor(&mut rng, INTER, HIDDEN),
+                false,
+            ),
+            (
+                format!("blk.{i}.ffn_down.weight"),
+                rand_tensor(&mut rng, HIDDEN, INTER),
+                false,
+            ),
+        ] {
+            let dtype = if is_norm {
+                GgmlDType::F32
+            } else {
+                GgmlDType::Q8_0
+            };
+            tensors.push((name, QTensor::quantize(&tensor, dtype).unwrap()));
+        }
+    }
+
+    let meta = [
+        ("general.architecture", Value::String("llama".to_string())),
+        ("llama.block_count", Value::U32(LAYERS as u32)),
+        ("llama.attention.head_count", Value::U32(Q_HEADS as u32)),
+        ("llama.attention.head_count_kv", Value::U32(KV_HEADS as u32)),
+        ("llama.embedding_length", Value::U32(HIDDEN as u32)),
+        ("llama.feed_forward_length", Value::U32(INTER as u32)),
+        ("llama.rope.freq_base", Value::F32(10000.0)),
+        ("llama.attention.layer_norm_rms_epsilon", Value::F32(1e-5)),
+    ];
+    let meta_refs: Vec<(&str, &Value)> = meta.iter().map(|(k, v)| (*k, v)).collect();
+    let tensor_refs: Vec<(&str, &QTensor)> =
+        tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();
+    let file = std::fs::File::create(path).expect("create tiny gguf");
+    gguf_file::write(&mut BufWriter::new(file), &meta_refs, &tensor_refs).expect("write tiny gguf");
+}
+
+fn run_bench_with_gate(tag: &str, budget_rows: &str) -> (std::process::Output, PathBuf) {
+    let gguf = write_tmp(&format!("run-{tag}.gguf"), "");
+    write_tiny_gguf(&gguf);
+    let budget = write_tmp(
+        &format!("run-{tag}-budget.json"),
+        &format!(r#"{{"name":"run-{tag}","rows":[{budget_rows}]}}"#),
+    );
+    let report = tmp_path(&format!("run-{tag}-report.json"));
+    let _ = std::fs::remove_file(&report);
+
+    let out = std::process::Command::new(bench_bin())
+        .args([
+            "--gate",
+            budget.to_str().unwrap(),
+            "--model",
+            gguf.to_str().unwrap(),
+            "--backend",
+            "cpu",
+            "--json-output",
+            report.to_str().unwrap(),
+            "--batch-sizes",
+            "1",
+            "--prompt-len",
+            "2",
+            "--gen-len",
+            "2",
+            "--no-warmup",
+        ])
+        .output()
+        .expect("run bench --gate --model");
+    let _ = std::fs::remove_file(&gguf);
+    (out, report)
+}
+
+#[test]
+fn bench_gate_run_exits_0_when_the_measured_report_is_within_budget() {
+    let (out, report) = run_bench_with_gate(
+        "pass",
+        r#"{"metric":"decode_ms_per_step","bound":"max","budget":1000000.0}"#,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("passed"), "{stdout}");
+    assert!(
+        report.is_file(),
+        "the evidence report JSON must still be written:\n{stdout}"
+    );
+    let _ = std::fs::remove_file(&report);
+}
+
+#[test]
+fn bench_gate_run_exits_1_when_the_measured_report_breaks_budget() {
+    let (out, report) = run_bench_with_gate(
+        "violated",
+        r#"{"metric":"decode_ms_per_step","bound":"max","budget":0.000001}"#,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("violated"), "{stdout}");
+
+    let evidence = std::fs::read_to_string(&report)
+        .expect("the evidence report JSON must be written even when the gate is red");
+    let parsed: BenchmarkReport = serde_json::from_str(&evidence).expect("report JSON parses");
+    assert!(parsed.decode_ms_per_step > 0.0);
+    let _ = std::fs::remove_file(&report);
+}
