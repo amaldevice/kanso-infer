@@ -233,10 +233,22 @@ fn quantized_kv_bytes_per_token_are_below_f32() {
             bytes < f32_bytes,
             "{mode:?} KV reports {bytes} bytes/token, F32 holds {f32_bytes}: quantization bought nothing"
         );
+        // AC: the reported ratio must be a real >1x saving, not a claimed one — it has to
+        // agree with the two byte counts it is derived from.
         let ratio = storage.memory_ratio_vs_f32();
         assert!(
             ratio > 1.0,
             "{mode:?} KV compression ratio {ratio} is not better than F32"
+        );
+        assert!(
+            (ratio - f32_bytes as f32 / bytes as f32).abs() < 1e-6,
+            "{mode:?} KV ratio {ratio} disagrees with {f32_bytes} / {bytes} bytes per token"
+        );
+        // Geometry sanity: K and V shrink to one byte per element, so even with the
+        // per-token-per-head F32 scales the pool must be at least 1.5x smaller here.
+        assert!(
+            ratio >= 1.5,
+            "{mode:?} KV ratio {ratio:.2}x is smaller than the >=1.5x this geometry implies"
         );
         println!("{mode:?} KV: {bytes} bytes/token vs F32 {f32_bytes} ({ratio:.2}x smaller)");
     }
@@ -244,15 +256,27 @@ fn quantized_kv_bytes_per_token_are_below_f32() {
 
 #[test]
 fn engine_reports_kv_bytes_per_token() {
-    let engine =
-        Engine::new_with_budget_and_kv(mock(), 1, 64, 16, usize::MAX, Some(QuantMode::Int8))
-            .expect("int8 engine");
     let f32_engine = Engine::new(mock(), 1, 64, 16).expect("f32 engine");
-    assert!(
-        engine.kv_storage.memory_bytes_per_token() < f32_engine.kv_storage.memory_bytes_per_token(),
-        "the engine must expose the per-token KV footprint so the saving is reportable"
+    let f32_bytes = f32_engine.kv_storage.memory_bytes_per_token();
+    assert_eq!(
+        f32_engine.kv_storage.memory_ratio_vs_f32(),
+        1.0,
+        "the F32 pool is the baseline, so its own ratio is exactly 1x"
     );
-    assert!(engine.kv_storage.memory_ratio_vs_f32() > 1.0);
+    for mode in [QuantMode::Int8, QuantMode::Fp8] {
+        let engine = Engine::new_with_budget_and_kv(mock(), 1, 64, 16, usize::MAX, Some(mode))
+            .expect("quantized engine");
+        let bytes = engine.kv_storage.memory_bytes_per_token();
+        assert!(
+            bytes < f32_bytes,
+            "the engine must expose the per-token KV footprint so the saving is reportable"
+        );
+        assert!(
+            engine.kv_storage.memory_ratio_vs_f32() > 1.0,
+            "{mode:?} engine reports no saving against F32"
+        );
+        println!("{mode:?} engine KV: {bytes} bytes/token vs F32 {f32_bytes}");
+    }
 }
 
 #[test]

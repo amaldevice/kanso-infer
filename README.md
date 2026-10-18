@@ -83,7 +83,7 @@ that every exec pointer resolves to a file in the tree.
 | Fused PagedAttention v2 Metal kernel | ✅ | `src/metal/paged_attention.rs`, `src/model/paged_attn.rs`, `src/metal/kernels/paged_attention_v2.metal` (decode: `Model::metal_paged_attention`) |
 | Fused Metal llama-layer kernel | 🧪 | `src/metal/fused_layer.rs` |
 | Hand-written NEON Q8_0/Q4_K GEMV kernels | 🧪 | `src/quant/neon.rs` (reference/benchmark path; production decode runs off candle's kernels) |
-| Quantized (INT8/FP8) paged KV cache | 🧪 | `src/kv_cache/quantized_storage.rs` |
+| Quantized (INT8/FP8) paged KV cache | ✅ | `src/kv_cache/kind.rs` (`KvStorageKind`), `src/kv_cache/quantized_storage.rs` — selected by `Engine::new_with_budget_and_kv`; F32 is the default, Metal refuses INT8/FP8 with an `Err` (its paged-attention kernel reads an F32 pool) |
 | Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation | 📝 | roadmap |
 | `granite-h` / `lfm` bench profiles | 📝 | roadmap |
 
@@ -91,7 +91,6 @@ that every exec pointer resolves to a file in the tree.
 
 - Real Core ML / ANE execution: compile per-layer SwiGLU to `.mlpackage` and run via `MLModel`, behind the `src/ffn_offload` seam.
 - Wire the fused PagedAttention v2 kernel into the Metal decode path (`src/model.rs` names the call site).
-- Wire quantized KV storage into `Engine` (currently always F32 `KvStorage`).
 - Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation — demoted from 🧪 to 📝
   by ticket #83. What exists today is `src/hybrid/recurrent_state.rs` (a rolling
   `0.9*state + 0.1*input` buffer, 72 lines) and `src/kv_cache/`'s `SparseBlockTable`
