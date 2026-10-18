@@ -153,9 +153,9 @@ pub const FEATURES: &[FeatureSpec] = &[
     },
     FeatureSpec {
         name: "Fused PagedAttention v2 Metal kernel",
-        status: FeatureStatus::KernelOnly,
-        exec_pointer: "src/metal/paged_attention.rs src/metal/kernels/paged_attention_v2.metal",
-        wired: None,
+        status: FeatureStatus::Wired,
+        exec_pointer: "src/metal/paged_attention.rs src/model/paged_attn.rs src/metal/kernels/paged_attention_v2.metal",
+        wired: wired!(crate::model::Model::metal_paged_attention),
     },
     FeatureSpec {
         name: "Fused Metal llama-layer kernel",

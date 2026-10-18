@@ -751,7 +751,7 @@ impl Model {
     ///
     /// Kernel parameters the shader cannot represent (head_dim > 256, GQA group > 8) are
     /// `Err` here — a silent fall back to the copying path would hide them.
-    fn metal_paged_attention(
+    pub fn metal_paged_attention(
         &self,
         q: &Tensor,
         kv_storage: &KvStorage,

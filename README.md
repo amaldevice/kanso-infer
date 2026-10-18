@@ -80,7 +80,7 @@ that every exec pointer resolves to a file in the tree.
 | AMX/Accelerate GEMM path (dense weights) | ✅ | `src/accelerate/amx.rs`, `src/model.rs` (`Model::linear`) |
 | FFN offload seam (per-layer SwiGLU adapters, CPU/AMX execution) | ✅ | `src/ffn_offload/adapter.rs`, `src/model.rs` (`forward_mlp_block`) |
 | Real Core ML / ANE execution (`.mlpackage`, `MLModel`) | 📝 | roadmap |
-| Fused PagedAttention v2 Metal kernel | 🧪 | `src/metal/paged_attention.rs`, `src/metal/kernels/paged_attention_v2.metal` |
+| Fused PagedAttention v2 Metal kernel | ✅ | `src/metal/paged_attention.rs`, `src/model/paged_attn.rs`, `src/metal/kernels/paged_attention_v2.metal` (decode: `Model::metal_paged_attention`) |
 | Fused Metal llama-layer kernel | 🧪 | `src/metal/fused_layer.rs` |
 | Hand-written NEON Q8_0/Q4_K GEMV kernels | 🧪 | `src/quant/neon.rs` (reference/benchmark path; production decode runs off candle's kernels) |
 | Quantized (INT8/FP8) paged KV cache | 🧪 | `src/kv_cache/quantized_storage.rs` |
