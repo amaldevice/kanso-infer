@@ -3,7 +3,41 @@ use std::io::{self, Write};
 
 use kanso_infer::bench::create_engine_for_model_profile;
 use kanso_infer::chat::ChatSession;
+use kanso_infer::engine::Engine;
+use kanso_infer::error::EngineError;
+use kanso_infer::model::Model;
 use kanso_infer::server::create_app;
+
+/// Builds a session engine, turning a KV request the machine cannot serve into a
+/// user-facing message and a non-zero exit instead of a panic (ticket #85).
+fn build_engine(
+    model: Model,
+    max_running: usize,
+    block_size: usize,
+    context_tokens: usize,
+    requests: usize,
+    min_blocks: usize,
+) -> Engine {
+    let per_sequence = context_tokens.div_ceil(block_size);
+    let total_blocks = per_sequence
+        .checked_mul(requests.max(1))
+        .map(|total| total.max(min_blocks));
+
+    let built = match total_blocks {
+        Some(blocks) => Engine::new(model, max_running, blocks, block_size),
+        None => Err(EngineError::Config(format!(
+            "cannot size the KV pool: {context_tokens} context tokens x {requests} requests exceeds the addressable size"
+        ))),
+    };
+
+    match built {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
 #[derive(Parser, Debug)]
 #[command(
     name = "kanso",
@@ -188,9 +222,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
             let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, device)?;
             model_instance.set_backend(backend);
-            let total_blocks = (128 + max_tokens).div_ceil(16) * prompt.len().max(1);
-            let mut engine =
-                kanso_infer::engine::Engine::new(model_instance, 8, total_blocks.max(32), 16);
+            let context_tokens = 128usize.saturating_add(max_tokens);
+            let mut engine = build_engine(model_instance, 8, 16, context_tokens, prompt.len(), 32);
 
             let tok_wrapper = kanso_infer::tokenizer::TokenizerWrapper::resolve(
                 tokenizer.as_deref(),
@@ -294,9 +327,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
             let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, device)?;
             model_instance.set_backend(backend);
-            let total_blocks = (256 + max_tokens).div_ceil(16) * 4;
-            let engine =
-                kanso_infer::engine::Engine::new(model_instance, 4, total_blocks.max(64), 16);
+            let context_tokens = 256usize.saturating_add(max_tokens);
+            let engine = build_engine(model_instance, 4, 16, context_tokens, 4, 64);
             let tok_wrapper = kanso_infer::tokenizer::TokenizerWrapper::resolve(
                 tokenizer.as_deref(),
                 Some(&resolved_path),
@@ -374,7 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
             let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, device)?;
             model_instance.set_backend(backend);
-            let engine = kanso_infer::engine::Engine::new(model_instance, 8, 128, 16);
+            let engine = build_engine(model_instance, 8, 16, 128, 1, 128);
 
             // #46: the server tokenizes and detokenizes with the real tokenizer, so a
             // missing one is a startup failure rather than silently wrong text.

@@ -116,7 +116,7 @@ fn test_jsonl_trace_parsing_invalid() {
 #[test]
 fn test_batch_sweep_with_warmup_exclusion_and_metrics() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-    let mut engine = Engine::new(model, 4, 60, 4);
+    let mut engine = Engine::new(model, 4, 60, 4).expect("engine");
 
     let batch_size = 2;
     let prompt_len = 2;
@@ -147,7 +147,7 @@ fn test_batch_sweep_with_warmup_exclusion_and_metrics() {
 
     // Repeat run should match deterministic checksum
     let model2 = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-    let mut engine2 = Engine::new(model2, 4, 60, 4);
+    let mut engine2 = Engine::new(model2, 4, 60, 4).expect("engine");
     let report2 =
         run_synthetic_benchmark(&mut engine2, batch_size, prompt_len, gen_len, true).unwrap();
     assert_eq!(report.checksum, report2.checksum);
@@ -156,7 +156,7 @@ fn test_batch_sweep_with_warmup_exclusion_and_metrics() {
 #[test]
 fn test_trace_benchmark_execution() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
-    let mut engine = Engine::new(model, 4, 60, 4);
+    let mut engine = Engine::new(model, 4, 60, 4).expect("engine");
 
     let trace = vec![
         TraceEntry {

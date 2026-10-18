@@ -48,12 +48,23 @@ Supports dense Transformer decoders and next-generation hybrid linear-attention 
   - Time-to-First-Token (`TTFT` mean and max in ms)
   - Inter-Token Latency (`ITL` mean and $p99$ in ms)
   - Decode duration (`ms/step`) and prefill rate (`tok/s`)
+- **Machine-Readable Performance Gates**: `--gate <budget.json>` compares the report against version-controlled budgets and exits `0` (passed) / `1` (violated) / `2` (skipped: required asset missing). See section 6.
 
 ## Feature Status
 
 Every claim below resolves to one status. ✅ wired = reachable from `kanso cli` / `chat` / `serve`;
 🧪 kernel-only = implemented and tested, but no production caller yet; 📝 planned = roadmap, not code.
-Status is machine-audited by `tests/test_honesty_fase3.rs` (every row carries an exec pointer).
+
+The table has one in-crate source of truth: `src/features.rs`. Each row is a `FeatureSpec`
+carrying the same name, status and exec pointer, and every ✅ row also carries a `wired`
+marker that names its production symbol inside a `const`. Deleting or privatising that
+symbol breaks the build, so a ✅ label cannot outlive the code it describes. What the
+marker proves is that the symbol *exists and is public* — reachability from
+`kanso cli` / `chat` / `serve` is still the behavioural tests' job.
+`tests/test_feature_registry.rs` fails when this table and the registry disagree by even
+one row, when a ✅ row has no marker, when a 🧪/📝 row still claims one, or when a 📝 row
+points somewhere other than the roadmap. `tests/test_honesty_fase3.rs` separately checks
+that every exec pointer resolves to a file in the tree.
 
 | Feature | Status | Exec pointer |
 | :--- | :---: | :--- |
@@ -73,15 +84,26 @@ Status is machine-audited by `tests/test_honesty_fase3.rs` (every row carries an
 | Fused Metal llama-layer kernel | 🧪 | `src/metal/fused_layer.rs` |
 | Hand-written NEON Q8_0/Q4_K GEMV kernels | 🧪 | `src/quant/neon.rs` (reference/benchmark path; production decode runs off candle's kernels) |
 | Quantized (INT8/FP8) paged KV cache | 🧪 | `src/kv_cache/quantized_storage.rs` |
-| Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation | 🧪 | `src/hybrid/`, `src/kv_cache/` (`SparseBlockTable`); loader rejects hybrid GGUF until wired |
-| `granite-h` / `lfm` bench profiles | 🧪 | `src/config.rs` (mock shapes for bench comparison, not loaded weights) |
+| Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation | 📝 | roadmap |
+| `granite-h` / `lfm` bench profiles | 📝 | roadmap |
 
 ## Roadmap
 
 - Real Core ML / ANE execution: compile per-layer SwiGLU to `.mlpackage` and run via `MLModel`, behind the `src/ffn_offload` seam.
 - Wire the fused PagedAttention v2 kernel into the Metal decode path (`src/model.rs` names the call site).
 - Wire quantized KV storage into `Engine` (currently always F32 `KvStorage`).
-- Wire hybrid SSM/conv layers into the forward pass and lift the loader arch gate for them.
+- Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation — demoted from 🧪 to 📝
+  by ticket #83. What exists today is `src/hybrid/recurrent_state.rs` (a rolling
+  `0.9*state + 0.1*input` buffer, 72 lines) and `src/kv_cache/`'s `SparseBlockTable`
+  (block bookkeeping), with **no integration into the forward pass**: no Mamba-2 SSM scan,
+  no LIV conv mixing, no sparse attention read. That is a stub, not "implemented and
+  tested", so the honest status is planned. The loader arch gate still rejects hybrid GGUF
+  (`mamba`, `lfm2`, ...) until the forward pass exists — that gate stays.
+- `granite-h` / `lfm` bench profiles — demoted from 🧪 to 📝 by ticket #83. `src/config.rs`
+  describes their *shapes* only (mock configs for comparative bench runs); no hybrid or
+  LFM weights are ever loaded, and `bench` refuses to run without `--model <path>`. A mock
+  shape is not an implemented feature, so this is roadmap: load real Granite-hybrid/LFM
+  GGUF once the hybrid forward pass above lands.
 - Promote hand-written NEON GEMV kernels from reference path to production decode path.
 
 ---
@@ -243,6 +265,42 @@ batch_size=1    backend=cpu    batch=1    tok/s(total)=245.2    tok/s/req=245.17
                 ttft_ms(mean/max)=22.3/22.3 itl_ms(mean/p99)=1.5/1.7 decode_ms/step=4.08 checksum=a8c7f832281a39c5
                 peak_rss=9.8MB thermal="Fair (Elevated, fans active)" bus_est=93.2GB/s (62.1% bus util)
 ```
+
+### 6. Performance Gates
+A budget file turns a performance threshold into a reviewable diff. `--gate`
+compares a `BenchmarkReport` against the budget and exits with a code CI can read:
+
+```bash
+# Gate a fresh run (the report JSON is written as evidence, path printed)
+cargo run --release --bin bench -- \
+  --model ./models/smollm2-360m-instruct-q8_0.gguf \
+  --gate gates/fase1.json
+
+# Re-check an existing report without loading a model or touching hardware
+cargo run --release --bin bench -- \
+  --gate gates/fase1.json \
+  --gate-report report.json
+```
+
+A budget declares rows of `{metric, bound, budget, requires?}`:
+
+```json
+{
+  "name": "fase1",
+  "rows": [
+    {"metric": "decode_ms_per_step", "bound": "max", "budget": 12.0},
+    {"metric": "total_tokens_per_sec", "bound": "min", "budget": 180.0,
+     "requires": {"kind": "file", "path": "models/smollm2-360m-instruct-q8_0.gguf"}}
+  ]
+}
+```
+
+Each row prints its measured value, the ratio against the budget, the budget and
+the verdict. Exit codes: `0` every row measured and within budget, `1` a budget
+was violated, `2` a row could not be measured because a required asset
+(`"kind": "file"`) or tool (`"kind": "tool"`, looked up on `PATH`) is missing.
+**A skipped row is never counted as a pass**, and an unknown metric is an error
+rather than a silent green.
 
 ---
 

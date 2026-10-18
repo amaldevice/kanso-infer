@@ -23,7 +23,7 @@ const MODEL: &str = "mock-tiny";
 /// dominates test wall time, and only `vocab_size` drives the embedding/head cost.
 fn mock_engine(vocab_size: usize) -> Engine {
     let model = Model::create_mock_tiny(16, 2, 1, 1, vocab_size).unwrap();
-    Engine::new(model, 8, 32, 16)
+    Engine::new(model, 8, 32, 16).expect("engine")
 }
 
 /// The repo's real `tokenizer.json`; the server must serve *its* text.
