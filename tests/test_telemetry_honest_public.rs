@@ -12,7 +12,19 @@ use kanso_infer::bench::{
 
 /// Same shape as the gate tests' synthetic report, but nothing was weighed.
 fn unweighed_report() -> BenchmarkReport {
-    evaluate_run_with_timings(100, 1.0, 2, &[10.0, 20.0], &[5.0, 6.0], 10, 0.1, 20, 0.5, 42, 0)
+    evaluate_run_with_timings(
+        100,
+        1.0,
+        2,
+        &[10.0, 20.0],
+        &[5.0, 6.0],
+        10,
+        0.1,
+        20,
+        0.5,
+        42,
+        0,
+    )
 }
 
 /// The same numbers, with bytes weighed from a real model.
@@ -93,8 +105,8 @@ fn legacy_json_without_the_marker_deserializes_as_unmeasured() {
 
 #[test]
 fn gate_cannot_pass_an_unmeasured_report() {
-    let outcome = evaluate_gate(&min_throughput_budget(), &unweighed_report())
-        .expect("gate evaluates");
+    let outcome =
+        evaluate_gate(&min_throughput_budget(), &unweighed_report()).expect("gate evaluates");
 
     assert!(
         !outcome.passed(),
@@ -118,8 +130,8 @@ fn gate_cannot_pass_an_unmeasured_report() {
 
 #[test]
 fn gate_still_passes_a_weighed_report() {
-    let outcome = evaluate_gate(&min_throughput_budget(), &weighed_report())
-        .expect("gate evaluates");
+    let outcome =
+        evaluate_gate(&min_throughput_budget(), &weighed_report()).expect("gate evaluates");
 
     assert!(outcome.passed(), "{}", outcome.format_table());
     assert_eq!(outcome.code(), 0);

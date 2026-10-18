@@ -214,6 +214,7 @@ fn test_benchmark_report_speculative_integration() {
         bytes_read_per_step: 100_000_000,
         peak_bandwidth_gb_s: 150.0,
         peak_bandwidth_source: "measured: test".to_string(),
+        telemetry: kanso_infer::bench::TelemetryStatus::Measured,
         speculative: None,
     }
     .with_speculative(spec_report);

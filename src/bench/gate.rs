@@ -8,7 +8,8 @@
 //! - `0` — every row measured and within budget
 //! - `1` — at least one row violated its budget
 //! - `2` — no violation, but a row could not be measured because the asset it
-//!   requires is missing. A skipped row is never counted as a pass.
+//!   requires is missing, or because the report's telemetry was never weighed.
+//!   A skipped row is never counted as a pass.
 
 use serde::{Deserialize, Serialize};
 
@@ -284,7 +285,13 @@ pub fn evaluate_gate(
         let skip_reason = row
             .requires
             .as_ref()
-            .and_then(|requirement| requirement.missing());
+            .and_then(|requirement| requirement.missing())
+            .or_else(|| {
+                // #91: a report that was never weighed cannot back a verdict.
+                report
+                    .is_unweighed()
+                    .then(|| "unmeasured telemetry: report carries no weighed bytes".to_string())
+            });
 
         let (measured, ratio, verdict) = match skip_reason {
             Some(reason) => (None, None, GateVerdict::Skipped(reason)),

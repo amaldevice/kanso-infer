@@ -253,17 +253,29 @@ cargo run --release --bin bench -- \
   --backend cpu
 ```
 
-Output format:
+Output format (field names, with `<...>` where a run puts its own numbers):
 ```text
 ============================================================
  kanso-infer multi-engine benchmark suite
- Hardware : Apple A18 Pro (6 cores, 8.0 GB RAM, Model: Mac17,5)
- Thermal  : Fair (Elevated, fans active)
- Backend  : cpu, Model Profile: mock, Warmup: false
+ Model    : <path to the GGUF that ran>
+ Hardware : <chip> (<n> cores, <n> GB RAM, Model: <id>)
+ Thermal  : <thermal state>
+ Backend  : <backend>, Warmup: <bool>
 ============================================================
-batch_size=1    backend=cpu    batch=1    tok/s(total)=245.2    tok/s/req=245.17
-                ttft_ms(mean/max)=22.3/22.3 itl_ms(mean/p99)=1.5/1.7 decode_ms/step=4.08 checksum=a8c7f832281a39c5
-                peak_rss=9.8MB thermal="Fair (Elevated, fans active)" bus_est=93.2GB/s (62.1% bus util)
+batch_size=<n>    backend=<backend>    batch=<n>    tok/s(total)=<t>    tok/s/req=<t>
+                ttft_ms(p50/p90/mean/max)=<t>/<t>/<t>/<t> itl_ms(p50/p90/p99)=<t>/<t>/<t> prefill_tok/s=<t> decode_ms/step=<t> (decode_ms/tok=<t>) prefix_hit=<t>% checksum=<16 hex digits>
+                peak_rss=<t>MB thermal="<thermal state>" bus_est=<t>GB/s (<t>% of <t>GB/s <how the peak was measured>)
+```
+
+Every number above comes from the run, so there is no reference output to
+compare against: the `checksum` is an FNV-1a hash of the tokens that run
+generated, and it differs per model, per prompt and per sampling seed. Two
+profiles reporting the same checksum would mean one of them did not run.
+
+The JSON written by `--json-output` carries a `telemetry` field next to
+`bytes_read_per_step`: `"measured"` when the bytes were weighed from the model
+that ran, `"unmeasured"` when nothing was weighed. `--gate` treats an
+unmeasured report as inconclusive (exit `2`), never as a pass.
 ```
 
 ### 6. Performance Gates
