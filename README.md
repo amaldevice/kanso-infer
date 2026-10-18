@@ -54,7 +54,17 @@ Supports dense Transformer decoders and next-generation hybrid linear-attention 
 
 Every claim below resolves to one status. ✅ wired = reachable from `kanso cli` / `chat` / `serve`;
 🧪 kernel-only = implemented and tested, but no production caller yet; 📝 planned = roadmap, not code.
-Status is machine-audited by `tests/test_honesty_fase3.rs` (every row carries an exec pointer).
+
+The table has one in-crate source of truth: `src/features.rs`. Each row is a `FeatureSpec`
+carrying the same name, status and exec pointer, and every ✅ row also carries a `wired`
+marker that names its production symbol inside a `const`. Deleting or privatising that
+symbol breaks the build, so a ✅ label cannot outlive the code it describes. What the
+marker proves is that the symbol *exists and is public* — reachability from
+`kanso cli` / `chat` / `serve` is still the behavioural tests' job.
+`tests/test_feature_registry.rs` fails when this table and the registry disagree by even
+one row, when a ✅ row has no marker, when a 🧪/📝 row still claims one, or when a 📝 row
+points somewhere other than the roadmap. `tests/test_honesty_fase3.rs` separately checks
+that every exec pointer resolves to a file in the tree.
 
 | Feature | Status | Exec pointer |
 | :--- | :---: | :--- |
@@ -74,15 +84,26 @@ Status is machine-audited by `tests/test_honesty_fase3.rs` (every row carries an
 | Fused Metal llama-layer kernel | 🧪 | `src/metal/fused_layer.rs` |
 | Hand-written NEON Q8_0/Q4_K GEMV kernels | 🧪 | `src/quant/neon.rs` (reference/benchmark path; production decode runs off candle's kernels) |
 | Quantized (INT8/FP8) paged KV cache | 🧪 | `src/kv_cache/quantized_storage.rs` |
-| Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation | 🧪 | `src/hybrid/`, `src/kv_cache/` (`SparseBlockTable`); loader rejects hybrid GGUF until wired |
-| `granite-h` / `lfm` bench profiles | 🧪 | `src/config.rs` (mock shapes for bench comparison, not loaded weights) |
+| Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation | 📝 | roadmap |
+| `granite-h` / `lfm` bench profiles | 📝 | roadmap |
 
 ## Roadmap
 
 - Real Core ML / ANE execution: compile per-layer SwiGLU to `.mlpackage` and run via `MLModel`, behind the `src/ffn_offload` seam.
 - Wire the fused PagedAttention v2 kernel into the Metal decode path (`src/model.rs` names the call site).
 - Wire quantized KV storage into `Engine` (currently always F32 `KvStorage`).
-- Wire hybrid SSM/conv layers into the forward pass and lift the loader arch gate for them.
+- Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation — demoted from 🧪 to 📝
+  by ticket #83. What exists today is `src/hybrid/recurrent_state.rs` (a rolling
+  `0.9*state + 0.1*input` buffer, 72 lines) and `src/kv_cache/`'s `SparseBlockTable`
+  (block bookkeeping), with **no integration into the forward pass**: no Mamba-2 SSM scan,
+  no LIV conv mixing, no sparse attention read. That is a stub, not "implemented and
+  tested", so the honest status is planned. The loader arch gate still rejects hybrid GGUF
+  (`mamba`, `lfm2`, ...) until the forward pass exists — that gate stays.
+- `granite-h` / `lfm` bench profiles — demoted from 🧪 to 📝 by ticket #83. `src/config.rs`
+  describes their *shapes* only (mock configs for comparative bench runs); no hybrid or
+  LFM weights are ever loaded, and `bench` refuses to run without `--model <path>`. A mock
+  shape is not an implemented feature, so this is roadmap: load real Granite-hybrid/LFM
+  GGUF once the hybrid forward pass above lands.
 - Promote hand-written NEON GEMV kernels from reference path to production decode path.
 
 ---

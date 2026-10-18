@@ -5,6 +5,7 @@ pub mod chat;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod features;
 pub mod ffn_offload;
 pub mod hardware;
 pub mod hybrid;
