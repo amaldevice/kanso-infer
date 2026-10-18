@@ -158,15 +158,36 @@ fn run_gate(
     let budget = kanso_infer::bench::GateBudget::from_file(std::path::Path::new(gate_path))?;
     let evidence = std::fs::read_to_string(report_path)
         .map_err(|e| format!("cannot read gate report '{report_path}': {e}"))?;
-    let report: BenchmarkReport = serde_json::from_str(&evidence)
+    let value: serde_json::Value = serde_json::from_str(&evidence)
         .map_err(|e| format!("invalid gate report '{report_path}': {e}"))?;
+    // A sweep run writes an array; a single run writes one object.
+    let parsed: Vec<BenchmarkReport> = match value {
+        serde_json::Value::Array(_) => serde_json::from_value(value)
+            .map_err(|e| format!("invalid gate report '{report_path}': {e}"))?,
+        single => vec![
+            serde_json::from_value(single)
+                .map_err(|e| format!("invalid gate report '{report_path}': {e}"))?,
+        ],
+    };
 
-    let outcome = kanso_infer::bench::evaluate_gate(&budget, &report)?;
-    print!("{}", outcome.format_table());
+    let mut violated = false;
+    let mut skipped = false;
+    for report in &parsed {
+        let outcome = kanso_infer::bench::evaluate_gate(&budget, report)?;
+        print!("{}", outcome.format_table());
+        violated |= outcome.code() == 1;
+        skipped |= outcome.code() == 2;
+    }
     println!("evidence: budget JSON {gate_path}");
     println!("evidence: report JSON {report_path}");
     std::io::stdout().flush()?;
-    std::process::exit(outcome.code());
+    std::process::exit(if violated {
+        1
+    } else if skipped {
+        2
+    } else {
+        0
+    });
 }
 
 /// Gate the reports just produced by a run. A violation anywhere outranks a
