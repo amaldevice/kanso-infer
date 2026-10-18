@@ -1,11 +1,11 @@
 // mini_engine library root
 pub mod accelerate;
-pub mod ane;
 pub mod bench;
 pub mod chat;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod ffn_offload;
 pub mod hardware;
 pub mod hybrid;
 pub mod kv_cache;

@@ -139,7 +139,7 @@ fn test_load_model_configs_smollm2_and_granite() {
     let smol = mini_engine::config::ModelConfig::smollm2_360m();
     assert_eq!(smol.hidden_size, 960);
     assert_eq!(smol.num_attention_heads, 15);
-    assert_eq!(smol.num_key_value_heads, 3);
+    assert_eq!(smol.num_key_value_heads, 5);
     assert_eq!(smol.num_hidden_layers, 32);
 
     let granite = mini_engine::config::ModelConfig::granite_4_0_350m_dense();

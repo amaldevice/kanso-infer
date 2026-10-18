@@ -21,6 +21,15 @@ pub struct ModelConfig {
     pub architecture: ModelArchitecture,
     pub attention_layers: Option<Vec<usize>>,
     pub rope_theta: f32,
+    /// Granite scales from GGUF metadata (llama.cpp `granite.cpp` semantics):
+    /// `embedding_scale` multiplies token embeddings, `attention_scale` replaces
+    /// `1/sqrt(head_dim)` when nonzero, `residual_scale` scales the attention and
+    /// FFN outputs before each residual add, `logit_scale` divides final logits.
+    /// `None` = key absent = identity (llama behaviour).
+    pub embedding_scale: Option<f32>,
+    pub attention_scale: Option<f32>,
+    pub residual_scale: Option<f32>,
+    pub logit_scale: Option<f32>,
 }
 
 impl ModelConfig {
@@ -58,11 +67,12 @@ impl ModelConfig {
         }
     }
 
+    /// SmolLM2-360M-Instruct: 32 layers, GQA 15 Q : 5 KV (head_dim 64).
     pub fn smollm2_360m() -> Self {
         Self {
             hidden_size: 960,
             num_attention_heads: 15,
-            num_key_value_heads: 3,
+            num_key_value_heads: 5,
             num_hidden_layers: 32,
             intermediate_size: 2560,
             vocab_size: 49152,
@@ -72,6 +82,10 @@ impl ModelConfig {
             architecture: ModelArchitecture::DenseLlama,
             attention_layers: None,
             rope_theta: 10000.0,
+            embedding_scale: None,
+            attention_scale: None,
+            residual_scale: None,
+            logit_scale: None,
         }
     }
 
@@ -89,6 +103,10 @@ impl ModelConfig {
             architecture: ModelArchitecture::DenseLlama,
             attention_layers: None,
             rope_theta: 10000.0,
+            embedding_scale: None,
+            attention_scale: None,
+            residual_scale: None,
+            logit_scale: None,
         }
     }
 
@@ -106,6 +124,10 @@ impl ModelConfig {
             architecture: ModelArchitecture::HybridMamba2,
             attention_layers: Some(vec![7, 15, 23, 31]), // 4 attention layers mixed with 28 Mamba-2 layers
             rope_theta: 10000.0,
+            embedding_scale: None,
+            attention_scale: None,
+            residual_scale: None,
+            logit_scale: None,
         }
     }
 
@@ -123,6 +145,10 @@ impl ModelConfig {
             architecture: ModelArchitecture::HybridLfm,
             attention_layers: Some(vec![2, 5, 8, 11, 14, 15]), // 6 attention layers interleaved with 10 LIV conv
             rope_theta: 10000.0,
+            embedding_scale: None,
+            attention_scale: None,
+            residual_scale: None,
+            logit_scale: None,
         }
     }
 }
