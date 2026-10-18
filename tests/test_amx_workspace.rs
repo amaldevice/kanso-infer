@@ -262,6 +262,51 @@ fn amx_workspace_decode_logits_match_cpu() {
     );
 }
 
+/// AC3: there is no per-decode workspace clearing. The slots a decode step writes are
+/// the same buffers the next step writes — reused, not dropped and rebuilt, and never
+/// zero-filled between tokens. (The `ScratchpadWorkspace` whose `clear()` used to run on
+/// every decode was removed in Fase-2 F12; this test keeps a clearing step from coming
+/// back through the AMX workspace.)
+///
+/// The verification command for the same property over the whole tree:
+/// `rg -n 'workspace\.clear|ScratchpadWorkspace|with_workspace' src tests` must only match
+/// the AMX workspace itself, never a per-step call site.
+#[test]
+fn decode_step_reuses_workspace_buffers_without_clearing_them() {
+    let _serial = serial();
+    let mut model = mock();
+    model.set_backend(Backend::Amx);
+
+    let (mut kv, table) = kv_for(&model, CTX);
+    for _ in 0..3 {
+        model
+            .forward_decode_step(1, CTX - 1, &table, &mut kv)
+            .expect("warmup decode step");
+    }
+
+    // Address of the buffer backing the logits the step returns. If the workspace were
+    // cleared or rebuilt per decode, this address would move between steps.
+    let address_of = |model: &Model, kv: &mut KvStorage| -> u64 {
+        let logits = model
+            .forward_decode_step(7, CTX - 1, &table, kv)
+            .expect("decode step");
+        let (guard, _) = logits.storage_and_layout();
+        let candle_core::Storage::Cpu(storage) = &*guard else {
+            panic!("expected a cpu logits tensor");
+        };
+        storage.as_slice::<f32>().expect("f32 storage").as_ptr() as u64
+    };
+
+    let first = address_of(&model, &mut kv);
+    let second = address_of(&model, &mut kv);
+    println!("#93 logits slot address across two decode steps: {first:#x}, {second:#x}");
+    assert_eq!(
+        first, second,
+        "the logits buffer moved between decode steps: the workspace is being rebuilt \
+         (or cleared) per decode instead of reused"
+    );
+}
+
 /// AC4, against an independent source of truth: a decode step must agree with the
 /// monolithic forward over the same sequence, through the workspace path too.
 ///

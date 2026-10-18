@@ -852,10 +852,7 @@ impl AmxWorkspace {
             &mut self.probs,
         )?;
 
-        let target = self
-            .slot(slot, &[kv_heads, group, head_dim])
-            .map_err(EngineError::from);
-        let target = match target {
+        let target = match self.slot(slot, &[kv_heads, group, head_dim]) {
             Ok(t) => t,
             Err(e) => return Some(Err(e)),
         };

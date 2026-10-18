@@ -93,6 +93,12 @@ Transform `kanso-infer` into an uncompromising high-performance inference engine
 - Allocate a contiguous workspace memory buffer during engine initialization sized to the maximum batch size and hidden dimensionality.
 - Intermediate activations borrow pre-allocated slices within this workspace.
 
+> **Status:** the engine-wide `ScratchpadWorkspace` this section described was removed in
+> Fase-2 F12 — a pre-zeroed scratchpad that had to be cleared every step traded
+> allocations for `fill()` traffic and an aliasing hazard. What exists instead is the AMX
+> decode workspace (`AmxWorkspace`, ticket #93): reused matmul output slots, never cleared
+> per step, with a written aliasing contract. See `docs/decode-workspace.md`.
+
 ---
 
 ## Testing Decisions
