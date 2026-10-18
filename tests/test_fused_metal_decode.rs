@@ -3,13 +3,21 @@
 //!
 //! Four things this pins down, all through `Model::forward_batch` (the entry the engine
 //! decodes through) rather than through the kernel test harness:
-//! 1. a Metal decode step really runs the fused layer path (observable counter), while
-//!    the CPU backend leaves that counter at zero;
+//! 1. a Metal decode step really runs the fused kernel (observable counter), while the CPU
+//!    backend leaves that counter at zero;
 //! 2. its logits stay within tolerance of the CPU reference path;
-//! 3. one decode step submits exactly one command buffer, measured on the production
-//!    path — the fused chain is what makes attention/O/MLP one submission;
-//! 4. dimensions outside the kernel geometry fall back to the discrete path instead of
+//! 3. the fused prologue is one command buffer per layer on the production path, not one
+//!    per op — the property `tests/test_single_command_buffer.rs` proves for the kernel and
+//!    this file proves for the decode loop that uses it;
+//! 4. dimensions outside the kernel geometry fall back to the per-op path instead of
 //!    erroring or changing the numbers.
+//!
+//! What is *not* asserted here, because it is not reachable with the kernels that already
+//! exist: one command buffer for the **whole** step (attention + O + MLP in the same
+//! submission as the prologue). `src/metal/fused_layer.rs` covers the QKV prologue only,
+//! and the only existing attention entry point owns its command buffer. That gap is
+//! recorded as debt in `docs/adr/0002-fused-decode-scope.md`, not papered over with a new
+//! kernel.
 
 #[cfg(target_os = "macos")]
 mod fused_metal_decode {
@@ -47,29 +55,32 @@ mod fused_metal_decode {
 
     fn filled_kv(model: &Model, ctx: usize) -> (KvStorageKind, BlockTable) {
         let head_dim = model.config.head_dim();
+        // KV heads come from the model, not the module constant: the fallback case builds a
+        // model with a different GQA shape and still has to fill a matching pool.
+        let kv_heads = model.config.num_key_value_heads;
         let blocks = ctx.div_ceil(BLOCK_SIZE);
         let mut kv = KvStorageKind::f32_new(
             model.config.num_hidden_layers,
             blocks,
             BLOCK_SIZE,
-            KV_HEADS,
+            kv_heads,
             head_dim,
             &model.device,
         )
         .expect("kv storage");
         for layer in 0..LAYERS {
-            let mut k = vec![0.0f32; blocks * BLOCK_SIZE * KV_HEADS * head_dim];
-            let mut v = vec![0.0f32; blocks * BLOCK_SIZE * KV_HEADS * head_dim];
+            let mut k = vec![0.0f32; blocks * BLOCK_SIZE * kv_heads * head_dim];
+            let mut v = vec![0.0f32; blocks * BLOCK_SIZE * kv_heads * head_dim];
             for slot in 0..blocks * BLOCK_SIZE {
-                for head in 0..KV_HEADS {
+                for head in 0..kv_heads {
                     for dim in 0..head_dim {
-                        let i = (slot * KV_HEADS + head) * head_dim + dim;
+                        let i = (slot * kv_heads + head) * head_dim + dim;
                         k[i] = pool_value(layer, slot, head, dim);
                         v[i] = -pool_value(layer + 1, slot, head, dim);
                     }
                 }
             }
-            let shape = (blocks, BLOCK_SIZE, KV_HEADS, head_dim);
+            let shape = (blocks, BLOCK_SIZE, kv_heads, head_dim);
             let pool = kv.f32_pool_mut().expect("F32 pool");
             pool.kv_k[layer] = Tensor::from_vec(k, shape, &model.device).expect("k pool");
             pool.kv_v[layer] = Tensor::from_vec(v, shape, &model.device).expect("v pool");
@@ -152,14 +163,18 @@ mod fused_metal_decode {
         }
     }
 
-    /// Acceptance #4: the whole decode step is one command buffer, and the counter is
-    /// read from the production entry point, not from the kernel harness.
+    /// Acceptance #4: the fused chain is one submission per layer, read from the
+    /// production entry point rather than from the kernel harness.
+    ///
+    /// Before #87 the prologue cost one command buffer per op (RMSNorm, three projections,
+    /// two RoPE passes). The fused kernel encodes the whole prologue into one buffer and
+    /// waits once, so a step's fused submissions must equal the layer count — not more.
     #[test]
-    fn metal_fused_decode_submits_one_command_buffer_per_step() {
+    fn metal_fused_decode_submits_one_command_buffer_per_layer_prologue() {
         let dev = Device::new_metal(0).expect("Metal device");
         let model = mock(&dev, Backend::Metal);
 
-        // Warm-up step: the first step builds the resident weights and pools.
+        // Warm-up step: the first step builds the resident weights.
         let _ = batch_logits(&model, 128);
         assert!(
             model.metal_command_buffers() > 0,
@@ -170,9 +185,9 @@ mod fused_metal_decode {
         let _ = batch_logits(&model, 128);
         assert_eq!(
             model.metal_command_buffers() - before,
-            1,
-            "one decode step is one command buffer: attention/O/MLP are chained, not \
-             re-submitted per kernel"
+            LAYERS,
+            "the fused prologue must be one command buffer per layer (RMSNorm + QKV + RoPE \
+             chained), not one per op"
         );
     }
 
@@ -181,7 +196,7 @@ mod fused_metal_decode {
     #[test]
     fn metal_fused_decode_falls_back_outside_kernel_geometry() {
         let dev = Device::new_metal(0).expect("Metal device");
-        let mut falls_back = {
+        let falls_back = {
             let mut model =
                 Model::create_mock_tiny(66, 3, 1, LAYERS, VOCAB).expect("mock hidden 66");
             model.to_device(&dev).expect("move weights");

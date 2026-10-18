@@ -83,9 +83,12 @@ impl PagedAttnContext {
     }
 }
 
+/// The fused Metal llama-layer kernel on the production decode path (ticket #87).
+mod fused_decode;
 /// Device copy of the block pool plus the kernel dispatch that reads it (ticket #86).
 mod paged_attn;
 
+use fused_decode::FusedDecodeSeam;
 pub(crate) use paged_attn::AttnShape;
 use paged_attn::PagedAttnSeam;
 
@@ -117,6 +120,10 @@ pub struct Model {
     /// The single seam that lets a decode step attend over the block pool instead of a
     /// per-layer gather: `Some` only once a Metal decode step has run (ticket #86).
     paged_attn: RefCell<Option<PagedAttnSeam>>,
+    /// #87: the fused Metal prologue (RMSNorm + QKV + RoPE) as the decode path. `None`
+    /// means this model is outside the kernel geometry, or has not decoded on Metal yet,
+    /// and the per-op path runs instead.
+    fused_decode: RefCell<Option<FusedDecodeSeam>>,
 }
 
 /// Fixed seed for mock-model weights so tests are reproducible.
@@ -164,6 +171,7 @@ impl Model {
             amx_workspace: RefCell::new(crate::accelerate::amx::AmxWorkspace::default()),
             paged_attention_calls: std::sync::atomic::AtomicU64::new(0),
             paged_attn: RefCell::new(None),
+            fused_decode: RefCell::new(None),
         }
     }
 
@@ -172,6 +180,28 @@ impl Model {
     pub fn paged_attention_calls(&self) -> u64 {
         self.paged_attention_calls
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Layer prologues this model ran through the fused Metal chain (ticket #87).
+    ///
+    /// Zero on every non-Metal backend, and zero on Metal for a model whose dimensions fall
+    /// outside the kernel geometry — which is what makes "the fused kernel is the production
+    /// path" an assertion a test can read instead of a claim.
+    pub fn fused_layer_calls(&self) -> u64 {
+        self.fused_decode
+            .borrow()
+            .as_ref()
+            .map(FusedDecodeSeam::steps)
+            .unwrap_or(0)
+    }
+
+    /// Command buffers the fused decode seam submitted.
+    pub fn metal_command_buffers(&self) -> usize {
+        self.fused_decode
+            .borrow()
+            .as_ref()
+            .map(FusedDecodeSeam::command_buffers)
+            .unwrap_or(0)
     }
 
     /// Batched forwards (`forward_batch`) issued so far (#45 acceptance hook).
@@ -208,8 +238,9 @@ impl Model {
         self.device = device.clone();
         self.rope_table.borrow_mut().take();
         self.amx_workspace.borrow_mut().clear();
-        // The seam's buffers live on the old device (ticket #86).
+        // The seams' buffers live on the old device (ticket #86 / #87).
         self.paged_attn.borrow_mut().take();
+        self.fused_decode.borrow_mut().take();
         Ok(())
     }
 
@@ -1400,16 +1431,53 @@ impl Model {
             _ => None,
         };
 
+        // #87: a single-token Metal decode runs each layer's RMSNorm + QKV + RoPE through
+        // the fused kernel, which is one command buffer for the whole prologue instead of
+        // one per op. The seam stays `None` for a model outside the kernel geometry (or a
+        // quantized projection), and the per-op prologue below runs unchanged — a
+        // fallback, never an error.
+        let fused_decode = total == 1 && matches!(self.backend, Backend::Metal);
+        let mut fused_seam = self.fused_decode.borrow_mut();
+        if fused_decode && fused_seam.is_none() {
+            *fused_seam = FusedDecodeSeam::build(self)?;
+        }
+        let fused_pos = positions[0];
+
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
-            let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
-            let (q, k, v) = self.project_qkv(layer, &normed)?;
-
-            let q = q.reshape((total, num_q_heads, head_dim))?;
-            let k = k.reshape((total, num_kv_heads, head_dim))?;
-            let v = v.reshape((total, num_kv_heads, head_dim))?;
-
-            let q = self.rope_apply(&q, &cos, &sin)?;
-            let k = self.rope_apply(&k, &cos, &sin)?;
+            // The prologue reads this layer's input row, which the previous layer just
+            // wrote back into `hidden`, so it is read here and not once before the loop.
+            let fused = match fused_seam.as_mut() {
+                Some(seam) if fused_decode && fused_pos <= seam.max_pos() => {
+                    let row = hidden.flatten_all()?.to_vec1::<f32>()?;
+                    Some(seam.prologue(
+                        layer_idx,
+                        &row,
+                        fused_pos,
+                        self.config.rms_norm_eps as f32,
+                    )?)
+                }
+                _ => None,
+            };
+            let (q, k, v) = match fused {
+                // The fused kernel already applied RoPE, so the rows below are final.
+                Some((q, k, v)) => (
+                    Tensor::from_vec(q, (1, num_q_heads, head_dim), &self.device)?,
+                    Tensor::from_vec(k, (1, num_kv_heads, head_dim), &self.device)?,
+                    Tensor::from_vec(v, (1, num_kv_heads, head_dim), &self.device)?,
+                ),
+                None => {
+                    let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
+                    let (q, k, v) = self.project_qkv(layer, &normed)?;
+                    let q = q.reshape((total, num_q_heads, head_dim))?;
+                    let k = k.reshape((total, num_kv_heads, head_dim))?;
+                    let v = v.reshape((total, num_kv_heads, head_dim))?;
+                    (
+                        self.rope_apply(&q, &cos, &sin)?,
+                        self.rope_apply(&k, &cos, &sin)?,
+                        v,
+                    )
+                }
+            };
 
             // Scatter this step's K/V into the physical blocks the scheduler mapped.
             kv_storage.write_kv_slots(layer_idx, &slot_plan, &k, &v)?;
