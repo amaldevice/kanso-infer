@@ -48,6 +48,7 @@ Supports dense Transformer decoders and next-generation hybrid linear-attention 
   - Time-to-First-Token (`TTFT` mean and max in ms)
   - Inter-Token Latency (`ITL` mean and $p99$ in ms)
   - Decode duration (`ms/step`) and prefill rate (`tok/s`)
+- **Machine-Readable Performance Gates**: `--gate <budget.json>` compares the report against version-controlled budgets and exits `0` (passed) / `1` (violated) / `2` (skipped: required asset missing). See section 6.
 
 ## Feature Status
 
@@ -264,6 +265,42 @@ batch_size=1    backend=cpu    batch=1    tok/s(total)=245.2    tok/s/req=245.17
                 ttft_ms(mean/max)=22.3/22.3 itl_ms(mean/p99)=1.5/1.7 decode_ms/step=4.08 checksum=a8c7f832281a39c5
                 peak_rss=9.8MB thermal="Fair (Elevated, fans active)" bus_est=93.2GB/s (62.1% bus util)
 ```
+
+### 6. Performance Gates
+A budget file turns a performance threshold into a reviewable diff. `--gate`
+compares a `BenchmarkReport` against the budget and exits with a code CI can read:
+
+```bash
+# Gate a fresh run (the report JSON is written as evidence, path printed)
+cargo run --release --bin bench -- \
+  --model ./models/smollm2-360m-instruct-q8_0.gguf \
+  --gate gates/fase1.json
+
+# Re-check an existing report without loading a model or touching hardware
+cargo run --release --bin bench -- \
+  --gate gates/fase1.json \
+  --gate-report report.json
+```
+
+A budget declares rows of `{metric, bound, budget, requires?}`:
+
+```json
+{
+  "name": "fase1",
+  "rows": [
+    {"metric": "decode_ms_per_step", "bound": "max", "budget": 12.0},
+    {"metric": "total_tokens_per_sec", "bound": "min", "budget": 180.0,
+     "requires": {"kind": "file", "path": "models/smollm2-360m-instruct-q8_0.gguf"}}
+  ]
+}
+```
+
+Each row prints its measured value, the ratio against the budget, the budget and
+the verdict. Exit codes: `0` every row measured and within budget, `1` a budget
+was violated, `2` a row could not be measured because a required asset
+(`"kind": "file"`) or tool (`"kind": "tool"`, looked up on `PATH`) is missing.
+**A skipped row is never counted as a pass**, and an unknown metric is an error
+rather than a silent green.
 
 ---
 
