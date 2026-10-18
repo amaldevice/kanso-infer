@@ -30,6 +30,61 @@ struct DecodeLayout {
     padded_ctx: usize,
 }
 
+/// What a decode step needs to attend straight out of the block pool (ticket #86): the
+/// block geometry the scheduler already built, plus the pool rows the step wrote. One
+/// seam — the Metal paged-attention kernel is its only consumer, so no backend grows a
+/// second KV read path.
+#[derive(Debug, Clone)]
+pub struct PagedAttnContext {
+    /// Physical block ids, `[num_seqs * max_blocks]`, padded to the batch's longest table.
+    pub block_tables: Vec<u32>,
+    /// Blocks per sequence in `block_tables`.
+    pub max_blocks: usize,
+    /// Context length per sequence.
+    pub context_lens: Vec<u32>,
+    /// Pool row each sequence's query token was just written to.
+    pub slots: Vec<usize>,
+}
+
+impl PagedAttnContext {
+    /// The context of a pure-decode batch: every sequence's block table padded to the
+    /// batch's longest, its context length, and the pool row its token landed in.
+    fn decode_batch(
+        kv_storage: &KvStorage,
+        block_tables: &[Vec<usize>],
+        context_lens: &[usize],
+        slot_mapping: &[usize],
+    ) -> Self {
+        let block_size = kv_storage.block_size;
+        let max_blocks = context_lens
+            .iter()
+            .map(|&ctx| ctx.div_ceil(block_size).max(1))
+            .max()
+            .unwrap_or(1);
+        let mut tables = Vec::with_capacity(block_tables.len() * max_blocks);
+        for (s, blocks) in block_tables.iter().enumerate() {
+            let needed = context_lens[s].div_ceil(block_size).max(1);
+            for b in 0..max_blocks {
+                // Padding repeats the last real block; the kernel never reads past
+                // `context_lens[s]`, so those ids are never dereferenced.
+                tables.push(blocks[b.min(needed - 1).min(blocks.len() - 1)] as u32);
+            }
+        }
+        Self {
+            block_tables: tables,
+            max_blocks,
+            context_lens: context_lens.iter().map(|&c| c as u32).collect(),
+            slots: slot_mapping.to_vec(),
+        }
+    }
+}
+
+/// Device copy of the block pool plus the kernel dispatch that reads it (ticket #86).
+mod paged_attn;
+
+pub(crate) use paged_attn::AttnShape;
+use paged_attn::PagedAttnSeam;
+
 pub struct Model {
     pub weights: ModelWeights,
     pub config: ModelConfig,
@@ -52,6 +107,12 @@ pub struct Model {
     /// Interior mutability because decode takes `&self`; see
     /// [`crate::accelerate::amx::AmxWorkspace`] for the aliasing contract.
     amx_workspace: RefCell<crate::accelerate::amx::AmxWorkspace>,
+    /// #86: Metal decode dispatches the fused PagedAttention v2 kernel. Counts the
+    /// dispatches so a test can tell the paged path from the copying `matmul` one.
+    paged_attention_calls: std::sync::atomic::AtomicU64,
+    /// The single seam that lets a decode step attend over the block pool instead of a
+    /// per-layer gather: `Some` only once a Metal decode step has run (ticket #86).
+    paged_attn: RefCell<Option<PagedAttnSeam>>,
 }
 
 /// Fixed seed for mock-model weights so tests are reproducible.
@@ -97,7 +158,16 @@ impl Model {
             forward_batch_calls: std::sync::atomic::AtomicU64::new(0),
             rope_table: RefCell::new(None),
             amx_workspace: RefCell::new(crate::accelerate::amx::AmxWorkspace::default()),
+            paged_attention_calls: std::sync::atomic::AtomicU64::new(0),
+            paged_attn: RefCell::new(None),
         }
+    }
+
+    /// Fused PagedAttention v2 dispatches this model has issued (ticket #86). A Metal
+    /// decode step must move this; every other backend must leave it at zero.
+    pub fn paged_attention_calls(&self) -> u64 {
+        self.paged_attention_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Batched forwards (`forward_batch`) issued so far (#45 acceptance hook).
@@ -134,6 +204,8 @@ impl Model {
         self.device = device.clone();
         self.rope_table.borrow_mut().take();
         self.amx_workspace.borrow_mut().clear();
+        // The seam's buffers live on the old device (ticket #86).
+        self.paged_attn.borrow_mut().take();
         Ok(())
     }
 
@@ -299,11 +371,11 @@ impl Model {
             // forcing contiguity there would copy the whole attention history per
             // layer per token (ticket #48).
             //
-            // Exempt from the #48 no-materialization claim (ticket #61 F4): on Metal
-            // this *does* copy the `[ctx, n_kv_heads, head_dim]` pool view per layer
-            // per token — `gpu_paged_attention_v2` (`src/metal/ops.rs`) is the wired
-            // fix, and it has no production caller yet. Metal decode therefore
-            // remains bounded-alloc but not copy-free.
+            // Metal decode attention no longer reaches here: since ticket #86 the decode
+            // path dispatches `gpu_paged_attention_v2`, which reads K/V out of the block
+            // pool itself, so the `[ctx, n_kv_heads, head_dim]` history is not copied per
+            // layer per token. What is left on Metal is prefill and the GEMMs whose
+            // operands are already contiguous.
             if a.device().is_metal() {
                 Ok(a.contiguous()?.matmul(&b.contiguous()?)?)
             } else {
@@ -602,25 +674,38 @@ impl Model {
         Ok(attn_out.reshape((n_heads, q_len, head_dim))?)
     }
 
-    /// Single-token decode attention over the K/V pool read (ticket #48).
+    /// Single-token decode attention over the K/V pool (ticket #48 / #86).
     ///
-    /// `k`/`v` are `[ctx, n_kv_heads, head_dim]` — pool views when the block table is
-    /// one consecutive run, the fragmented gather otherwise. The AMX backend feeds those
-    /// rows straight into Accelerate with the pool's own row stride, so the history is
-    /// never copied; every other backend runs the same math through `gqa_attention`
-    /// (candle's CPU and metal matmul stream the strided operand without re-copying it).
+    /// `paged` carries the block geometry the scheduler already built. On Metal the fused
+    /// paged-attention kernel walks that table itself, so the history is never
+    /// materialized per layer; every other backend reads the same pool as a strided
+    /// `[ctx, n_kv_heads, head_dim]` view (one consecutive run) or gather, and runs
+    /// `gqa_attention` on it — unchanged behaviour.
     /// Returns `[n_heads, 1, head_dim]`.
     ///
-    /// Two paths fall outside the #48 claim, both documented rather than papered over
-    /// (ticket #61 F4): a Metal tensor reaching `matmul` materializes the history (see
-    /// [`Model::matmul`]), and the AMX fallback below copies once when Accelerate rejects
-    /// the layout.
+    /// One path falls outside the #48 claim, documented rather than papered over (ticket
+    /// #61 F4): the AMX fallback copies once when Accelerate rejects the layout.
     fn decode_attention_paged(
         &self,
         q: &Tensor, // [n_heads, 1, head_dim]
-        k: &Tensor, // [ctx, n_kv_heads, head_dim]
-        v: &Tensor, // [ctx, n_kv_heads, head_dim]
+        paged: &PagedAttnContext,
+        kv_storage: &KvStorage,
+        layer_idx: usize,
     ) -> Result<Tensor, EngineError> {
+        // #86: Metal reads K/V straight out of the block pool through the kernel instead of
+        // letting `matmul` materialize the history per layer per token.
+        if matches!(self.backend, Backend::Metal) {
+            let batched = q.transpose(0, 1)?.contiguous()?; // [1, n_heads, head_dim]
+            let out = self.metal_paged_attention(&batched, kv_storage, layer_idx, paged)?;
+            return Ok(out.reshape((q.dim(0)?, 1, self.config.head_dim()))?);
+        }
+
+        let ctx_len = paged.context_lens[0] as usize;
+        let blocks: Vec<usize> = paged.block_tables[..paged.max_blocks]
+            .iter()
+            .map(|&b| b as usize)
+            .collect();
+        let (k, v) = kv_storage.paged_kv_tokens(layer_idx, &blocks, ctx_len)?;
         if matches!(self.backend, Backend::Amx) {
             let (n_heads, q_len, head_dim) = q.dims3()?;
             let (_, n_kv_heads, _) = k.dims3()?;
@@ -634,8 +719,8 @@ impl Model {
             let in_workspace = self.amx_workspace.borrow_mut().paged_decode_attention_into(
                 crate::accelerate::amx::AmxWorkspace::SLOT_PAGED_ATTN,
                 &q_folded,
-                k,
-                v,
+                &k,
+                &v,
                 scale as f32,
             );
             if let Some(out) = in_workspace {
@@ -655,6 +740,53 @@ impl Model {
         }
         let (k_all, v_all) = (k.transpose(0, 1)?, v.transpose(0, 1)?);
         self.gqa_attention(q, &k_all, &v_all, None)
+    }
+
+    /// Metal decode attention through `gpu_paged_attention_v2_buffer` (ticket #86): the
+    /// kernel walks the block table itself, so the `[ctx, n_kv_heads, head_dim]` history is
+    /// never materialized per layer.
+    ///
+    /// `q` is `[num_seqs, n_heads, head_dim]` — one query token per sequence, which is what
+    /// a decode step produces. Returns `[num_seqs, n_heads * head_dim]`.
+    ///
+    /// Kernel parameters the shader cannot represent (head_dim > 256, GQA group > 8) are
+    /// `Err` here — a silent fall back to the copying path would hide them.
+    fn metal_paged_attention(
+        &self,
+        q: &Tensor,
+        kv_storage: &KvStorage,
+        layer_idx: usize,
+        paged: &PagedAttnContext,
+    ) -> Result<Tensor, EngineError> {
+        let head_dim = self.config.head_dim();
+        let shape = AttnShape {
+            num_heads: self.config.num_attention_heads,
+            num_kv_heads: self.config.num_key_value_heads,
+            head_dim,
+            scale: self.attention_scale(head_dim) as f32,
+        };
+
+        let mut seam = self.paged_attn.borrow_mut();
+        if seam.is_none() {
+            *seam = Some(PagedAttnSeam::new(
+                self.config.num_hidden_layers,
+                &self.device,
+            )?);
+        }
+        let seam = seam.as_mut().expect("just built");
+        let out = seam.attention(
+            q,
+            kv_storage,
+            layer_idx,
+            &paged.block_tables,
+            paged.max_blocks,
+            &paged.context_lens,
+            &paged.slots,
+            &shape,
+        )?;
+        self.paged_attention_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(out)
     }
 
     pub fn forward_tokens(&self, tokens: &[u32]) -> Result<Tensor, EngineError> {
@@ -909,17 +1041,19 @@ impl Model {
             // Write roped token K, V directly into physical block in KvStorage
             kv_storage.write_kv_token(layer_idx, physical_block, offset, &k_token, &v_token)?;
 
-            // #48: attention reads the history straight out of the block pool through the
-            // block table — a view of the pool storage when the table is one consecutive
-            // run — instead of re-gathering the whole history into a fresh tensor per
-            // layer per token.
-            let (k_tokens, v_tokens) = kv_storage.paged_kv_tokens(
-                layer_idx,
-                &block_table.blocks()[..=block_idx],
-                pos + 1,
-            )?;
-
-            let attn_out = self.decode_attention_paged(&q, &k_tokens, &v_tokens)?;
+            // #48/#86: attention reads the history straight out of the block pool through
+            // the block table. On Metal the fused paged-attention kernel walks the table
+            // itself; other backends read the same table as a pool view.
+            let paged = PagedAttnContext {
+                block_tables: block_table.blocks()[..=block_idx]
+                    .iter()
+                    .map(|&b| b as u32)
+                    .collect(),
+                max_blocks: block_idx + 1,
+                context_lens: vec![(pos + 1) as u32],
+                slots: vec![physical_block * block_size + offset],
+            };
+            let attn_out = self.decode_attention_paged(&q, &paged, kv_storage, layer_idx)?;
             // Merge heads back: [1, hidden_size]
             let attn_out = attn_out
                 .transpose(0, 1)?
@@ -1199,6 +1333,17 @@ impl Model {
         let decode_layout = pure_decode
             .then(|| self.decode_layout(kv_storage, block_tables, context_lens))
             .transpose()?;
+        // #86: the Metal pure-decode path hands the kernel the same block geometry the
+        // padded layout is built from, so it needs no per-layer KV view at all.
+        let paged_decode = match (&self.backend, pure_decode) {
+            (Backend::Metal, true) => Some(PagedAttnContext::decode_batch(
+                kv_storage,
+                block_tables,
+                context_lens,
+                slot_mapping,
+            )),
+            _ => None,
+        };
 
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
@@ -1214,8 +1359,13 @@ impl Model {
             // Scatter this step's K/V into the physical blocks the scheduler mapped.
             kv_storage.write_kv_slots(layer_idx, &slot_ids, &k, &v)?;
 
-            let attn_out = match &decode_layout {
-                Some(layout) => {
+            let attn_out = match (&paged_decode, &decode_layout) {
+                (Some(paged), _) => {
+                    // #86: the kernel reads K/V out of the block pool itself, so the
+                    // history is not gathered, padded or copied per layer.
+                    self.metal_paged_attention(&q, kv_storage, layer_idx, paged)?
+                }
+                (None, Some(layout)) => {
                     // One query token per sequence: the whole batch attends in a single
                     // padded GEMM instead of one attention pass per sequence (which is
                     // what per-op overhead makes expensive at small batch sizes).
@@ -1223,7 +1373,7 @@ impl Model {
                     // so ragged batches waste lanes; a varlen kernel drops the padding.
                     self.batch_decode_attention(&q, kv_storage, layer_idx, layout)?
                 }
-                None => {
+                (None, None) => {
                     // Steps that mix prefill chunks with decode tokens attend per sequence
                     // instead (those steps are latency- not throughput-critical).
                     // ponytail: per-sequence attention costs one gather + a dozen ops per

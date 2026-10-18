@@ -27,7 +27,9 @@ mod metal_paged_attention_wiring {
         let mut model = Model::create_mock_tiny(HIDDEN, Q_HEADS, KV_HEADS, LAYERS, VOCAB)
             .expect("mock model (GQA group 4)");
         if !device.is_cpu() {
-            model.to_device(device).expect("move mock weights to device");
+            model
+                .to_device(device)
+                .expect("move mock weights to device");
         }
         model.set_backend(backend);
         model
@@ -103,6 +105,62 @@ mod metal_paged_attention_wiring {
         );
     }
 
+    /// `engine.step` reaches attention through `forward_batch`, not
+    /// `forward_decode_step`, so that is the entry the kernel has to serve.
+    fn batch_logits(model: &Model, ctx: usize) -> Vec<f32> {
+        let (mut kv, table) = filled_kv(model, ctx);
+        let pos = ctx - 1;
+        let slot = table.blocks()[pos / BLOCK_SIZE] * BLOCK_SIZE + pos % BLOCK_SIZE;
+        model
+            .forward_batch(
+                &[7],
+                &[pos],
+                &[slot],
+                &mut kv,
+                &[table.blocks().to_vec()],
+                &[ctx],
+                &[1],
+            )
+            .expect("batched decode step")
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("logits")
+    }
+
+    #[test]
+    fn metal_batched_decode_dispatches_kernel_and_keeps_parity() {
+        let dev = Device::new_metal(0).expect("Metal device");
+        let metal_model = mock(&dev, Backend::Metal);
+        let cpu_model = mock(&Device::Cpu, Backend::Cpu);
+
+        let reference = batch_logits(&cpu_model, 128);
+        assert_eq!(
+            cpu_model.paged_attention_calls(),
+            0,
+            "the batched CPU path must not dispatch the Metal kernel"
+        );
+
+        let actual = batch_logits(&metal_model, 128);
+        assert!(
+            metal_model.paged_attention_calls() >= LAYERS as u64,
+            "forward_batch on Metal must dispatch the kernel once per layer (got {})",
+            metal_model.paged_attention_calls()
+        );
+        assert_eq!(reference.len(), actual.len(), "logits length");
+        let mut worst = 0.0f32;
+        for (r, a) in reference.iter().zip(actual.iter()) {
+            let diff = (r - a).abs() / (1.0 + r.abs());
+            if diff > worst {
+                worst = diff;
+            }
+        }
+        assert!(
+            worst <= 1e-3,
+            "batched Metal paged-attention logits drift {worst} from the reference path"
+        );
+    }
+
     #[test]
     fn metal_decode_logits_match_reference_across_contexts() {
         let dev = Device::new_metal(0).expect("Metal device");
@@ -141,7 +199,8 @@ mod metal_paged_attention_wiring {
         let dev = Device::new_metal(0).expect("Metal device");
 
         // head_dim 512 exceeds the kernel's MAX_HEAD_DIM (256).
-        let mut wide = Model::create_mock_tiny(1024, 2, 1, LAYERS, VOCAB).expect("mock head_dim 512");
+        let mut wide =
+            Model::create_mock_tiny(1024, 2, 1, LAYERS, VOCAB).expect("mock head_dim 512");
         wide.to_device(&dev).expect("move weights");
         wide.set_backend(Backend::Metal);
         assert_eq!(wide.config.head_dim(), 512);
@@ -158,9 +217,7 @@ mod metal_paged_attention_wiring {
         grouped.set_backend(Backend::Metal);
         let (mut kv, table) = filled_kv(&grouped, 32);
         assert!(
-            grouped
-                .forward_decode_step(7, 31, &table, &mut kv)
-                .is_err(),
+            grouped.forward_decode_step(7, 31, &table, &mut kv).is_err(),
             "GQA group 16 is not representable by the kernel: must be Err, not a silent fallback"
         );
     }
