@@ -1,11 +1,10 @@
 //! Ticket #45 acceptance: continuous batching must be ONE batched forward per
 //! `step()`, not a per-sequence loop over batch-1 forwards.
 //!
-//! Scoped to the serving path (ticket #61 F3): `forward_batch_calls` counts
-//! `forward_batch`, which is what `Engine::step` runs. Speculative traffic
-//! (`SpeculativeEngine`) verifies through `forward_verify_tokens` and spends one draft
-//! `forward_decode_step` per proposal, so its forwards are deliberately outside this
-//! claim and outside the counter.
+//! Scoped to `Engine::step`: `forward_batch_calls` counts
+//! `forward_batch`, which is what `Engine::step` runs. Speculative verification rides the
+//! same batched forward since ticket #90 (see `test_speculative_batched_verify`); the draft
+//! still spends one `forward_decode_step` per proposal on its own cache.
 
 use candle_core::{IndexOp, Tensor};
 use kanso_infer::engine::Engine;

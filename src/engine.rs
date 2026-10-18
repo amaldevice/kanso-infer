@@ -164,9 +164,8 @@ impl Engine {
     /// commit the sampled tokens, retire finished sequences.
     ///
     /// "One model forward per step" describes this method on the serving path. Speculative
-    /// traffic does not ride it (ticket #61 F3): `SpeculativeEngine::step` calls
-    /// [`Engine::speculative_step_sampled`] instead, which verifies through
-    /// `forward_verify_tokens` and lets the draft spend a decode step per proposal.
+    /// traffic rides [`Engine::speculative_step_sampled`] instead, which submits its
+    /// candidate block as one sequence of the same batched forward (ticket #90).
     pub fn step(&mut self) -> Result<Vec<StepOutput>, EngineError> {
         self.current_step += 1;
         let mut outputs = Vec::new();
@@ -565,12 +564,10 @@ impl Engine {
     /// `draft_candidates[i]` from — required when `sampling.temperature > 0`, where the
     /// candidates are verified by rejection sampling instead of argmax match (#55).
     ///
-    /// Deliberately outside the "one batched forward per step" claim (#45, ticket #61 F3):
-    /// the candidates are verified by one `forward_verify_tokens` over the `[current,
-    /// candidates...]` block (not `forward_batch`), and the draft paid one
-    /// `forward_decode_step` per proposal before this call. Batching the verifier with the
-    /// step's other sequences is the open work; until then the counter
-    /// `Model::forward_batch_calls` does not move for speculative traffic, by design.
+    /// The candidates are verified in one batched forward: the `[current, candidates...]`
+    /// block rides `Model::forward_batch` as a single sequence (ticket #90), so the step
+    /// costs one forward and `Model::forward_batch_calls` counts it. The draft still pays
+    /// one `forward_decode_step` per proposal on its own KV cache before this call.
     pub fn speculative_step_sampled(
         &mut self,
         request_id: u64,

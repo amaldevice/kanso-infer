@@ -40,9 +40,9 @@ pub struct Model {
     /// point of continuous batching — a per-sequence loop shows up here as a count
     /// that grows with the batch size.
     ///
-    /// It counts `forward_batch` only (ticket #61 F6): speculative verification
-    /// (`forward_verify_tokens`) and draft decode steps serve the speculative loop, not
-    /// the batched serving path, and are deliberately not counted here.
+    /// It counts `forward_batch` only: speculative verification rides `forward_batch`
+    /// since ticket #90, so speculative steps are counted too. The draft model's decode
+    /// steps are not — they are a different model, on its own KV cache.
     forward_batch_calls: std::sync::atomic::AtomicU64,
     /// Grown on demand, dropped by [`Model::to_device`] because its rows live on the
     /// device the model was built for.
@@ -1083,12 +1083,11 @@ impl Model {
     /// sequence contributes a single decode token, per sequence otherwise.
     /// Returns logits `[num_seqs, vocab]`: one row per sequence's last new token.
     ///
-    /// This is the *serving* path's only forward: the "one model forward per step"
-    /// property (#45) is a property of `Engine::step` over non-speculative traffic.
-    /// Speculative decoding is deliberately outside it (ticket #61 F3) — the verifier runs
-    /// `forward_verify_tokens` for the candidate block and the draft spends one
-    /// `forward_decode_step` per proposal, neither of which goes through here, which is why
-    /// [`Model::forward_batch_calls`] counts this call alone.
+    /// This is the serving path's only forward, and since ticket #90 the speculative
+    /// verifier rides it too: `Engine::speculative_step_sampled` submits the candidate
+    /// block `[current, candidates...]` as one sequence of this batch, so "one model
+    /// forward per step" (#45) holds for speculative traffic as well and
+    /// [`Model::forward_batch_calls`] moves for it.
     #[allow(clippy::too_many_arguments)] // #45: the issue's flat-batch signature
     pub fn forward_batch(
         &self,
@@ -1102,7 +1101,61 @@ impl Model {
     ) -> Result<Tensor, EngineError> {
         self.forward_batch_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.forward_batch_rows(
+            tokens,
+            positions,
+            slot_mapping,
+            kv_storage,
+            block_tables,
+            context_lens,
+            query_lens,
+            false,
+        )
+    }
 
+    /// Same batched forward, but returns logits for *every* new token
+    /// (`[total tokens, vocab]`) instead of one row per sequence.
+    ///
+    /// The speculative verifier needs the distribution under each of its candidates, not
+    /// just the last one (ticket #90). Counted exactly like [`Model::forward_batch`],
+    /// which it delegates to the same implementation as.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_batch_all_rows(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        slot_mapping: &[usize],
+        kv_storage: &mut KvStorage,
+        block_tables: &[Vec<usize>],
+        context_lens: &[usize],
+        query_lens: &[usize],
+    ) -> Result<Tensor, EngineError> {
+        self.forward_batch_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.forward_batch_rows(
+            tokens,
+            positions,
+            slot_mapping,
+            kv_storage,
+            block_tables,
+            context_lens,
+            query_lens,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch_rows(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        slot_mapping: &[usize],
+        kv_storage: &mut KvStorage,
+        block_tables: &[Vec<usize>],
+        context_lens: &[usize],
+        query_lens: &[usize],
+        all_rows: bool,
+    ) -> Result<Tensor, EngineError> {
         let num_seqs = block_tables.len();
         let total: usize = query_lens.iter().sum();
         if num_seqs == 0 {
@@ -1260,8 +1313,12 @@ impl Model {
 
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
 
-        // Only each sequence's last new token needs logits (that is the token the
-        // caller samples; partial prefill chunks discard theirs).
+        // The serving path only needs each sequence's last new token (that is the token
+        // the caller samples; partial prefill chunks discard theirs). The speculative
+        // verifier needs every candidate's row (ticket #90).
+        if all_rows {
+            return self.scale_logits(self.linear(&self.weights.lm_head, &final_normed)?);
+        }
         let last_indices: Vec<u32> = (0..num_seqs)
             .map(|s| (offsets[s] + query_lens[s] - 1) as u32)
             .collect();
