@@ -62,7 +62,6 @@ fn f32_storage(model: &Model, table: &BlockTable) -> KvStorage {
 
 fn logits_of(model: &Model, storage: &mut KvStorageKind, ctx: usize) -> Vec<f32> {
     let (prompt, mut table) = context(model, ctx);
-    let mut storage = storage;
     let _ = model.forward_prefill(&prompt, 0, &table, storage);
     table.set_num_tokens(ctx + 1);
     let logits = model
@@ -127,11 +126,11 @@ fn engine_preserves_legacy_constructor_signatures() {
 fn quantized_kv_is_refused_on_metal() {
     let mut model = Model::create_mock_tiny(16, 4, 2, 2, 50).expect("mock model");
     model.set_backend(Backend::Metal);
-    let err = match Engine::new_with_budget_and_kv(model, 1, 64, 16, usize::MAX, Some(QuantMode::Int8))
-    {
-        Ok(_) => panic!("Metal must refuse quantized KV, not fall back to the F32 kernel"),
-        Err(err) => err,
-    };
+    let err =
+        match Engine::new_with_budget_and_kv(model, 1, 64, 16, usize::MAX, Some(QuantMode::Int8)) {
+            Ok(_) => panic!("Metal must refuse quantized KV, not fall back to the F32 kernel"),
+            Err(err) => err,
+        };
     assert!(
         matches!(err, EngineError::Config(_)),
         "expected a Config error naming the Metal limitation, got {err:?}"
@@ -239,16 +238,15 @@ fn quantized_kv_bytes_per_token_are_below_f32() {
             ratio > 1.0,
             "{mode:?} KV compression ratio {ratio} is not better than F32"
         );
-        println!(
-            "{mode:?} KV: {bytes} bytes/token vs F32 {f32_bytes} ({ratio:.2}x smaller)"
-        );
+        println!("{mode:?} KV: {bytes} bytes/token vs F32 {f32_bytes} ({ratio:.2}x smaller)");
     }
 }
 
 #[test]
 fn engine_reports_kv_bytes_per_token() {
-    let engine = Engine::new_with_budget_and_kv(mock(), 1, 64, 16, usize::MAX, Some(QuantMode::Int8))
-        .expect("int8 engine");
+    let engine =
+        Engine::new_with_budget_and_kv(mock(), 1, 64, 16, usize::MAX, Some(QuantMode::Int8))
+            .expect("int8 engine");
     let f32_engine = Engine::new(mock(), 1, 64, 16).expect("f32 engine");
     assert!(
         engine.kv_storage.memory_bytes_per_token() < f32_engine.kv_storage.memory_bytes_per_token(),
@@ -279,7 +277,9 @@ fn decode_path_holds_one_storage_type() {
     // 40 prefilled tokens plus the decode token just written at position 40.
     assert_eq!(k.dims(), &[prompt.len() + 1, 2, 4]);
     assert_eq!(v.dims(), &[prompt.len() + 1, 2, 4]);
-    let (k, _) = storage.paged_kv_tokens(0, table.blocks(), prompt.len()).unwrap();
+    let (k, _) = storage
+        .paged_kv_tokens(0, table.blocks(), prompt.len())
+        .unwrap();
     assert_eq!(k.dims(), &[prompt.len(), 2, 4]);
     let (k1, v1) = storage.read_kv_token(0, 0, 0).unwrap();
     assert_eq!(k1.dims(), &[2, 4]);
@@ -293,15 +293,9 @@ fn int8_engine_generates_the_same_tokens_as_f32() {
     // tiny mock's greedy trajectory is what the F32 engine produces too.
     let prompt: Vec<u32> = (0..12).collect();
     let mut f32_engine = Engine::new(mock(), 1, 64, 16).expect("f32 engine");
-    let mut int8_engine = Engine::new_with_budget_and_kv(
-        mock(),
-        1,
-        64,
-        16,
-        usize::MAX,
-        Some(QuantMode::Int8),
-    )
-    .expect("int8 engine");
+    let mut int8_engine =
+        Engine::new_with_budget_and_kv(mock(), 1, 64, 16, usize::MAX, Some(QuantMode::Int8))
+            .expect("int8 engine");
     let f32_id = f32_engine.add_request(prompt.clone(), 8);
     let int8_id = int8_engine.add_request(prompt, 8);
     let mut f32_tokens = Vec::new();

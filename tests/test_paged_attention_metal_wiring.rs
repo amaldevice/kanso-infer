@@ -12,7 +12,7 @@
 mod metal_paged_attention_wiring {
     use candle_core::{Device, Tensor};
     use kanso_infer::hardware::Backend;
-use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
+    use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
     use kanso_infer::model::Model;
 
     const HIDDEN: usize = 64;

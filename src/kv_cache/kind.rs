@@ -110,12 +110,7 @@ impl KvStorageKind {
         device: &Device,
     ) -> Result<Self, EngineError> {
         Ok(Self::F32(KvStorage::new(
-            num_layers,
-            num_blocks,
-            block_size,
-            n_kv_heads,
-            head_dim,
-            device,
+            num_layers, num_blocks, block_size, n_kv_heads, head_dim, device,
         )?))
     }
 
@@ -129,13 +124,7 @@ impl KvStorageKind {
         device: &Device,
     ) -> Result<Self, EngineError> {
         Ok(Self::Quantized(QuantizedKvStorage::new(
-            num_layers,
-            num_blocks,
-            block_size,
-            n_kv_heads,
-            head_dim,
-            mode,
-            device,
+            num_layers, num_blocks, block_size, n_kv_heads, head_dim, mode, device,
         )?))
     }
 
@@ -221,11 +210,7 @@ impl KvStorageKind {
     ///
     /// candle's `scatter_set` is element-wise, so each token's slot id repeats across its
     /// head/dim row (ticket #61 F11). Built once per step by [`KvSlotPlan`].
-    pub fn slot_id_tensor(
-        &self,
-        slots: &[usize],
-        device: &Device,
-    ) -> Result<Tensor, EngineError> {
+    pub fn slot_id_tensor(&self, slots: &[usize], device: &Device) -> Result<Tensor, EngineError> {
         let repeats = self.n_kv_heads() * self.head_dim();
         let mut slot_ids: Vec<u32> = Vec::with_capacity(slots.len() * repeats);
         for &slot in slots {

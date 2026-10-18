@@ -47,7 +47,14 @@ impl Engine {
         block_size: usize,
         token_budget: usize,
     ) -> Result<Self, EngineError> {
-        Self::new_with_budget_and_kv(model, max_running, total_blocks, block_size, token_budget, None)
+        Self::new_with_budget_and_kv(
+            model,
+            max_running,
+            total_blocks,
+            block_size,
+            token_budget,
+            None,
+        )
     }
 
     /// `new_with_budget` with an explicit KV cache type (ticket #88).
