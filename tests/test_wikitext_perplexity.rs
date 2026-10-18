@@ -147,19 +147,40 @@ fn test_backend_perplexity_parity_cpu_amx_neon_metal() {
     assert_eq!(report.dataset, "wikitext2");
     assert!(report.baseline_ppl > 0.0);
 
-    let backends = ["cpu", "amx", "neon", "metal"];
+    // Ticket #89: `neon` must be reported as *not run*, never as a number that
+    // is secretly the CPU path. The remaining backends must be measured.
+    let neon = report
+        .backends
+        .iter()
+        .find(|x| x.backend == kanso_infer::Backend::Neon)
+        .expect("neon row must still be present in the report");
+    assert!(
+        neon.perplexity.is_none(),
+        "neon must not report a measured PPL (that would be the CPU path), got {:?}",
+        neon.perplexity
+    );
+    assert!(
+        neon.skipped_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("not wired")),
+        "neon row must carry the reason it was skipped, got {:?}",
+        neon.skipped_reason
+    );
+
+    let backends = ["cpu", "amx", "metal"];
     for name in &backends {
         let b = report
             .backends
             .iter()
             .find(|x| x.backend.to_string().eq_ignore_ascii_case(name))
             .unwrap_or_else(|| panic!("backend {} missing in report", name));
+        let ppl = b.perplexity.expect("measured backend must carry a PPL");
 
         assert!(
-            b.delta_vs_fp32.abs() < 0.01,
+            (ppl - report.baseline_ppl).abs() < 0.01,
             "Backend {} Delta PPL {} exceeds 0.01 parity threshold",
             name,
-            b.delta_vs_fp32
+            (ppl - report.baseline_ppl).abs()
         );
     }
 }

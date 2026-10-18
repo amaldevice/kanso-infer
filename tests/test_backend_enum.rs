@@ -22,6 +22,33 @@ fn test_backend_foo_rejected() {
     }
 }
 
+/// Ticket #89: `--backend neon` used to resolve to `Device::Cpu` and then run the
+/// exact same candle CPU matmul as `--backend cpu`, while printing "neon" — the
+/// `--backend metal`-before-#42 placebo in a different costume.
+///
+/// The hand-written kernels in `src/quant/neon.rs` cannot read the production
+/// `LinearWeight` blocks: `src/quant::BlockQ8_0` is `{ d: f32, qs: [i8; 32] }`
+/// (36 B) while candle stores `{ d: f16, qs: [i8; 32] }` (34 B), and
+/// `src/quant::BlockQ4_K` keeps `d`/`dmin` as f32 where candle keeps f16. Reading
+/// them in place is impossible and repacking every weight on every token would
+/// cost more than it saves, so the kernels stay benchmark-only and the backend
+/// must refuse instead of silently measuring the CPU path.
+#[test]
+fn test_neon_backend_refuses_placebo_cpu_run() {
+    let err = Backend::Neon
+        .device()
+        .expect_err("--backend neon must not silently resolve to the CPU path");
+    let msg = err.to_string();
+    assert!(msg.contains("neon"), "error must name the backend: {msg}");
+    assert!(
+        msg.contains("kernel"),
+        "error must say the NEON kernels are not wired: {msg}"
+    );
+    // The refusal is specific to neon: cpu/amx still resolve to CPU on purpose.
+    assert!(matches!(Backend::Cpu.device().unwrap(), Device::Cpu));
+    assert!(matches!(Backend::Amx.device().unwrap(), Device::Cpu));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn test_metal_device_is_honest_gpu() {
