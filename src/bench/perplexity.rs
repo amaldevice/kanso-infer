@@ -247,11 +247,20 @@ pub fn calculate_perplexity_quantized(
 }
 
 /// Evaluation record for an individual backend.
+///
+/// `perplexity`/`delta_vs_fp32` are `None` when the backend was not measured.
+/// Ticket #89: a backend that cannot execute its own kernels (today: `neon`)
+/// must say so here instead of reporting a number that is really another path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendPpl {
     pub backend: crate::hardware::Backend,
-    pub perplexity: f64,
-    pub delta_vs_fp32: f64,
+    #[serde(default)]
+    pub perplexity: Option<f64>,
+    #[serde(default)]
+    pub delta_vs_fp32: Option<f64>,
+    /// Why this backend has no measurement. `None` for measured backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
 }
 
 /// Evaluation record for a quantized kernel.
@@ -302,14 +311,28 @@ pub fn compare_backends_perplexity(
     ];
     let mut backends = Vec::new();
     for &b in &backend_names {
-        model.set_backend(b);
-        let ppl = calculate_perplexity(&model, tokens, stride)?;
-        let delta = ppl - baseline_ppl;
-        backends.push(BackendPpl {
-            backend: b,
-            perplexity: ppl,
-            delta_vs_fp32: delta,
-        });
+        // Ticket #89: a backend whose own kernels are not wired must not report a
+        // measurement, because whatever it would measure is the CPU path. Resolve
+        // the device first so a skipped backend never even tags the model.
+        match b.device() {
+            Ok(_) => {
+                model.set_backend(b);
+                let ppl = calculate_perplexity(&model, tokens, stride)?;
+                let delta = ppl - baseline_ppl;
+                backends.push(BackendPpl {
+                    backend: b,
+                    perplexity: Some(ppl),
+                    delta_vs_fp32: Some(delta),
+                    skipped_reason: None,
+                });
+            }
+            Err(e) => backends.push(BackendPpl {
+                backend: b,
+                perplexity: None,
+                delta_vs_fp32: None,
+                skipped_reason: Some(e.to_string()),
+            }),
+        }
     }
 
     // Reset backend to cpu for quantization evals
@@ -390,15 +413,21 @@ pub fn format_ascii_ppl_report(report: &PerplexityReport) -> String {
     );
 
     for b in &report.backends {
-        let status = if b.delta_vs_fp32.abs() < 0.05 {
-            "PASS"
-        } else {
-            "FAIL"
+        let (Some(ppl), Some(delta)) = (b.perplexity, b.delta_vs_fp32) else {
+            out.push_str(&format!(
+                "{:<25} {:<16} {:<24} {:<8}\n",
+                b.backend,
+                "not run",
+                b.skipped_reason.as_deref().unwrap_or("no reason recorded"),
+                "SKIP"
+            ));
+            continue;
         };
-        let sign = if b.delta_vs_fp32 >= 0.0 { "+" } else { "" };
+        let status = if delta.abs() < 0.05 { "PASS" } else { "FAIL" };
+        let sign = if delta >= 0.0 { "+" } else { "" };
         out.push_str(&format!(
             "{:<25} {:<16.4} {:>1}{:<23.4} {:<8}\n",
-            b.backend, b.perplexity, sign, b.delta_vs_fp32, status
+            b.backend, ppl, sign, delta, status
         ));
     }
 

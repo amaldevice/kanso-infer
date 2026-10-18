@@ -37,7 +37,7 @@ Supports dense Transformer decoders and next-generation hybrid linear-attention 
 - **Batch Size Sweeping**: Sweeps batch sizes (e.g. `--batch-sizes 1,4,8,16,32`) to evaluate saturation points.
 - **Trace Replay**: Replays ShareGPT-style JSONL traces (`--trace-file`) with heterogeneous prompt lengths, generation lengths, and staggered arrival times.
 - **Multi-Model Profile Selection**: `--model-type <mock | smollm2 | granite-dense | granite-h | lfm>` for empirical architecture comparison.
-- **Deterministic 64-bit FNV-1a Checksums**: Order-sensitive token stream hashing to mathematically prove greedy output parity across CPU, NEON, and Metal backends.
+- **Deterministic 64-bit FNV-1a Checksums**: Order-sensitive token stream hashing to mathematically prove greedy output parity across CPU and Metal backends.
 - **Hardware Telemetry & Resource Tracking (Zero-Sudo)**:
   - **Hardware Profiling**: Reads CPU model, core counts, RAM, and model identifier via macOS `sysctl`.
   - **Peak Memory (RSS)**: Tracks peak Resident Set Size in MB via POSIX `libc::getrusage`.
@@ -82,7 +82,7 @@ that every exec pointer resolves to a file in the tree.
 | Real Core ML / ANE execution (`.mlpackage`, `MLModel`) | 📝 | roadmap |
 | Fused PagedAttention v2 Metal kernel | 🧪 | `src/metal/paged_attention.rs`, `src/metal/kernels/paged_attention_v2.metal` |
 | Fused Metal llama-layer kernel | 🧪 | `src/metal/fused_layer.rs` |
-| Hand-written NEON Q8_0/Q4_K GEMV kernels | 🧪 | `src/quant/neon.rs` (reference/benchmark path; production decode runs off candle's kernels) |
+| Hand-written NEON Q8_0/Q4_K GEMV kernels | 🧪 | `src/quant/neon.rs` (benchmark/parity-test path only; `--backend neon` refuses to start — see below) |
 | Quantized (INT8/FP8) paged KV cache | 🧪 | `src/kv_cache/quantized_storage.rs` |
 | Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation | 📝 | roadmap |
 | `granite-h` / `lfm` bench profiles | 📝 | roadmap |
@@ -105,6 +105,13 @@ that every exec pointer resolves to a file in the tree.
   shape is not an implemented feature, so this is roadmap: load real Granite-hybrid/LFM
   GGUF once the hybrid forward pass above lands.
 - Promote hand-written NEON GEMV kernels from reference path to production decode path.
+  Blocker (ticket #89): the packed layouts differ, so the kernels cannot read the
+  production `LinearWeight` blocks in place. `src/quant::BlockQ8_0` is
+  `{ d: f32, qs: [i8; 32] }` (36 B); candle stores `{ d: f16, qs: [i8; 32] }` (34 B).
+  `src/quant::BlockQ4_K` keeps `d`/`dmin` as f32 where candle keeps f16. Bridging that
+  needs either a repack of every weight per token (costs more bandwidth than the kernel
+  saves, so rejected) or a kernel written against candle's f16-scale blocks. Until then
+  `--backend neon` errors out instead of silently running candle's CPU matmul.
 
 ---
 
