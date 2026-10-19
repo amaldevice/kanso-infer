@@ -92,7 +92,7 @@ fn test_metal_device_reports_ok_or_a_runtime_gap() {
 #[test]
 fn test_is_metal_runtime_gap_matches_only_the_capability_prefix() {
     use kanso_infer::error::EngineError;
-    use kanso_infer::hardware::{is_metal_runtime_gap, METAL_RUNTIME_GAP_PREFIX};
+    use kanso_infer::hardware::{METAL_RUNTIME_GAP_PREFIX, is_metal_runtime_gap};
 
     let gap = EngineError::Metal(format!(
         "{METAL_RUNTIME_GAP_PREFIX}: class MTLResidencySetDescriptor could not be found"
