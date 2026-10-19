@@ -83,7 +83,7 @@ pub struct Args {
     pub ctx_lengths: Option<String>,
 
     /// `host:port` of a live `kanso serve` to smoke-test the SSE stream against.
-    /// Without it the `sse_sdk_stream_consumed` probe does not run, and the gate
+    /// Without it the `sse_stream_consumed` probe does not run, and the gate
     /// skips that row rather than judging a stream nobody opened.
     #[arg(long)]
     pub sse_endpoint: Option<String>,

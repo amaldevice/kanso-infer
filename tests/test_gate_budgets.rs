@@ -128,7 +128,7 @@ fn fase2_budget_declares_the_f15_rows() {
         "batch_scale_ratio",
         "ctx_latency_ratio",
         "spec_speedup_ratio",
-        "sse_sdk_stream_consumed",
+        "sse_stream_consumed",
     ] {
         assert!(
             metrics.iter().any(|m| m == expected),
@@ -243,7 +243,7 @@ fn fase2_declares_which_f15_rows_are_measurable_today() {
         "batch_scale_ratio",
         "spec_speedup_ratio",
         "ctx_latency_ratio",
-        "sse_sdk_stream_consumed",
+        "sse_stream_consumed",
     ] {
         assert_eq!(
             row_in(&budget, metric).status,
@@ -310,14 +310,14 @@ fn asset_rows_are_skipped_not_passed_when_the_gguf_is_absent() {
             other => panic!("'{metric}' must not be {other:?} without the GGUF"),
         }
     }
-    // `sse_sdk_stream_consumed` has no asset requirement, so the asset check does
+    // `sse_stream_consumed` has no asset requirement, so the asset check does
     // not skip it — but the report carries no probe result, so it is skipped too.
-    match &row(&outcome, "sse_sdk_stream_consumed").verdict {
+    match &row(&outcome, "sse_stream_consumed").verdict {
         GateVerdict::Skipped(reason) => assert!(
             reason.contains("probe") || reason.contains("not yet instrumented"),
             "the SDK stream row must say why it has no number, got '{reason}'"
         ),
-        other => panic!("sse_sdk_stream_consumed must not be {other:?}"),
+        other => panic!("sse_stream_consumed must not be {other:?}"),
     }
     assert_eq!(outcome.code(), 2, "no GGUF means exit 2, never 0");
     assert!(!outcome.passed());

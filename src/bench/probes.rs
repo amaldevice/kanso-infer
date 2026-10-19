@@ -168,7 +168,7 @@ pub fn probe_paged_attn_over_theoretical(
 /// listening on `host:port`, reading the SSE frames off a plain TCP socket until
 /// the `[DONE]` sentinel arrives.
 ///
-/// This is the functional probe behind `sse_sdk_stream_consumed`: it answers
+/// This is the functional probe behind `sse_stream_consumed`: it answers
 /// "did a client see a whole OpenAI-shaped stream from the real server", not
 /// "how fast was it". It talks HTTP/1.1 by hand so the library needs no HTTP
 /// client dependency for it.
@@ -243,7 +243,7 @@ pub fn run_probes(
             head_dim,
         ),
         idle_gap_pct: None,
-        sse_sdk_stream_consumed: sse_endpoint
+        sse_stream_consumed: sse_endpoint
             .and_then(|(host, port)| probe_sse_stream_consumed(host, port)),
     }
 }

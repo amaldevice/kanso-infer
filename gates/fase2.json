@@ -34,12 +34,12 @@
       "note": "F15 real pair: SmolLM2-360M target + 135M draft, gamma 4, ctx 512. Read from the report's SpeculativeReport.speedup_ratio and reported as-is, including below 1x."
     },
     {
-      "metric": "sse_sdk_stream_consumed",
+      "metric": "sse_stream_consumed",
       "bound": "min",
       "budget": 1.0,
       "status": "measured",
       "owner": "#95",
-      "note": "One chat.completion.chunk stream consumed through a real HTTP client. `bench --probes --sse-endpoint host:port` opens a plain TCP connection to a live `kanso serve`, reads the SSE frames to the [DONE] sentinel, and reports 1.0/0.0 in `probes.sse_sdk_stream_consumed`. No server listening = the probe does not run, so the row skips rather than reporting a stream nobody opened."
+      "note": "One chat.completion.chunk stream consumed end-to-end. `bench --probes --sse-endpoint host:port` opens a plain TCP connection to a live `kanso serve`, reads the SSE frames to the [DONE] sentinel, and reports 1.0/0.0 in `probes.sse_stream_consumed`. This is a hand-rolled HTTP/1.1 client, NOT the official OpenAI SDK, which is why the row is named `sse_stream_consumed` and not `sse_sdk_stream_consumed`. Consuming the same stream through a real SDK client (openai-python / eventsource) is owner #101's addition. No server listening = the probe does not run, so the row skips rather than reporting a stream nobody opened."
     }
   ]
 }

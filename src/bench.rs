@@ -176,10 +176,11 @@ pub struct KernelProbes {
     /// CPU-GPU idle gap as a percentage of decode step wall time (Metal only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_gap_pct: Option<f64>,
-    /// 1.0 when the SSE smoke harness consumed a whole `chat.completion.chunk`
-    /// stream, 0.0 when it did not. A functional result, not a rate.
+    /// 1.0 when the SSE probe consumed a whole `chat.completion.chunk` stream
+    /// over plain HTTP/1.1, 0.0 when it did not. A functional result, not a rate.
+    /// Named for what it measures: the real OpenAI SDK client is #101's job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sse_sdk_stream_consumed: Option<f64>,
+    pub sse_stream_consumed: Option<f64>,
 }
 
 impl BenchmarkReport {

@@ -336,7 +336,7 @@ pub const GATE_METRICS: &[&str] = &[
     "gemv_peak_pct",
     "paged_attn_ctx4096_b1_over_theoretical",
     "idle_gap_pct",
-    "sse_sdk_stream_consumed",
+    "sse_stream_consumed",
 ];
 
 /// Metrics that need a second report: `last / first` over the run's sweep.
@@ -347,7 +347,7 @@ pub const PROBE_METRICS: &[&str] = &[
     "gemv_peak_pct",
     "paged_attn_ctx4096_b1_over_theoretical",
     "idle_gap_pct",
-    "sse_sdk_stream_consumed",
+    "sse_stream_consumed",
 ];
 
 /// A row's number, or why it has none. `Missing` means the metric exists but
@@ -397,7 +397,7 @@ fn metric_value(report: &BenchmarkReport, metric: &str) -> Option<f64> {
                 .paged_attn_ctx4096_b1_over_theoretical?
         }
         "idle_gap_pct" => report.probes.as_ref()?.idle_gap_pct?,
-        "sse_sdk_stream_consumed" => report.probes.as_ref()?.sse_sdk_stream_consumed?,
+        "sse_stream_consumed" => report.probes.as_ref()?.sse_stream_consumed?,
         _ => return None,
     };
     Some(value)

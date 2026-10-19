@@ -240,22 +240,19 @@ fn ctx_latency_ratio_comes_from_a_ctx_sweep_of_reports() {
 #[test]
 fn gate_reads_the_sse_stream_probe_from_the_report() {
     let consumed = weighed_report(10.0).with_probes(KernelProbes {
-        sse_sdk_stream_consumed: Some(1.0),
+        sse_stream_consumed: Some(1.0),
         ..KernelProbes::default()
     });
-    let (measured, verdict) = verdict_of(
-        &budget_for("sse_sdk_stream_consumed", "min", 1.0),
-        &consumed,
-    );
+    let (measured, verdict) = verdict_of(&budget_for("sse_stream_consumed", "min", 1.0), &consumed);
     assert_eq!(measured, Some(1.0));
     assert_eq!(verdict, GateVerdict::Passed);
 
     let not_consumed = weighed_report(10.0).with_probes(KernelProbes {
-        sse_sdk_stream_consumed: Some(0.0),
+        sse_stream_consumed: Some(0.0),
         ..KernelProbes::default()
     });
     let (measured, verdict) = verdict_of(
-        &budget_for("sse_sdk_stream_consumed", "min", 1.0),
+        &budget_for("sse_stream_consumed", "min", 1.0),
         &not_consumed,
     );
     assert_eq!(
@@ -266,7 +263,7 @@ fn gate_reads_the_sse_stream_probe_from_the_report() {
     assert_eq!(verdict, GateVerdict::Violated);
 
     let (measured, verdict) = verdict_of(
-        &budget_for("sse_sdk_stream_consumed", "min", 1.0),
+        &budget_for("sse_stream_consumed", "min", 1.0),
         &weighed_report(10.0),
     );
     assert_eq!(measured, None);
@@ -284,7 +281,7 @@ fn the_new_fields_survive_the_report_json_round_trip() {
             gemv_peak_pct: Some(64.0),
             paged_attn_ctx4096_b1_over_theoretical: Some(1.9),
             idle_gap_pct: Some(4.5),
-            sse_sdk_stream_consumed: Some(1.0),
+            sse_stream_consumed: Some(1.0),
         });
 
     let json = report.to_json().expect("report serializes");
@@ -297,7 +294,7 @@ fn the_new_fields_survive_the_report_json_round_trip() {
     assert_eq!(probes.gemv_peak_pct, Some(64.0));
     assert_eq!(probes.paged_attn_ctx4096_b1_over_theoretical, Some(1.9));
     assert_eq!(probes.idle_gap_pct, Some(4.5));
-    assert_eq!(probes.sse_sdk_stream_consumed, Some(1.0));
+    assert_eq!(probes.sse_stream_consumed, Some(1.0));
 }
 
 /// A report written before these fields existed must still parse, and its rows
