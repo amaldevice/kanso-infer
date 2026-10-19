@@ -96,7 +96,10 @@ fn a_legacy_report_cannot_pass_the_peak_rss_budget_on_a_zero() {
     assert_eq!(parsed.peak_rss_mb, None, "an absent field is not a zero");
 
     let (measured, verdict) = verdict_of(&budget_for("peak_rss_mb", "max", 900.0), &parsed);
-    assert_eq!(measured, None, "a report with no RSS has no number to judge");
+    assert_eq!(
+        measured, None,
+        "a report with no RSS has no number to judge"
+    );
     assert!(
         matches!(verdict, GateVerdict::Skipped(_)),
         "a zero RSS must never satisfy a max budget, got {verdict:?}"

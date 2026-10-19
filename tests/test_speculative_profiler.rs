@@ -215,7 +215,7 @@ fn test_benchmark_report_speculative_integration() {
         peak_bandwidth_gb_s: 150.0,
         peak_bandwidth_source: "measured: test".to_string(),
         telemetry: kanso_infer::bench::TelemetryStatus::Measured,
-        peak_rss_mb: 0.0,
+        peak_rss_mb: None,
         perplexity_wikitext2: None,
         context_len: None,
         probes: None,

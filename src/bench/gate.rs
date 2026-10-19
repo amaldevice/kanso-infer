@@ -383,8 +383,9 @@ fn metric_value(report: &BenchmarkReport, metric: &str) -> Option<f64> {
             util_pct
         }
         "spec_speedup_ratio" => report.speculative.as_ref()?.speedup_ratio?,
-        // Peak RSS is a whole-process figure every run has (#100).
-        "peak_rss_mb" => report.peak_rss_mb,
+        // Peak RSS is a whole-process figure every fresh run has (#100); a
+        // report from before the field carries no measurement, not a zero.
+        "peak_rss_mb" => report.peak_rss_mb?,
         // Perplexity only exists when the run asked for it (#100).
         "perplexity_wikitext2" => report.perplexity_wikitext2?,
         // Probe figures: absent when the probe did not run (#100).

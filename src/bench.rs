@@ -139,9 +139,11 @@ pub struct BenchmarkReport {
     #[serde(default)]
     pub telemetry: TelemetryStatus,
     /// Peak resident set size of the measuring process, straight from
-    /// `hardware::get_peak_rss_mb()` (#100). Zero = predates the field.
-    #[serde(default)]
-    pub peak_rss_mb: f64,
+    /// `hardware::get_peak_rss_mb()` (#100). `None` = the report predates the
+    /// field, so there is no measurement to judge — a zero would read as "nothing
+    /// resident" and wrongly satisfy a `max` budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_rss_mb: Option<f64>,
     /// Perplexity on the bundled WikiText-2 slice, attached only by a run that
     /// asked for it (`--eval-ppl`). `None` = never evaluated (#100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,7 +194,7 @@ impl BenchmarkReport {
     /// Attaches peak RSS, the figure `peak_rss_mb` rows judge (#100).
     #[must_use]
     pub fn with_peak_rss_mb(mut self, peak_rss_mb: f64) -> Self {
-        self.peak_rss_mb = peak_rss_mb;
+        self.peak_rss_mb = Some(peak_rss_mb);
         self
     }
 
@@ -388,7 +390,7 @@ pub fn evaluate_run_with_timings(
         peak_bandwidth_gb_s,
         peak_bandwidth_source,
         telemetry: TelemetryStatus::from_bytes(bytes_read_per_step),
-        peak_rss_mb: crate::hardware::get_peak_rss_mb(),
+        peak_rss_mb: Some(crate::hardware::get_peak_rss_mb()),
         perplexity_wikitext2: None,
         context_len: None,
         probes: None,

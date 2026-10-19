@@ -121,9 +121,12 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: Backend) {
         report.checksum,
     );
     println!(
-        "{:<24} peak_rss={:.1}MB thermal=\"{}\" bus_est={:.1}GB/s ({:.1}% of {:.1}GB/s {})",
+        "{:<24} peak_rss={} thermal=\"{}\" bus_est={:.1}GB/s ({:.1}% of {:.1}GB/s {})",
         "",
-        peak_rss_mb,
+        match peak_rss_mb {
+            Some(mb) => format!("{mb:.1}MB"),
+            None => "unmeasured".to_string(),
+        },
         thermal.as_str(),
         effective_gb_s,
         util_pct,
