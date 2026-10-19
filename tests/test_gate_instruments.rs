@@ -458,3 +458,66 @@ fn ctx_latency_ratio_skips_reports_without_a_context_len() {
     assert_eq!(outcome.rows[0].measured, None);
     assert!(matches!(outcome.rows[0].verdict, GateVerdict::Skipped(_)));
 }
+
+/// B6: `--eval-ppl <spec>` must honour what it is given. A dataset that is not
+/// on this machine produces no number, so the gate skips the row — the compiled-in
+/// fixture may only be used when the spec actually names it.
+#[test]
+fn the_perplexity_dataset_is_resolved_from_the_spec_not_always_the_fixture() {
+    use kanso_infer::bench::resolve_perplexity_dataset;
+
+    // The bundled slice is a documented default, reachable by name.
+    let bundled = resolve_perplexity_dataset("wikitext2").expect("the bundled slice resolves");
+    assert!(
+        !bundled.is_empty(),
+        "the bundled WikiText-2 slice carries tokens"
+    );
+
+    // A path that is not there is an absent dataset, not a silent fallback.
+    assert_eq!(
+        resolve_perplexity_dataset("/nonexistent/wikitext2-validation.txt"),
+        None,
+        "a missing dataset must not fall back to the bundled slice"
+    );
+    assert_eq!(
+        resolve_perplexity_dataset("no-such-dataset-name"),
+        None,
+        "an unknown dataset name is not a dataset"
+    );
+
+    // A real file on disk is read, and its tokens are what the eval consumes.
+    let path = std::env::temp_dir().join(format!(
+        "kanso-100-ppl-{}.txt",
+        std::process::id()
+    ));
+    std::fs::write(&path, "the quick brown fox jumps over the lazy dog").expect("write fixture");
+    let from_file = resolve_perplexity_dataset(path.to_str().unwrap())
+        .expect("an existing dataset path resolves");
+    assert_eq!(
+        from_file,
+        kanso_infer::bench::tokenize_wikitext2(
+            "the quick brown fox jumps over the lazy dog"
+        ),
+        "the eval must consume the file it was pointed at"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// B6: the gate's side of the same rule — a report with no perplexity (because
+/// the dataset was absent) skips, and only a real eval reads `measured`.
+#[test]
+fn an_absent_perplexity_dataset_leaves_the_row_skipped() {
+    let report = weighed_report(10.0);
+    assert_eq!(
+        report.perplexity_wikitext2, None,
+        "a run with no dataset evaluates nothing"
+    );
+
+    let (measured, verdict) =
+        verdict_of(&budget_for("perplexity_wikitext2", "max", 12.0), &report);
+    assert_eq!(measured, None);
+    assert!(
+        matches!(verdict, GateVerdict::Skipped(_)),
+        "an absent dataset must skip, got {verdict:?}"
+    );
+}
