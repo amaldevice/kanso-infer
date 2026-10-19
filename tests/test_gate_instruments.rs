@@ -56,27 +56,61 @@ fn verdict_of(budget: &GateBudget, report: &BenchmarkReport) -> (Option<f64>, Ga
 #[test]
 fn gate_reads_peak_rss_from_the_report() {
     let report = weighed_report(10.0);
-    assert!(
-        report.peak_rss_mb > 0.0,
-        "a real process has resident memory; the report must carry it, got {}",
-        report.peak_rss_mb
-    );
+    let rss = report
+        .peak_rss_mb
+        .expect("a real process has resident memory; the report must carry it");
+    assert!(rss > 0.0, "peak RSS must be a real figure, got {rss}");
 
     let (measured, verdict) = verdict_of(&budget_for("peak_rss_mb", "max", 0.0), &report);
     assert_eq!(
         measured,
-        Some(report.peak_rss_mb),
+        Some(rss),
         "the gate must judge the report's own RSS, not a constant"
     );
     assert_eq!(
         verdict,
         GateVerdict::Violated,
-        "{} MB cannot fit a 0 MB budget",
-        report.peak_rss_mb
+        "{rss} MB cannot fit a 0 MB budget"
     );
 
     let (_, generous) = verdict_of(&budget_for("peak_rss_mb", "max", 1e9), &report);
     assert_eq!(generous, GateVerdict::Passed);
+}
+
+/// D9: a report written before the field existed must not pass a `max` budget
+/// on its default value. Zero is "never measured", not "nothing resident".
+#[test]
+fn a_legacy_report_cannot_pass_the_peak_rss_budget_on_a_zero() {
+    let legacy = r#"{
+        "total_tokens": 100, "total_duration_secs": 1.0, "num_requests": 1,
+        "total_tokens_per_sec": 100.0, "tokens_per_sec_per_request": 100.0,
+        "avg_ms_per_step": 10.0, "mean_ttft_ms": 10.0, "max_ttft_ms": 10.0,
+        "ttft_p50_ms": 10.0, "ttft_p90_ms": 10.0, "itl_mean_ms": 5.0,
+        "itl_p50_ms": 5.0, "itl_p90_ms": 5.0, "itl_p99_ms": 5.0,
+        "prefill_tokens_per_sec": 100.0, "decode_ms_per_step": 10.0,
+        "decode_ms_per_token": 10.0, "checksum": 0, "prefix_hit_rate": 0.0,
+        "bytes_read_per_step": 100000000, "peak_bandwidth_gb_s": 20.0,
+        "peak_bandwidth_source": "measured", "telemetry": "measured"
+    }"#;
+    let parsed: BenchmarkReport = serde_json::from_str(legacy).expect("legacy report parses");
+    assert_eq!(parsed.peak_rss_mb, None, "an absent field is not a zero");
+
+    let (measured, verdict) = verdict_of(&budget_for("peak_rss_mb", "max", 900.0), &parsed);
+    assert_eq!(measured, None, "a report with no RSS has no number to judge");
+    assert!(
+        matches!(verdict, GateVerdict::Skipped(_)),
+        "a zero RSS must never satisfy a max budget, got {verdict:?}"
+    );
+}
+
+/// A report that *did* measure RSS still round-trips as a number, not as absent.
+#[test]
+fn a_measured_peak_rss_survives_the_json_round_trip() {
+    let report = weighed_report(10.0);
+    let json = report.to_json().expect("report serializes");
+    let parsed: BenchmarkReport = serde_json::from_str(&json).expect("report parses back");
+    assert_eq!(parsed.peak_rss_mb, report.peak_rss_mb);
+    assert!(parsed.peak_rss_mb.is_some());
 }
 
 /// `perplexity_wikitext2` reads `measured` only when the run actually evaluated
@@ -253,7 +287,7 @@ fn the_new_fields_survive_the_report_json_round_trip() {
     let json = report.to_json().expect("report serializes");
     let parsed: BenchmarkReport = serde_json::from_str(&json).expect("report parses back");
 
-    assert!((parsed.peak_rss_mb - report.peak_rss_mb).abs() < 1e-9);
+    assert_eq!(parsed.peak_rss_mb, report.peak_rss_mb);
     assert_eq!(parsed.perplexity_wikitext2, Some(11.25));
     assert_eq!(parsed.context_len, Some(2048));
     let probes = parsed.probes.expect("probes survive JSON");
