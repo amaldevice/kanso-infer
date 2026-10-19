@@ -103,6 +103,15 @@ impl PaddedBatch {
     }
 }
 
+/// The pool row a token's K/V lands in: `block * block_size + offset` (ticket #61 F11).
+///
+/// One definition, because the mapping is a contract three call sites depend on — the
+/// slot plan, the single-token decode path and the speculative verifier — and a
+/// disagreement between them is a silent write to the wrong row.
+pub fn slot_for(block: usize, offset: usize, block_size: usize) -> usize {
+    block * block_size + offset
+}
+
 /// Where a step's K/V rows go, built once per step and shared by every layer (#61 F11).
 pub struct KvSlotPlan {
     /// `[tokens, n_kv_heads, head_dim]` scatter index for the F32 pool.

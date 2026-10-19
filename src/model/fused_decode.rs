@@ -68,14 +68,8 @@ impl FusedDecodeSeam {
         let ctx = MetalContext::new()?;
         let mut layers = Vec::with_capacity(model.weights.layers.len());
         for (index, layer) in model.weights.layers.iter().enumerate() {
-            let weights = LayerHostWeights::read(model, index, layer, &dims)?;
-            layers.push(MetalWeights::upload(
-                &ctx,
-                &dims,
-                &weights.view(),
-                &cos,
-                &sin,
-            )?);
+            let weights = read_layer_weights(model, index, layer, &dims)?;
+            layers.push(MetalWeights::upload(&ctx, &dims, &weights, &cos, &sin)?);
         }
 
         Ok(Some(Self {
@@ -154,45 +148,30 @@ fn host_row(tensor: &Tensor) -> Result<Vec<f32>, EngineError> {
         .to_vec1::<f32>()?)
 }
 
-/// Owned host copies of one layer's prologue weights.
-struct LayerHostWeights {
-    norm_weight: Vec<f32>,
-    w_q: Vec<f32>,
-    w_k: Vec<f32>,
-    w_v: Vec<f32>,
-}
-
-impl LayerHostWeights {
-    /// Copies one layer's dense prologue weights to the host, applying the GGUF Q/K row
-    /// permutation so the fused RoPE sees rotate-half rows — the same permutation
-    /// `project_qk` applies to the projection output.
-    fn read(
-        model: &super::Model,
-        index: usize,
-        layer: &crate::weights::LayerWeights,
-        dims: &FusedLayerDimensions,
-    ) -> Result<Self, EngineError> {
-        let hidden = dims.hidden_dim;
-        let (q_perm, k_perm) = match &model.weights.qk_perm {
-            Some(p) => (Some(&p.q), Some(&p.k)),
-            None => (None, None),
-        };
-        Ok(Self {
-            norm_weight: host_row(&layer.attn_norm)?,
-            w_q: permute_rows(dense_rows(&layer.attn_q, "attn_q", index)?, hidden, q_perm)?,
-            w_k: permute_rows(dense_rows(&layer.attn_k, "attn_k", index)?, hidden, k_perm)?,
-            w_v: dense_rows(&layer.attn_v, "attn_v", index)?,
-        })
-    }
-
-    fn view(&self) -> FusedLayerWeights {
-        FusedLayerWeights {
-            norm_weight: self.norm_weight.clone(),
-            w_q: self.w_q.clone(),
-            w_k: self.w_k.clone(),
-            w_v: self.w_v.clone(),
-        }
-    }
+/// Copies one layer's dense prologue weights to the host, applying the GGUF Q/K row
+/// permutation so the fused RoPE sees rotate-half rows — the same permutation
+/// `project_qk` applies to the projection output.
+///
+/// Returned by value: the buffers are uploaded once and then dropped, so an owned
+/// [`FusedLayerWeights`] is the whole story — a wrapper plus a cloning `view()` would
+/// copy every weight twice at build for nothing.
+fn read_layer_weights(
+    model: &super::Model,
+    index: usize,
+    layer: &crate::weights::LayerWeights,
+    dims: &FusedLayerDimensions,
+) -> Result<FusedLayerWeights, EngineError> {
+    let hidden = dims.hidden_dim;
+    let (q_perm, k_perm) = match &model.weights.qk_perm {
+        Some(p) => (Some(&p.q), Some(&p.k)),
+        None => (None, None),
+    };
+    Ok(FusedLayerWeights {
+        norm_weight: host_row(&layer.attn_norm)?,
+        w_q: permute_rows(dense_rows(&layer.attn_q, "attn_q", index)?, hidden, q_perm)?,
+        w_k: permute_rows(dense_rows(&layer.attn_k, "attn_k", index)?, hidden, k_perm)?,
+        w_v: dense_rows(&layer.attn_v, "attn_v", index)?,
+    })
 }
 
 /// One dense weight matrix as a flat host row-major `[out, hidden]` buffer.

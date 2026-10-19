@@ -1,4 +1,5 @@
 use crate::error::EngineError;
+use crate::kv_cache::kind::slot_for as kanso_slot_for;
 use crate::kv_cache::{BlockPool, BlockTable, KvStorageKind, PrefixCache};
 use crate::model::Model;
 use crate::sampler::{greedy_token, sample_from_probs, softmax_probs};
@@ -91,7 +92,13 @@ impl SpeculativeVerifier {
         let physical_blocks = block_table.blocks();
         let slot_mapping: Vec<usize> = positions
             .iter()
-            .map(|&pos| physical_blocks[pos / block_size] * block_size + pos % block_size)
+            .map(|&pos| {
+                kanso_slot_for(
+                    physical_blocks[pos / block_size],
+                    pos % block_size,
+                    block_size,
+                )
+            })
             .collect();
         let logits = model.forward_batch_all_rows(
             &verify_tokens,

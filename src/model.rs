@@ -1091,7 +1091,11 @@ impl Model {
                     .collect(),
                 max_blocks: block_idx + 1,
                 context_lens: vec![(pos + 1) as u32],
-                slots: vec![physical_block * block_size + offset],
+                slots: vec![crate::kv_cache::slot_for(
+                    physical_block,
+                    offset,
+                    block_size,
+                )],
             };
             let attn_out = self.decode_attention_paged(&q, &paged, kv_storage, layer_idx)?;
             // Merge heads back: [1, hidden_size]
