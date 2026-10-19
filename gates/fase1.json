@@ -17,41 +17,41 @@
       "metric": "gemv_peak_pct",
       "bound": "min",
       "budget": 60.0,
-      "status": "not-yet-instrumented",
+      "status": "measured",
       "owner": "#95",
-      "note": "Per-kernel GEMV throughput against peak. Needs Instruments / Metal System Trace counters; the decode step is not split per kernel yet. bandwidth_util_pct above is the whole-step proxy, not this number."
+      "note": "Per-kernel GEMV throughput against peak: `bench --probes` times the NEON Q8_0 GEMV kernel (1024x1024, the size of a real decode GEMV) and divides its throughput by the host's measured peak bandwidth. Report field `probes.gemv_peak_pct`, and `bench::GEMV_PROBE_KERNEL` names the kernel that was timed. Off aarch64 the probe declines (row skips) instead of timing the scalar fallback under this name."
     },
     {
       "metric": "paged_attn_ctx4096_b1_over_theoretical",
       "bound": "max",
       "budget": 2.0,
-      "status": "not-yet-instrumented",
+      "status": "measured",
       "owner": "#95",
-      "note": "Attention at ctx 4096 / batch 1 over its theoretical floor (2 * ctx * heads * head_dim * bytes / peak bandwidth). Needs per-kernel timings."
+      "note": "Attention at ctx 4096 / batch 1 over its theoretical floor (2 * ctx * kv_heads * head_dim * 4 B / peak bandwidth): `bench --probes` times the GPU paged-attention v2 kernel at exactly that shape and reports the ratio in `probes.paged_attn_ctx4096_b1_over_theoretical`. The probe declines (row skips) when no Metal device is available, rather than timing the CPU reference under the GPU kernel's name."
     },
     {
       "metric": "idle_gap_pct",
       "bound": "max",
       "budget": 5.0,
       "status": "not-yet-instrumented",
-      "owner": "#95",
-      "note": "CPU-GPU idle gap between encode and commit on the decode steps that are actually wired (fused prologue + paged-attn v2). Needs a Metal System Trace of a real decode loop."
+      "owner": "#101",
+      "note": "CPU-GPU idle gap between encode and commit on the decode steps that are actually wired (fused prologue + paged-attn v2). NOT measured here on purpose: only a Metal command-buffer timestamp (MTLCommandBuffer.GPUStartTime/GPUEndTime) or a Metal System Trace can answer it, and this crate's metal binding exposes neither. A CPU-timed proxy would report the host's scheduling jitter, not the GPU's idle window, so the report carries no idle_gap_pct and the gate skips this row. Owner #101 adds the timestamp path."
     },
     {
       "metric": "peak_rss_mb",
       "bound": "max",
       "budget": 900.0,
-      "status": "not-yet-instrumented",
+      "status": "measured",
       "owner": "#95",
-      "note": "Target for SmolLM2-360M Q8_0 resident weights + KV on the real file. BenchmarkReport does not carry peak RSS, so this is a declared target, not a measurement."
+      "note": "Target for SmolLM2-360M Q8_0 resident weights + KV on the real file. Every BenchmarkReport now carries `peak_rss_mb` from hardware::get_peak_rss_mb(), so the gate judges the process's own resident peak instead of a declared target."
     },
     {
       "metric": "perplexity_wikitext2",
       "bound": "max",
       "budget": 12.0,
-      "status": "not-yet-instrumented",
+      "status": "measured",
       "owner": "#95",
-      "note": "Target for the real GGUF on wikitext2 at stride 512. `bench --eval-ppl` prints PPL but does not attach it to the report the gate reads."
+      "note": "Target for the real GGUF on wikitext2 at stride 512. `bench --eval-ppl <spec> --gate <budget>` resolves the spec: the name `wikitext2` selects the bundled validation slice, anything else must be a readable text file. When the dataset is absent the run reports `perplexity skipped: ...` and the report carries no `perplexity_wikitext2`, so the gate skips this row instead of judging a fixture nobody asked for."
     }
   ]
 }

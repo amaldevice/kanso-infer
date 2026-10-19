@@ -200,13 +200,15 @@ fn gate_table_prints_measured_budget_ratio_and_verdict() {
 
 #[test]
 fn gate_rejects_an_unknown_metric_instead_of_passing_it() {
-    let budget = budget(r#"{"metric":"gemv_peak_pct","bound":"min","budget":0.6}"#);
+    // `gemv_peak_pct` used to stand in here, until #100 gave it a real report
+    // field; the stand-in must stay a name no budget can ever measure.
+    let budget = budget(r#"{"metric":"no_such_metric","bound":"min","budget":0.6}"#);
 
     let err = evaluate_gate(&budget, &sample_report())
         .expect_err("an unknown metric must not be silently treated as passing");
 
     assert!(
-        err.to_string().contains("gemv_peak_pct"),
+        err.to_string().contains("no_such_metric"),
         "error must name the bad metric, got {err}"
     );
 }

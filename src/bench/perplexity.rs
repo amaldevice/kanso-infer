@@ -375,12 +375,44 @@ pub fn compare_backends_perplexity(
     })
 }
 
+/// Resolves the perplexity dataset a `--eval-ppl <spec>` run asked for.
+///
+/// The spec is either the name of the bundled WikiText-2 slice (`wikitext2`) or a
+/// path to a text file on this machine. `None` means the dataset is **absent**: an
+/// unknown name, or a path that is not there. Falling back to the compiled-in
+/// slice would make `perplexity_wikitext2` permanently "measured" on a machine
+/// that has no dataset at all, which is exactly the hollow reading #100 removes.
+pub fn resolve_perplexity_dataset(spec: &str) -> Option<Vec<u32>> {
+    if spec.eq_ignore_ascii_case("wikitext2") || spec.eq_ignore_ascii_case("wikitext-2") {
+        return Some(get_bundled_wikitext2_tokens());
+    }
+    let text = std::fs::read_to_string(spec).ok()?;
+    (!text.is_empty()).then(|| tokenize_wikitext2(&text))
+}
+
 /// Executes complete automated WikiText-2 perplexity evaluation.
 pub fn run_wikitext2_perplexity_eval(
     model_type: &str,
     stride: usize,
 ) -> Result<PerplexityReport, EngineError> {
-    let tokens = get_bundled_wikitext2_tokens();
+    run_perplexity_eval(model_type, "wikitext2", stride)
+}
+
+/// Runs the perplexity eval against the dataset `spec` names (#100).
+///
+/// Returns [`EngineError::Config`] when the dataset is absent, so a caller can tell
+/// "this machine has no dataset" apart from "the model failed". The gate then
+/// skips `perplexity_wikitext2` instead of judging a fixture that was never asked for.
+pub fn run_perplexity_eval(
+    model_type: &str,
+    spec: &str,
+    stride: usize,
+) -> Result<PerplexityReport, EngineError> {
+    let tokens = resolve_perplexity_dataset(spec).ok_or_else(|| {
+        EngineError::Config(format!(
+            "perplexity dataset '{spec}' is not available (expected `wikitext2` or a readable text file)"
+        ))
+    })?;
     compare_backends_perplexity(model_type, &tokens, stride)
 }
 

@@ -70,10 +70,27 @@ pub struct Args {
     /// Evaluate an existing BenchmarkReport JSON against `--gate` instead of running a workload
     #[arg(long, requires = "gate")]
     pub gate_report: Option<String>,
+
+    /// Run the per-kernel / functional probes that fill the F12/F15 rows no
+    /// workload figure answers (GEMV share of peak, paged-attention floor,
+    /// SSE smoke). Results land in the report under `probes`.
+    #[arg(long, default_value_t = false)]
+    pub probes: bool,
+
+    /// Comma-separated context lengths to sweep, e.g. "128,2048". Each length
+    /// runs the workload once, so `ctx_latency_ratio` has the pair it needs.
+    #[arg(long)]
+    pub ctx_lengths: Option<String>,
+
+    /// `host:port` of a live `kanso serve` to smoke-test the SSE stream against.
+    /// Without it the `sse_stream_consumed` probe does not run, and the gate
+    /// skips that row rather than judging a stream nobody opened.
+    #[arg(long)]
+    pub sse_endpoint: Option<String>,
 }
 
 fn print_report(label: &str, report: &BenchmarkReport, backend: Backend) {
-    let peak_rss_mb = kanso_infer::hardware::get_peak_rss_mb();
+    let peak_rss_mb = report.peak_rss_mb;
     let thermal = kanso_infer::hardware::get_thermal_state();
 
     // Effective bandwidth vs the measured peak carried on the report (#53).
@@ -104,9 +121,12 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: Backend) {
         report.checksum,
     );
     println!(
-        "{:<24} peak_rss={:.1}MB thermal=\"{}\" bus_est={:.1}GB/s ({:.1}% of {:.1}GB/s {})",
+        "{:<24} peak_rss={} thermal=\"{}\" bus_est={:.1}GB/s ({:.1}% of {:.1}GB/s {})",
         "",
-        peak_rss_mb,
+        match peak_rss_mb {
+            Some(mb) => format!("{mb:.1}MB"),
+            None => "unmeasured".to_string(),
+        },
         thermal.as_str(),
         effective_gb_s,
         util_pct,
@@ -115,6 +135,15 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: Backend) {
     );
     if let Some(spec) = &report.speculative {
         println!("{}", spec.format_report());
+    }
+    if let Some(ppl) = report.perplexity_wikitext2 {
+        println!("{:<24} perplexity(wikitext2)={ppl:.4}", "");
+    }
+    if let Some(ctx) = report.context_len {
+        println!("{:<24} context_len={ctx}", "");
+    }
+    if let Some(probes) = &report.probes {
+        println!("{:<24} probes: {probes:?}", "");
     }
 }
 
@@ -284,21 +313,40 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!(" Thermal  : {}", thermal.as_str());
     println!(" Backend  : {}, Warmup: {}", args.backend, warmup);
     println!("============================================================");
+    // `--eval-ppl` on its own writes the perplexity report and stops. With
+    // `--gate` the number is attached to the benchmark reports instead, because
+    // the gate reads a `BenchmarkReport`, not a `PerplexityReport` (#100).
+    let mut ppl_value: Option<f64> = None;
     if let Some(dataset) = &args.eval_ppl {
         println!("Evaluating perplexity on dataset: {}", dataset);
-        let report = kanso_infer::bench::run_wikitext2_perplexity_eval(
+        // An absent dataset is not an error and not a fixture: it means the run
+        // has no perplexity to report, so the gate skips the row (#100).
+        match kanso_infer::bench::run_perplexity_eval(
             model_path.to_str().unwrap_or("model"),
+            dataset,
             args.ppl_stride,
-        )?;
-        let ascii_table = kanso_infer::bench::format_ascii_ppl_report(&report);
-        println!("{}", ascii_table);
+        ) {
+            Ok(report) => {
+                let ascii_table = kanso_infer::bench::format_ascii_ppl_report(&report);
+                println!("{}", ascii_table);
 
-        if let Some(json_path) = &args.json_output {
-            let json_content = serde_json::to_string_pretty(&report)?;
-            std::fs::write(json_path, json_content)?;
-            println!("Exported JSON perplexity report to {}", json_path);
+                if let Some(json_path) = &args.json_output {
+                    let json_content = serde_json::to_string_pretty(&report)?;
+                    std::fs::write(json_path, json_content)?;
+                    println!("Exported JSON perplexity report to {}", json_path);
+                }
+                if args.gate.is_none() {
+                    return Ok(());
+                }
+                ppl_value = Some(report.baseline_ppl);
+            }
+            Err(e) => {
+                eprintln!("perplexity skipped: {e}");
+                if args.gate.is_none() {
+                    return Ok(());
+                }
+            }
         }
-        return Ok(());
     }
     if let Some(trace_path) = &args.trace_file {
         let trace = if args.dataset.to_lowercase() == "sharegpt"
@@ -330,7 +378,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             args.max_running,
         )?;
 
-        let report = run_trace_benchmark(&mut engine, &trace, warmup)?;
+        let geometry = kanso_infer::bench::attention_geometry(&engine.model);
+        let report = attach_instruments(
+            run_trace_benchmark(&mut engine, &trace, warmup)?,
+            &args,
+            geometry,
+            None,
+            ppl_value,
+        );
         print_report("trace_replay", &report, args.backend);
         if let Some(json_path) = &args.json_output {
             let json_content = serde_json::to_string_pretty(&report)?;
@@ -353,14 +408,42 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(|s| s.trim().parse::<usize>())
         .collect::<Result<_, _>>()?;
 
-    println!(
-        "Running synthetic sweep: prompt_len={} gen_len={} block_size={}",
-        args.prompt_len, args.gen_len, args.block_size
-    );
+    // `--ctx-lengths 128,2048` turns the sweep into a context sweep: one report
+    // per context length at the first batch size, which is the pair
+    // `ctx_latency_ratio` reads as last/first (#100).
+    let ctx_lengths: Option<Vec<usize>> = args
+        .ctx_lengths
+        .as_deref()
+        .map(|list| {
+            list.split(',')
+                .map(|s| s.trim().parse::<usize>())
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let runs: Vec<(usize, usize)> = match &ctx_lengths {
+        Some(lengths) => lengths.iter().map(|&ctx| (batch_sizes[0], ctx)).collect(),
+        None => batch_sizes
+            .iter()
+            .map(|&batch| (batch, args.prompt_len))
+            .collect(),
+    };
+
+    if ctx_lengths.is_some() {
+        println!(
+            "Running context sweep: gen_len={} block_size={} (prompt_len is the swept context)",
+            args.gen_len, args.block_size
+        );
+    } else {
+        println!(
+            "Running synthetic sweep: prompt_len={} gen_len={} block_size={}",
+            args.prompt_len, args.gen_len, args.block_size
+        );
+    }
 
     let mut reports = Vec::new();
-    for &batch_size in &batch_sizes {
-        let max_tokens = args.prompt_len + args.gen_len;
+    let mut labels = Vec::new();
+    for &(batch_size, prompt_len) in &runs {
+        let max_tokens = prompt_len + args.gen_len;
         let mut engine = create_engine_for_workload(
             &model_path,
             args.backend,
@@ -369,18 +452,23 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             args.block_size,
             args.max_running,
         )?;
+        let geometry = kanso_infer::bench::attention_geometry(&engine.model);
 
-        let report = run_synthetic_benchmark(
-            &mut engine,
-            batch_size,
-            args.prompt_len,
-            args.gen_len,
-            warmup,
-        )?;
+        let report = attach_instruments(
+            run_synthetic_benchmark(&mut engine, batch_size, prompt_len, args.gen_len, warmup)?,
+            &args,
+            geometry,
+            ctx_lengths.as_ref().map(|_| prompt_len),
+            ppl_value,
+        );
 
-        let label = format!("batch_size={batch_size}");
+        let label = match &ctx_lengths {
+            Some(_) => format!("ctx_len={prompt_len}"),
+            None => format!("batch_size={batch_size}"),
+        };
         print_report(&label, &report, args.backend);
         reports.push(report);
+        labels.push(label);
     }
 
     if let Some(json_path) = &args.json_output {
@@ -394,13 +482,45 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     if let Some(gate_path) = &args.gate {
-        let labeled: Vec<(String, &BenchmarkReport)> = batch_sizes
-            .iter()
-            .zip(reports.iter())
-            .map(|(batch, report)| (format!("batch_size={batch}"), report))
-            .collect();
+        let labeled: Vec<(String, &BenchmarkReport)> =
+            labels.iter().cloned().zip(reports.iter()).collect();
         gate_reports(gate_path, &labeled, args.json_output.as_deref())?;
     }
 
     Ok(())
+}
+
+/// Attaches the numbers no workload figure answers: peak RSS (always), the
+/// context length this report ran, the perplexity the `--eval-ppl` pass measured,
+/// and — when `--probes` asked for them — the per-kernel / functional probes (#100).
+fn attach_instruments(
+    report: BenchmarkReport,
+    args: &Args,
+    geometry: (usize, usize),
+    context_len: Option<usize>,
+    perplexity: Option<f64>,
+) -> BenchmarkReport {
+    let mut report = report.with_peak_rss_mb(kanso_infer::hardware::get_peak_rss_mb());
+    if let Some(ctx) = context_len {
+        report = report.with_context_len(ctx);
+    }
+    if let Some(ppl) = perplexity {
+        report = report.with_perplexity_wikitext2(ppl);
+    }
+    if args.probes {
+        let sse_endpoint = args.sse_endpoint.as_deref().and_then(|endpoint| {
+            let (host, port) = endpoint.rsplit_once(':')?;
+            Some((host.to_string(), port.parse::<u16>().ok()?))
+        });
+        let probes = kanso_infer::bench::run_probes(
+            report.peak_bandwidth_gb_s,
+            geometry.0,
+            geometry.1,
+            sse_endpoint
+                .as_ref()
+                .map(|(host, port)| (host.as_str(), *port)),
+        );
+        report = report.with_probes(probes);
+    }
+    report
 }

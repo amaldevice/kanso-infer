@@ -331,10 +331,24 @@ pub const GATE_METRICS: &[&str] = &[
     "spec_speedup_ratio",
     "batch_scale_ratio",
     "ctx_latency_ratio",
+    "peak_rss_mb",
+    "perplexity_wikitext2",
+    "gemv_peak_pct",
+    "paged_attn_ctx4096_b1_over_theoretical",
+    "idle_gap_pct",
+    "sse_stream_consumed",
 ];
 
 /// Metrics that need a second report: `last / first` over the run's sweep.
 pub const GATE_RATIO_METRICS: &[&str] = &["batch_scale_ratio", "ctx_latency_ratio"];
+
+/// Metrics a dedicated probe produces; absent means the probe did not run (#100).
+pub const PROBE_METRICS: &[&str] = &[
+    "gemv_peak_pct",
+    "paged_attn_ctx4096_b1_over_theoretical",
+    "idle_gap_pct",
+    "sse_stream_consumed",
+];
 
 /// A row's number, or why it has none. `Missing` means the metric exists but
 /// this report does not carry it — a skip, never a pass.
@@ -369,6 +383,21 @@ fn metric_value(report: &BenchmarkReport, metric: &str) -> Option<f64> {
             util_pct
         }
         "spec_speedup_ratio" => report.speculative.as_ref()?.speedup_ratio?,
+        // Peak RSS is a whole-process figure every fresh run has (#100); a
+        // report from before the field carries no measurement, not a zero.
+        "peak_rss_mb" => report.peak_rss_mb?,
+        // Perplexity only exists when the run asked for it (#100).
+        "perplexity_wikitext2" => report.perplexity_wikitext2?,
+        // Probe figures: absent when the probe did not run (#100).
+        "gemv_peak_pct" => report.probes.as_ref()?.gemv_peak_pct?,
+        "paged_attn_ctx4096_b1_over_theoretical" => {
+            report
+                .probes
+                .as_ref()?
+                .paged_attn_ctx4096_b1_over_theoretical?
+        }
+        "idle_gap_pct" => report.probes.as_ref()?.idle_gap_pct?,
+        "sse_stream_consumed" => report.probes.as_ref()?.sse_stream_consumed?,
         _ => return None,
     };
     Some(value)
@@ -389,6 +418,11 @@ fn read_metric(report: &BenchmarkReport, metric: &str) -> Reading {
         },
         None if GATE_RATIO_METRICS.contains(&metric) => Reading::Missing(format!(
             "'{metric}' needs two reports (first vs last of the run)"
+        )),
+        // A probe that never ran is a skip with a reason a reader can act on,
+        // not a silent zero (#100).
+        None if PROBE_METRICS.contains(&metric) => Reading::Missing(format!(
+            "report carries no '{metric}': the probe that produces it did not run"
         )),
         None => Reading::Missing(format!("report carries no '{metric}'")),
     }
@@ -474,11 +508,8 @@ fn evaluate_with(
         let readings: Vec<Reading> = if GATE_RATIO_METRICS.contains(&row.metric.as_str()) {
             match run {
                 Some(reports) if reports.len() >= 2 => match ratio_of(reports, &row.metric) {
-                    Some(ratio) => vec![Reading::Value(ratio)],
-                    None => vec![Reading::Missing(format!(
-                        "'{}': the run's first report measured zero, so no ratio exists",
-                        row.metric
-                    ))],
+                    Ok(ratio) => vec![Reading::Value(ratio)],
+                    Err(reason) => vec![Reading::Missing(reason)],
                 },
                 _ => vec![Reading::Missing(format!(
                     "'{}' needs two reports (first vs last of the run)",
@@ -590,15 +621,55 @@ fn judge(bound: GateBound, budget: f64, measured: f64) -> GateVerdict {
     }
 }
 
-/// `last / first` for the two ratio metrics. A zero baseline cannot produce a
-/// ratio, so it reads as missing instead of infinity.
-fn ratio_of(reports: &[BenchmarkReport], metric: &str) -> Option<f64> {
+/// `last / first` for the two ratio metrics.
+///
+/// `batch_scale_ratio` reads throughput, so a zero baseline cannot produce a
+/// ratio and reads as missing instead of infinity.
+///
+/// `ctx_latency_ratio` reads a *context pair*: the run must carry two different
+/// `context_len`s, and the numerator is always the larger context. A
+/// `--batch-sizes 1,8` sweep holds the context fixed, so it has no context ratio
+/// to report; judging one would relabel batch latency as context latency. Order
+/// must not matter either: reversing the sweep cannot invert the ratio.
+fn ratio_of(reports: &[BenchmarkReport], metric: &str) -> Result<f64, String> {
     let first = &reports[0];
     let last = &reports[reports.len() - 1];
-    let (base, top) = match metric {
-        "batch_scale_ratio" => (first.total_tokens_per_sec, last.total_tokens_per_sec),
-        "ctx_latency_ratio" => (first.decode_ms_per_step, last.decode_ms_per_step),
+    match metric {
+        "batch_scale_ratio" => {
+            let (base, top) = (first.total_tokens_per_sec, last.total_tokens_per_sec);
+            if base > 0.0 {
+                Ok(top / base)
+            } else {
+                Err(format!(
+                    "'{metric}': the run's first report measured zero, so no ratio exists"
+                ))
+            }
+        }
+        "ctx_latency_ratio" => {
+            let (Some(a_ctx), Some(b_ctx)) = (first.context_len, last.context_len) else {
+                return Err(format!(
+                    "'{metric}': the run's reports carry no context_len, so there is no context pair"
+                ));
+            };
+            if a_ctx == b_ctx {
+                return Err(format!(
+                    "'{metric}': both reports ran ctx {a_ctx}, so this is not a context pair"
+                ));
+            }
+            // Larger context is always the numerator, whatever the run order.
+            let (short, long) = if a_ctx < b_ctx {
+                (first, last)
+            } else {
+                (last, first)
+            };
+            if short.decode_ms_per_step > 0.0 {
+                Ok(long.decode_ms_per_step / short.decode_ms_per_step)
+            } else {
+                Err(format!(
+                    "'{metric}': the shorter context measured zero ms/step, so no ratio exists"
+                ))
+            }
+        }
         _ => unreachable!("ratio_of is only called for GATE_RATIO_METRICS"),
-    };
-    (base > 0.0).then(|| top / base)
+    }
 }

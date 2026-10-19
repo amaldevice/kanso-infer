@@ -128,7 +128,7 @@ fn fase2_budget_declares_the_f15_rows() {
         "batch_scale_ratio",
         "ctx_latency_ratio",
         "spec_speedup_ratio",
-        "sse_sdk_stream_consumed",
+        "sse_stream_consumed",
     ] {
         assert!(
             metrics.iter().any(|m| m == expected),
@@ -166,30 +166,31 @@ fn every_not_yet_instrumented_row_names_an_owner_and_a_note() {
 /// The whole point of the two classes: an uninstrumented target is never green.
 #[test]
 fn not_yet_instrumented_rows_report_skipped_never_passed() {
-    let budget = asset_free(
-        &fase1(),
-        &["bandwidth_util_pct", "idle_gap_pct", "gemv_peak_pct"],
-    );
+    let budget = asset_free(&fase1(), &["bandwidth_util_pct", "idle_gap_pct"]);
     let outcome = evaluate_gate(&budget, &weighed_report(10.0, 200.0)).expect("gate evaluates");
 
     let idle = row(&outcome, "idle_gap_pct");
     match &idle.verdict {
         GateVerdict::Skipped(reason) => assert!(
-            reason.contains("#95"),
+            reason.contains("#101"),
             "the skip reason must point at the ticket that instruments it, got '{reason}'"
         ),
         other => panic!("idle_gap_pct must be skipped, got {other:?}"),
     }
     assert_eq!(idle.measured, None, "an unmeasured row has no number");
     assert_eq!(idle.ratio, None, "an unmeasured row has no ratio");
-    assert!(
-        matches!(
-            row(&outcome, "gemv_peak_pct").verdict,
-            GateVerdict::Skipped(_)
+
+    // A probe row whose probe did not run is skipped with a reason, not zeroed.
+    let probe_free = asset_free(&fase1(), &["gemv_peak_pct"]);
+    let probe_outcome =
+        evaluate_gate(&probe_free, &weighed_report(10.0, 200.0)).expect("gate evaluates");
+    match &row(&probe_outcome, "gemv_peak_pct").verdict {
+        GateVerdict::Skipped(reason) => assert!(
+            reason.contains("probe"),
+            "a probe that did not run must say so, got '{reason}'"
         ),
-        "gemv_peak_pct must be skipped until #95 instruments it:\n{}",
-        outcome.format_table()
-    );
+        other => panic!("gemv_peak_pct must be skipped without --probes, got {other:?}"),
+    }
 
     // The measured row in the same budget is still judged on its merits.
     assert_eq!(
@@ -200,46 +201,54 @@ fn not_yet_instrumented_rows_report_skipped_never_passed() {
     assert_eq!(outcome.code(), 1, "a violation outranks the skips");
 }
 
-/// Every F12 target that has no instrumentation behind it is declared as such.
+/// Every F12 row that has instrumentation behind it is declared measured, and
+/// the one that needs hardware this crate cannot reach says so (#100).
 #[test]
-fn fase1_declares_the_uninstrumented_f12_targets() {
+fn fase1_declares_which_f12_rows_are_measurable_today() {
     let budget = fase1();
     for metric in [
         "gemv_peak_pct",
         "paged_attn_ctx4096_b1_over_theoretical",
-        "idle_gap_pct",
         "peak_rss_mb",
         "perplexity_wikitext2",
+        "bandwidth_util_pct",
     ] {
         assert_eq!(
             row_in(&budget, metric).status,
-            GateRowStatus::NotYetInstrumented,
-            "'{metric}' must be declared not-yet-instrumented, not judged from a number nobody measures"
+            GateRowStatus::Measured,
+            "'{metric}' has a report field behind it, so it is judged from that number"
         );
     }
+    // idle_gap_pct needs a Metal command-buffer timestamp the `metal` binding
+    // does not expose; the row must stay a declared target, with the reason.
+    let idle = row_in(&budget, "idle_gap_pct");
     assert_eq!(
-        row_in(&budget, "bandwidth_util_pct").status,
-        GateRowStatus::Measured,
-        "bandwidth_util_pct is derived from the report's weighed bytes"
+        idle.status,
+        GateRowStatus::NotYetInstrumented,
+        "'idle_gap_pct' must not be judged from a proxy"
     );
+    let note = idle.note.as_deref().unwrap_or_default();
+    assert!(
+        note.contains("Metal") && note.contains("timestamp"),
+        "the row must name the hardware it needs, got '{note}'"
+    );
+    assert_eq!(idle.owner.as_deref(), Some("#101"));
 }
 
 /// F15's measured rows are the ones a real run can actually fill today.
 #[test]
 fn fase2_declares_which_f15_rows_are_measurable_today() {
     let budget = fase2();
-    for metric in ["batch_scale_ratio", "spec_speedup_ratio"] {
+    for metric in [
+        "batch_scale_ratio",
+        "spec_speedup_ratio",
+        "ctx_latency_ratio",
+        "sse_stream_consumed",
+    ] {
         assert_eq!(
             row_in(&budget, metric).status,
             GateRowStatus::Measured,
-            "'{metric}' is read straight off the report a real run writes"
-        );
-    }
-    for metric in ["ctx_latency_ratio", "sse_sdk_stream_consumed"] {
-        assert_eq!(
-            row_in(&budget, metric).status,
-            GateRowStatus::NotYetInstrumented,
-            "'{metric}' has no bench path producing it yet"
+            "'{metric}' has a bench path producing it (#100)"
         );
     }
 }
@@ -301,14 +310,14 @@ fn asset_rows_are_skipped_not_passed_when_the_gguf_is_absent() {
             other => panic!("'{metric}' must not be {other:?} without the GGUF"),
         }
     }
-    // `sse_sdk_stream_consumed` has no asset requirement, so the asset check
-    // does not skip it — but nothing measures it yet, so it is skipped too.
-    match &row(&outcome, "sse_sdk_stream_consumed").verdict {
+    // `sse_stream_consumed` has no asset requirement, so the asset check does
+    // not skip it — but the report carries no probe result, so it is skipped too.
+    match &row(&outcome, "sse_stream_consumed").verdict {
         GateVerdict::Skipped(reason) => assert!(
-            reason.contains("not yet instrumented"),
-            "the SDK stream row must say it is not instrumented, got '{reason}'"
+            reason.contains("probe") || reason.contains("not yet instrumented"),
+            "the SDK stream row must say why it has no number, got '{reason}'"
         ),
-        other => panic!("sse_sdk_stream_consumed must not be {other:?}"),
+        other => panic!("sse_stream_consumed must not be {other:?}"),
     }
     assert_eq!(outcome.code(), 2, "no GGUF means exit 2, never 0");
     assert!(!outcome.passed());
@@ -384,7 +393,11 @@ fn batch_scale_ratio_is_last_report_over_first() {
 #[test]
 fn ctx_latency_ratio_compares_the_last_step_to_the_first() {
     let budget = forced_measured(&fase2(), &["ctx_latency_ratio"]);
-    let run = vec![weighed_report(5.0, 100.0), weighed_report(7.0, 100.0)];
+    // A real context pair: the run must say which context each report ran (#100).
+    let run = vec![
+        weighed_report(5.0, 100.0).with_context_len(128),
+        weighed_report(7.0, 100.0).with_context_len(2048),
+    ];
     let outcome = evaluate_gate_run(&budget, &run).expect("gate evaluates");
 
     let ratio = row(&outcome, "ctx_latency_ratio");
