@@ -116,6 +116,48 @@ fn test_is_metal_runtime_gap_matches_only_the_capability_prefix() {
     }
 }
 
+/// Ticket #99: `metal_device()` gates on the Darwin release (MTLResidencySet
+/// needs macOS 15+), so the parsing feeding that gate must be pinned down
+/// without needing a macOS 14 host.
+#[test]
+fn test_parse_darwin_major_releases() {
+    use kanso_infer::hardware::parse_darwin_major;
+
+    for (release, want) in [
+        ("14.2.1", 14),
+        ("15.0", 15),
+        ("23.6.0", 23),
+        ("27.0", 27),
+        ("15", 15),
+    ] {
+        assert_eq!(
+            parse_darwin_major(release),
+            Some(want),
+            "parse release {release:?}"
+        );
+    }
+    // Unparseable releases must fail closed: unknown version => no Metal.
+    assert_eq!(parse_darwin_major("unknown"), None);
+    assert_eq!(parse_darwin_major(""), None);
+}
+
+/// This host is macOS 27 (class present), so the version gate must admit it.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_macos_host_passes_the_residency_set_version_gate() {
+    use kanso_infer::hardware::{macos_has_residency_set_class, macos_major_version};
+
+    let major = macos_major_version().expect("uname release must parse on macOS");
+    assert!(
+        major >= 15,
+        "this machine is expected to have the class (macOS 15+), got major {major}"
+    );
+    assert!(
+        macos_has_residency_set_class(),
+        "macOS {major} must pass the residency-set version gate"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn test_metal_cpu_parity_mock() {

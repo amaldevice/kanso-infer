@@ -104,6 +104,18 @@ pub const METAL_RUNTIME_GAP_PREFIX: &str = "metal runtime lacks a required class
 pub fn metal_device() -> Result<Device, crate::error::EngineError> {
     #[cfg(target_os = "macos")]
     {
+        // Ticket #99: `MTLResidencySetDescriptor` exists only since macOS 15 (Metal
+        // 3.2), and candle calls `MTLResidencySetDescriptor::new()` during
+        // `Device::new_metal(0)`. objc2 panics when the class is absent (the
+        // `macos-14` CI runner is macOS 14.x), so the OS version is a deterministic
+        // gate: below 15 we report the gap WITHOUT ever touching candle, meaning no
+        // panic can occur at all. The `catch_unwind` below stays as a second layer.
+        if !macos_has_residency_set_class() {
+            return Err(crate::error::EngineError::Metal(format!(
+                "{METAL_RUNTIME_GAP_PREFIX}: macOS {} lacks MTLResidencySetDescriptor (needs 15+)",
+                macos_major_version().map_or_else(|| "unknown".to_string(), |v| v.to_string())
+            )));
+        }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Device::new_metal(0))) {
             Ok(Ok(device)) => Ok(device),
             Ok(Err(e)) => Err(e.into()),
@@ -134,6 +146,36 @@ pub fn is_metal_runtime_gap(err: &crate::error::EngineError) -> bool {
         crate::error::EngineError::Metal(msg) => msg.starts_with(METAL_RUNTIME_GAP_PREFIX),
         _ => false,
     }
+}
+
+/// Parses the major version out of a Darwin `uname -r` release string
+/// (e.g. `"14.2.1"` → `Some(14)`, `"unknown"` → `None`).
+pub fn parse_darwin_major(release: &str) -> Option<u32> {
+    release.split('.').next()?.parse().ok()
+}
+
+/// Major macOS version from `uname`, or `None` when it cannot be read/parsed.
+#[cfg(target_os = "macos")]
+pub fn macos_major_version() -> Option<u32> {
+    unsafe {
+        let mut buf: libc::utsname = std::mem::zeroed();
+        if libc::uname(&mut buf) != 0 {
+            return None;
+        }
+        let release = std::ffi::CStr::from_ptr(buf.release.as_ptr())
+            .to_string_lossy()
+            .into_owned();
+        parse_darwin_major(&release)
+    }
+}
+
+/// Whether this macOS has the Metal classes candle requires (ticket #99).
+/// `MTLResidencySet` ships with macOS 15; anything older (including the
+/// `macos-14` CI runner) cannot create a candle Metal device at all.
+/// Unknown version → `false` (skip rather than crash).
+#[cfg(target_os = "macos")]
+pub fn macos_has_residency_set_class() -> bool {
+    matches!(macos_major_version(), Some(v) if v >= 15)
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
