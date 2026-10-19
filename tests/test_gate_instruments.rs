@@ -515,3 +515,102 @@ fn an_absent_perplexity_dataset_leaves_the_row_skipped() {
         "an absent dataset must skip, got {verdict:?}"
     );
 }
+
+/// B7: `peak_rss_mb` must come from the process, not from a default. The figure
+/// is read by `get_peak_rss_mb()` and is strictly positive for a live process.
+#[test]
+fn the_report_carries_the_process_rss_it_measured() {
+    let live = kanso_infer::hardware::get_peak_rss_mb();
+    assert!(
+        live > 0.0,
+        "a running process has resident memory, got {live}"
+    );
+
+    let report = weighed_report(10.0);
+    let carried = report.peak_rss_mb.expect("a fresh report carries its RSS");
+    assert!(
+        carried > 0.0,
+        "the report must carry the measured RSS, not a zero: {carried}"
+    );
+    // The report is built from the same process, so it cannot be wildly off.
+    assert!(
+        carried >= live * 0.5,
+        "the carried RSS ({carried}) should track the live process ({live})"
+    );
+}
+
+/// B7: the perplexity field is filled by the harness that computes it, not by a
+/// literal. `--eval-ppl` on the bundled slice must produce a finite PPL.
+#[test]
+fn the_perplexity_harness_fills_the_field_it_reports() {
+    let tokens = kanso_infer::bench::resolve_perplexity_dataset("wikitext2")
+        .expect("the bundled slice resolves");
+    let ppl = kanso_infer::bench::calculate_perplexity(
+        &kanso_infer::model::Model::create_mock_tiny(64, 4, 2, 2, 256).expect("mock model"),
+        &tokens,
+        512,
+    )
+    .expect("perplexity computes on the bundled slice");
+
+    assert!(ppl > 0.0, "a perplexity is above zero, got {ppl}");
+    assert!(ppl.is_finite(), "a perplexity is finite, got {ppl}");
+
+    // The same number is what the report carries when the run attaches it.
+    let report = weighed_report(10.0).with_perplexity_wikitext2(ppl);
+    assert_eq!(report.perplexity_wikitext2, Some(ppl));
+}
+
+/// B7: the SSE probe must open a real stream and consume it to `[DONE]`. This
+/// spins up the actual router on a loopback port, so the probe is exercised
+/// against a server rather than against a fixture.
+#[test]
+fn the_sse_probe_consumes_a_real_stream_from_a_live_server() {
+    use kanso_infer::bench::probe_sse_stream_consumed;
+    use kanso_infer::engine::Engine;
+    use kanso_infer::model::Model;
+    use kanso_infer::tokenizer::TokenizerWrapper;
+
+    let Ok(tokenizer) = TokenizerWrapper::resolve(None, None) else {
+        panic!("the repo ships tokenizer.json, so the harness can run");
+    };
+    let vocab = tokenizers::Tokenizer::from_file("tokenizer.json")
+        .expect("repo tokenizer.json")
+        .get_vocab_size(true);
+    let model = Model::create_mock_tiny(16, 2, 1, 1, vocab).expect("mock model");
+    let engine = Engine::new(model, 8, 32, 16).expect("engine");
+    let app = kanso_infer::server::create_app(engine, tokenizer);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    let (port, server) = runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let port = listener.local_addr().expect("local addr").port();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (port, handle)
+    });
+
+    let consumed = probe_sse_stream_consumed("127.0.0.1", port);
+    server.abort();
+    drop(runtime);
+
+    assert_eq!(
+        consumed,
+        Some(1.0),
+        "a live server streams chat.completion.chunk frames to [DONE], so the probe reads 1.0"
+    );
+
+    // A port nobody is listening on is a probe that could not run: `None`, never 0.
+    assert_eq!(
+        probe_sse_stream_consumed("127.0.0.1", 1),
+        None,
+        "no server means no stream to judge, not a failed one"
+    );
+}
