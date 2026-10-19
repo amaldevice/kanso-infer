@@ -180,13 +180,15 @@ pub const FEATURES: &[FeatureSpec] = &[
         wired: None,
     },
     FeatureSpec {
-        // Ticket #88: `Engine::new_with_budget_and_kv` picks the pool; `KvStorageKind` is
-        // the one seam the decode path reads through. F32 stays the default, and Metal
-        // refuses INT8/FP8 with an `Err` (its paged-attention kernel reads an F32 pool),
-        // so the wired claim covers the CPU/AMX backends that actually serve it.
+        // Ticket #88: `--kv-type f32|int8|fp8` is the user-facing selection, parsed into
+        // `KvCacheType` and plumbed through `build_engine` to
+        // `Engine::new_with_budget_and_kv`; `KvStorageKind` is the one seam the decode
+        // path reads through. F32 stays the default, and Metal refuses INT8/FP8 with an
+        // `Err` (its paged-attention kernel reads an F32 pool), so the wired claim covers
+        // the CPU/AMX backends that actually serve it.
         name: "Quantized (INT8/FP8) paged KV cache",
         status: FeatureStatus::Wired,
-        exec_pointer: "src/kv_cache/kind.rs src/kv_cache/quantized_storage.rs",
+        exec_pointer: "src/kv_cache/kind.rs src/kv_cache/quantized_storage.rs src/main.rs",
         wired: wired!(
             crate::engine::Engine::new_with_budget_and_kv,
             crate::kv_cache::KvStorageKind::quantized

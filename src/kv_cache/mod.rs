@@ -7,7 +7,7 @@ pub mod storage;
 
 pub use block_pool::BlockPool;
 pub use block_table::BlockTable;
-pub use kind::{KvSlotPlan, KvStorageKind, PaddedBatch};
+pub use kind::{KvCacheType, KvSlotPlan, KvStorageKind, PaddedBatch};
 pub use prefix_cache::PrefixCache;
 pub use quantized_storage::{QuantMode, QuantType, QuantizedKvBlock, QuantizedKvStorage};
 pub use storage::KvStorage;

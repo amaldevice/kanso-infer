@@ -5,6 +5,7 @@ use kanso_infer::bench::create_engine_for_model_profile;
 use kanso_infer::chat::ChatSession;
 use kanso_infer::engine::Engine;
 use kanso_infer::error::EngineError;
+use kanso_infer::kv_cache::KvCacheType;
 use kanso_infer::model::Model;
 use kanso_infer::server::create_app;
 
@@ -17,6 +18,7 @@ fn build_engine(
     context_tokens: usize,
     requests: usize,
     min_blocks: usize,
+    kv_type: KvCacheType,
 ) -> Engine {
     let per_sequence = context_tokens.div_ceil(block_size);
     let total_blocks = per_sequence
@@ -24,7 +26,14 @@ fn build_engine(
         .map(|total| total.max(min_blocks));
 
     let built = match total_blocks {
-        Some(blocks) => Engine::new(model, max_running, blocks, block_size),
+        Some(blocks) => Engine::new_with_budget_and_kv(
+            model,
+            max_running,
+            blocks,
+            block_size,
+            usize::MAX,
+            kv_type.mode(),
+        ),
         None => Err(EngineError::Config(format!(
             "cannot size the KV pool: {context_tokens} context tokens x {requests} requests exceeds the addressable size"
         ))),
@@ -60,9 +69,15 @@ enum Commands {
         #[arg(short, long)]
         model: String,
 
-        /// Hardware backend: cpu, metal, amx. `neon` parses but errors: its hand-written\n        /// kernels are not wired to the packed-weight decode path (ticket #89).
+        /// Hardware backend: cpu, metal, amx. `neon` parses but errors: its
+        /// hand-written kernels are not wired to the packed-weight decode path (ticket #89).
         #[arg(long, default_value_t = kanso_infer::Backend::default())]
         backend: kanso_infer::Backend,
+
+        /// KV cache type: f32 (default), int8 or fp8. The quantized pools are
+        /// host-side only: `metal` refuses them at startup (ticket #88).
+        #[arg(long, default_value_t = kanso_infer::kv_cache::KvCacheType::default())]
+        kv_type: kanso_infer::kv_cache::KvCacheType,
 
         /// Maximum tokens to generate
         #[arg(long, default_value_t = 32)]
@@ -91,9 +106,15 @@ enum Commands {
         #[arg(short, long)]
         model: String,
 
-        /// Hardware backend: cpu, metal, amx. `neon` parses but errors: its hand-written\n        /// kernels are not wired to the packed-weight decode path (ticket #89).
+        /// Hardware backend: cpu, metal, amx. `neon` parses but errors: its
+        /// hand-written kernels are not wired to the packed-weight decode path (ticket #89).
         #[arg(long, default_value_t = kanso_infer::Backend::default())]
         backend: kanso_infer::Backend,
+
+        /// KV cache type: f32 (default), int8 or fp8. The quantized pools are
+        /// host-side only: `metal` refuses them at startup (ticket #88).
+        #[arg(long, default_value_t = kanso_infer::kv_cache::KvCacheType::default())]
+        kv_type: kanso_infer::kv_cache::KvCacheType,
 
         /// Optional custom system prompt
         #[arg(long, default_value = "You are a helpful and concise assistant.")]
@@ -118,9 +139,15 @@ enum Commands {
         #[arg(short, long)]
         model: String,
 
-        /// Hardware backend: cpu, metal, amx. `neon` parses but errors: its hand-written\n        /// kernels are not wired to the packed-weight decode path (ticket #89).
+        /// Hardware backend: cpu, metal, amx. `neon` parses but errors: its
+        /// hand-written kernels are not wired to the packed-weight decode path (ticket #89).
         #[arg(long, default_value_t = kanso_infer::Backend::default())]
         backend: kanso_infer::Backend,
+
+        /// KV cache type: f32 (default), int8 or fp8. The quantized pools are
+        /// host-side only: `metal` refuses them at startup (ticket #88).
+        #[arg(long, default_value_t = kanso_infer::kv_cache::KvCacheType::default())]
+        kv_type: kanso_infer::kv_cache::KvCacheType,
 
         /// Path to tokenizer.json (optional, auto-resolved from working directory or HF cache)
         #[arg(long)]
@@ -148,7 +175,8 @@ enum Commands {
         #[arg(long, default_value_t = 64)]
         gen_len: usize,
 
-        /// Hardware backend: cpu, metal, amx. `neon` parses but errors: its hand-written\n        /// kernels are not wired to the packed-weight decode path (ticket #89).
+        /// Hardware backend: cpu, metal, amx. `neon` parses but errors: its
+        /// hand-written kernels are not wired to the packed-weight decode path (ticket #89).
         #[arg(long, default_value_t = kanso_infer::Backend::default())]
         backend: kanso_infer::Backend,
 
@@ -195,6 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             prompt,
             model,
             backend,
+            kv_type,
             max_tokens,
             tokenizer,
             temperature,
@@ -223,7 +252,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, device)?;
             model_instance.set_backend(backend);
             let context_tokens = 128usize.saturating_add(max_tokens);
-            let mut engine = build_engine(model_instance, 8, 16, context_tokens, prompt.len(), 32);
+            let mut engine = build_engine(
+                model_instance,
+                8,
+                16,
+                context_tokens,
+                prompt.len(),
+                32,
+                kv_type,
+            );
 
             let tok_wrapper = kanso_infer::tokenizer::TokenizerWrapper::resolve(
                 tokenizer.as_deref(),
@@ -300,6 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Chat {
             model,
             backend,
+            kv_type,
             system,
             max_tokens,
             tokenizer,
@@ -328,7 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, device)?;
             model_instance.set_backend(backend);
             let context_tokens = 256usize.saturating_add(max_tokens);
-            let engine = build_engine(model_instance, 4, 16, context_tokens, 4, 64);
+            let engine = build_engine(model_instance, 4, 16, context_tokens, 4, 64, kv_type);
             let tok_wrapper = kanso_infer::tokenizer::TokenizerWrapper::resolve(
                 tokenizer.as_deref(),
                 Some(&resolved_path),
@@ -383,6 +421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             port,
             model,
             backend,
+            kv_type,
             tokenizer,
         } => {
             println!(
@@ -406,7 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
             let mut model_instance = kanso_infer::model::Model::load_gguf(&resolved_path, device)?;
             model_instance.set_backend(backend);
-            let engine = build_engine(model_instance, 8, 16, 128, 1, 128);
+            let engine = build_engine(model_instance, 8, 16, 128, 1, 128, kv_type);
 
             // #46: the server tokenizes and detokenizes with the real tokenizer, so a
             // missing one is a startup failure rather than silently wrong text.

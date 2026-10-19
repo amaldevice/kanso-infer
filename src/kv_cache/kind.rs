@@ -13,11 +13,64 @@
 //! over with a silent fallback.
 
 use candle_core::{DType, Device, IndexOp, Tensor};
+use serde::{Deserialize, Serialize};
 
 use crate::error::EngineError;
 use crate::kv_cache::block_table::BlockTable;
 use crate::kv_cache::quantized_storage::{QuantMode, QuantizedKvStorage};
 use crate::kv_cache::storage::KvStorage;
+
+/// The KV cache type a user selects (`--kv-type`), and what `Engine` builds from it
+/// (ticket #88).
+///
+/// This is the user-facing half of the [`KvStorageKind`] seam: without it the
+/// quantized pool was reachable only from tests, so the feature registry could not
+/// honestly call it wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KvCacheType {
+    /// Full-precision pool: the default and the pre-#88 behaviour.
+    #[default]
+    F32,
+    Int8,
+    Fp8,
+}
+
+impl KvCacheType {
+    /// The quantization mode to build, or `None` for the F32 pool.
+    pub fn mode(&self) -> Option<QuantMode> {
+        match self {
+            Self::F32 => None,
+            Self::Int8 => Some(QuantMode::Int8),
+            Self::Fp8 => Some(QuantMode::Fp8),
+        }
+    }
+}
+
+impl std::fmt::Display for KvCacheType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::F32 => "f32",
+            Self::Int8 => "int8",
+            Self::Fp8 => "fp8",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl std::str::FromStr for KvCacheType {
+    type Err = EngineError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "f32" => Ok(Self::F32),
+            "int8" => Ok(Self::Int8),
+            "fp8" => Ok(Self::Fp8),
+            other => Err(EngineError::Config(format!(
+                "unknown kv type '{other}' (expected one of: f32, int8, fp8)"
+            ))),
+        }
+    }
+}
 
 /// The block geometry of a pure-decode batch, padded to the batch's longest table
 /// (ticket #61 F11 / #88): both pools read it, one as a device index, one as a walk.
