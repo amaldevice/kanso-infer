@@ -147,6 +147,30 @@ impl KvSlotPlan {
     }
 }
 
+/// The shape of a KV pool: block geometry plus the per-token head layout.
+///
+/// The same four fields on both pools, bundled because they are always needed
+/// together — a slot index, a byte count and a kernel dispatch all read at least two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvGeometry {
+    pub block_size: usize,
+    pub num_blocks: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+}
+
+impl KvGeometry {
+    /// Pool rows addressable across all blocks.
+    pub fn rows(&self) -> usize {
+        self.num_blocks * self.block_size
+    }
+
+    /// Floats in one `[n_kv_heads, head_dim]` row.
+    pub fn row_elems(&self) -> usize {
+        self.n_kv_heads * self.head_dim
+    }
+}
+
 /// The KV pool the decode path writes and reads, chosen once per engine.
 #[derive(Debug, Clone)]
 pub enum KvStorageKind {
@@ -198,32 +222,42 @@ impl KvStorageKind {
         }
     }
 
-    pub fn block_size(&self) -> usize {
+    /// The four numbers every pool shares, read from whichever variant holds them.
+    ///
+    /// They travel together everywhere (`KvSlotPlan`, `PaddedBatch`, the kernel's
+    /// `PagedAttentionParams`, the byte accounting), so they are one value rather than
+    /// four two-arm matches that have to agree.
+    pub fn geometry(&self) -> KvGeometry {
         match self {
-            Self::F32(kv) => kv.block_size,
-            Self::Quantized(q) => q.block_size,
+            Self::F32(kv) => KvGeometry {
+                block_size: kv.block_size,
+                num_blocks: kv.num_blocks,
+                n_kv_heads: kv.n_kv_heads,
+                head_dim: kv.head_dim,
+            },
+            Self::Quantized(q) => KvGeometry {
+                block_size: q.block_size,
+                num_blocks: q.num_blocks,
+                n_kv_heads: q.n_kv_heads,
+                head_dim: q.head_dim,
+            },
         }
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.geometry().block_size
     }
 
     pub fn num_blocks(&self) -> usize {
-        match self {
-            Self::F32(kv) => kv.num_blocks,
-            Self::Quantized(q) => q.num_blocks,
-        }
+        self.geometry().num_blocks
     }
 
     pub fn n_kv_heads(&self) -> usize {
-        match self {
-            Self::F32(kv) => kv.n_kv_heads,
-            Self::Quantized(q) => q.n_kv_heads,
-        }
+        self.geometry().n_kv_heads
     }
 
     pub fn head_dim(&self) -> usize {
-        match self {
-            Self::F32(kv) => kv.head_dim,
-            Self::Quantized(q) => q.head_dim,
-        }
+        self.geometry().head_dim
     }
 
     /// The F32 pool, for the one consumer that needs the raw device buffer: the Metal
@@ -260,7 +294,7 @@ impl KvStorageKind {
 
     /// The F32 pool's bytes per token for this pool's geometry.
     pub fn f32_bytes_per_token(&self) -> usize {
-        2 * self.n_kv_heads() * self.head_dim() * std::mem::size_of::<f32>()
+        2 * self.geometry().row_elems() * std::mem::size_of::<f32>()
     }
 
     /// How many times smaller this pool is than the F32 pool (`1.0` for F32 itself).
