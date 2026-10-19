@@ -330,4 +330,5 @@ Reported metrics:
 - **Throughput**: Total tokens/s and per-request tokens/s.
 - **Latency**: Mean/max/p50/p90 Time-to-First-Token (TTFT), p50/p90/p99 Inter-Token Latency (ITL), decode ms/step, and per-token decode latency (ms/token).
 - **Traceable Bus Utilization**: Derived from resident model weight bytes plus active KV cache bytes summed across sequences, evaluated against host DRAM bandwidth measured via the STREAM-triad microbench.
+  **Debt (#82 D1):** the byte total is one number — it does not say how many of those bytes are KV, and nothing in the report distinguishes an F32 pool from an INT8/FP8 one. The memory saving quantized KV buys is therefore asserted only in `tests/test_quantized_kv_engine.rs` (`memory_ratio_vs_f32`), not reported by `bench`.
 - **Determinism**: 64-bit FNV-1a checksums over generated tokens to verify greedy output parity.
