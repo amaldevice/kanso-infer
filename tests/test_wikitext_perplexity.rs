@@ -147,19 +147,40 @@ fn test_backend_perplexity_parity_cpu_amx_neon_metal() {
     assert_eq!(report.dataset, "wikitext2");
     assert!(report.baseline_ppl > 0.0);
 
-    let backends = ["cpu", "amx", "neon", "metal"];
+    // Ticket #89: `neon` must be reported as *not run*, never as a number that
+    // is secretly the CPU path. The remaining backends must be measured.
+    let neon = report
+        .backends
+        .iter()
+        .find(|x| x.backend == kanso_infer::Backend::Neon)
+        .expect("neon row must still be present in the report");
+    assert!(
+        neon.perplexity.is_none(),
+        "neon must not report a measured PPL (that would be the CPU path), got {:?}",
+        neon.perplexity
+    );
+    assert!(
+        neon.skipped_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("not wired")),
+        "neon row must carry the reason it was skipped, got {:?}",
+        neon.skipped_reason
+    );
+
+    let backends = ["cpu", "amx", "metal"];
     for name in &backends {
         let b = report
             .backends
             .iter()
             .find(|x| x.backend.to_string().eq_ignore_ascii_case(name))
             .unwrap_or_else(|| panic!("backend {} missing in report", name));
+        let ppl = b.perplexity.expect("measured backend must carry a PPL");
 
         assert!(
-            b.delta_vs_fp32.abs() < 0.01,
+            (ppl - report.baseline_ppl).abs() < 0.01,
             "Backend {} Delta PPL {} exceeds 0.01 parity threshold",
             name,
-            b.delta_vs_fp32
+            (ppl - report.baseline_ppl).abs()
         );
     }
 }
@@ -218,4 +239,53 @@ fn test_perplexity_report_ascii_and_json_serialization() {
     assert_eq!(deserialized.dataset, "wikitext2");
     assert_eq!(deserialized.backends.len(), 4);
     assert_eq!(deserialized.quantized_evals.len(), 3);
+}
+
+/// Legacy reports (pre-#92) wrote `backend` as a **PascalCase** string.
+///
+/// `Backend` on `origin/main` derived `Serialize` with no `rename_all`, so
+/// `Backend::Cpu` went to disk as `"Cpu"` — not `"cpu"`. Ticket #92 pinned the wire
+/// form to lowercase and kept the old spelling as `#[serde(alias = "Cpu")]`, which
+/// is the compatibility that actually has to hold: every archived report on disk
+/// carries the PascalCase spelling.
+///
+/// An earlier version of this test asserted `"cpu"`, a form `main` never produced;
+/// it proved nothing. This one round-trips the real historical spelling.
+#[test]
+fn test_legacy_pascalcase_backend_report_still_deserializes() {
+    let legacy = r#"{
+        "dataset": "wikitext2",
+        "num_tokens": 64,
+        "stride": 32,
+        "baseline_ppl": 12.5,
+        "backends": [
+            {"backend": "Cpu", "perplexity": 12.5, "delta_vs_fp32": 0.0},
+            {"backend": "Amx", "perplexity": 12.6, "delta_vs_fp32": 0.1}
+        ],
+        "quantized_evals": [],
+        "delta_threshold": 0.15,
+        "all_passed": true
+    }"#;
+    let report: PerplexityReport =
+        serde_json::from_str(legacy).expect("a report written by main must still deserialize");
+    assert_eq!(report.backends.len(), 2);
+    assert_eq!(report.backends[0].backend, kanso_infer::Backend::Cpu);
+    assert_eq!(report.backends[1].backend, kanso_infer::Backend::Amx);
+
+    // New reports write the pinned lowercase wire form; the old one still reads.
+    let json = serde_json::to_string(&report).expect("serialize");
+    assert!(json.contains("\"backend\":\"cpu\""), "got: {json}");
+    let round_trip: PerplexityReport =
+        serde_json::from_str(&json).expect("the new wire form reads back");
+    assert_eq!(round_trip.backends[0].backend, kanso_infer::Backend::Cpu);
+}
+
+/// The lowercase form #92 pinned must read too, so a report written by this branch
+/// is readable by this branch and by anything that adopted the pinned form early.
+#[test]
+fn test_pinned_lowercase_backend_report_deserializes() {
+    let pinned = r#"{"backend": "cpu", "perplexity": 12.5, "delta_vs_fp32": 0.0}"#;
+    let entry: kanso_infer::bench::BackendPpl =
+        serde_json::from_str(pinned).expect("lowercase backend must deserialize");
+    assert_eq!(entry.backend, kanso_infer::Backend::Cpu);
 }

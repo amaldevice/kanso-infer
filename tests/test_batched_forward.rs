@@ -1,15 +1,14 @@
 //! Ticket #45 acceptance: continuous batching must be ONE batched forward per
 //! `step()`, not a per-sequence loop over batch-1 forwards.
 //!
-//! Scoped to the serving path (ticket #61 F3): `forward_batch_calls` counts
-//! `forward_batch`, which is what `Engine::step` runs. Speculative traffic
-//! (`SpeculativeEngine`) verifies through `forward_verify_tokens` and spends one draft
-//! `forward_decode_step` per proposal, so its forwards are deliberately outside this
-//! claim and outside the counter.
+//! Scoped to `Engine::step`: `forward_batch_calls` counts
+//! `forward_batch`, which is what `Engine::step` runs. Speculative verification rides the
+//! same batched forward since ticket #90 (see `test_speculative_batched_verify`); the draft
+//! still spends one `forward_decode_step` per proposal on its own cache.
 
 use candle_core::{IndexOp, Tensor};
 use kanso_infer::engine::Engine;
-use kanso_infer::kv_cache::{BlockTable, KvStorage};
+use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
 use kanso_infer::model::Model;
 
 /// Every sequence in a step — decode tokens and prefill chunks alike — must ride
@@ -54,7 +53,7 @@ fn test_one_forward_call_per_step_regardless_of_batch() {
 fn test_batched_forward_matches_per_sequence_reference() {
     let model = Model::create_mock_tiny(16, 4, 2, 2, 50).unwrap();
     let kv = |blocks: usize| {
-        KvStorage::new(
+        KvStorageKind::f32_new(
             model.config.num_hidden_layers,
             blocks,
             model.config.block_size,

@@ -4,10 +4,17 @@ use serde::{Deserialize, Serialize};
 /// Execution backend selected via `--backend`. Parsed once by clap;
 /// an unknown string fails CLI parsing instead of silently running CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Backend {
+    // PascalCase aliases keep any report serialized before the wire form was
+    // pinned to lowercase (ticket #92) readable.
+    #[serde(alias = "Cpu")]
     Cpu,
+    #[serde(alias = "Metal")]
     Metal,
+    #[serde(alias = "Neon")]
     Neon,
+    #[serde(alias = "Amx")]
     Amx,
 }
 
@@ -51,8 +58,18 @@ impl std::str::FromStr for Backend {
 
 impl Backend {
     /// Resolves the candle device this backend really executes on.
-    /// Metal goes to the GPU via `Device::new_metal(0)`; every other
-    /// backend runs on CPU (NEON/AMX are CPU SIMD paths).
+    /// Metal goes to the GPU via `Device::new_metal(0)`; `cpu` and `amx` run on
+    /// CPU (`amx` because the AMX/Accelerate GEMM path lives there).
+    ///
+    /// `neon` deliberately returns an error (ticket #89). The hand-written kernels
+    /// in `src/quant/neon.rs` take `&[BlockQ8_0]` / `&[BlockQ4_K]` with f32
+    /// scales, but the production `LinearWeight` keeps candle's blocks, whose
+    /// scales are f16 (34 B vs 36 B for Q8_0). The packed layout cannot be read in
+    /// place, and repacking every weight per token would cost more bandwidth than
+    /// the kernel saves. Before this, `neon` resolved to `Device::Cpu` and ran
+    /// candle's CPU matmul while the banner said "neon" — the same placebo
+    /// `--backend metal` was before #42. Refusing is the honest answer until the
+    /// kernels are wired to the packed production layout.
     pub fn device(&self) -> Result<Device, crate::error::EngineError> {
         match self {
             Self::Metal => {
@@ -67,7 +84,15 @@ impl Backend {
                     ))
                 }
             }
-            Self::Cpu | Self::Neon | Self::Amx => Ok(Device::Cpu),
+            Self::Neon => Err(crate::error::EngineError::Config(
+                "backend 'neon' is not available: the hand-written NEON Q8_0/Q4_K kernels \
+                 (src/quant/neon.rs) are not wired to the packed LinearWeight blocks, so this \
+                 backend would silently run the same candle CPU matmul as '--backend cpu'. \
+                 Use '--backend cpu' (or '--backend amx') instead; NEON kernel coverage lives in \
+                 the perplexity bench, not the decode path."
+                    .to_string(),
+            )),
+            Self::Cpu | Self::Amx => Ok(Device::Cpu),
         }
     }
 }

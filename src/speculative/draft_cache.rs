@@ -1,5 +1,5 @@
 use crate::error::EngineError;
-use crate::kv_cache::{BlockPool, BlockTable, KvStorage};
+use crate::kv_cache::{BlockPool, BlockTable, KvStorageKind};
 use crate::model::Model;
 use crate::sampler::{greedy_token, sample_from_probs, softmax_probs};
 use crate::scheduler::SamplingParams;
@@ -22,7 +22,7 @@ pub struct Proposals {
 /// advances one `forward_decode_step` per proposal, and the cache is truncated when the
 /// target rejects proposals.
 pub struct DraftCache {
-    storage: KvStorage,
+    storage: KvStorageKind,
     pool: BlockPool,
     block_size: usize,
     slots: HashMap<u64, Slot>,
@@ -37,7 +37,7 @@ struct Slot {
 
 impl DraftCache {
     pub fn new(model: &Model, total_blocks: usize, block_size: usize) -> Result<Self, EngineError> {
-        let storage = KvStorage::new(
+        let storage = KvStorageKind::f32_new(
             model.config.num_hidden_layers,
             total_blocks,
             block_size,

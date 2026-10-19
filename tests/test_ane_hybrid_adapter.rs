@@ -1,8 +1,7 @@
 use candle_core::Tensor;
 use kanso_infer::engine::Engine;
 use kanso_infer::ffn_offload::{
-    AneLayerAdapter, CoreMlAneAdapter, CpuFallbackAdapter, HybridExecutionPipeline,
-    PlannedCoreMlAdapter,
+    CpuFallbackAdapter, FfnOffloadAdapter, HybridExecutionPipeline, PlannedCoreMlAdapter,
 };
 use kanso_infer::model::Model;
 
@@ -71,7 +70,7 @@ fn test_ane_adapter_fallback_mechanism() {
     let hidden_size = model.config.hidden_size;
     let intermediate_size = model.config.intermediate_size;
 
-    let coreml_adapter = CoreMlAneAdapter::new(
+    let coreml_adapter = PlannedCoreMlAdapter::new(
         layer_idx,
         hidden_size,
         intermediate_size,
@@ -89,7 +88,7 @@ fn test_ane_adapter_fallback_mechanism() {
 
     // Check with AMX fallback if Accelerate is available
     if kanso_infer::accelerate::amx::has_accelerate_support() {
-        let amx_fallback_adapter = CoreMlAneAdapter::new(
+        let amx_fallback_adapter = PlannedCoreMlAdapter::new(
             layer_idx,
             hidden_size,
             intermediate_size,
@@ -127,9 +126,9 @@ fn test_hybrid_scheduling_pipeline_attention_amx_metal_mlp_ane() {
         kanso_infer::Backend::Cpu
     };
 
-    let mut adapters: Vec<Box<dyn AneLayerAdapter>> = Vec::new();
+    let mut adapters: Vec<Box<dyn FfnOffloadAdapter>> = Vec::new();
     for (idx, layer) in model.weights.layers.iter().enumerate() {
-        let adapter = CoreMlAneAdapter::new(
+        let adapter = PlannedCoreMlAdapter::new(
             idx,
             hidden_size,
             intermediate_size,
@@ -251,10 +250,10 @@ fn test_decode_step_parity_hybrid_vs_monolithic() {
 
     let block_size = 16;
     let mut kv_mono =
-        kanso_infer::kv_cache::KvStorage::new(2, 4, block_size, 2, 8, &model_mono.device)
+        kanso_infer::kv_cache::KvStorageKind::f32_new(2, 4, block_size, 2, 8, &model_mono.device)
             .expect("kv mono");
     let mut kv_hyb =
-        kanso_infer::kv_cache::KvStorage::new(2, 4, block_size, 2, 8, &model_hyb.device)
+        kanso_infer::kv_cache::KvStorageKind::f32_new(2, 4, block_size, 2, 8, &model_hyb.device)
             .expect("kv hyb");
 
     let mut bt_mono = kanso_infer::kv_cache::BlockTable::new();
@@ -289,7 +288,7 @@ fn test_decode_step_parity_hybrid_vs_monolithic() {
 #[test]
 fn test_adapter_input_validation_errors() {
     let model = Model::create_mock_tiny(32, 4, 2, 2, 100).expect("model");
-    let adapter = CoreMlAneAdapter::new(
+    let adapter = PlannedCoreMlAdapter::new(
         0,
         32,
         64,

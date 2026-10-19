@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use candle_core::{Device, Tensor};
 use kanso_infer::Backend;
-use kanso_infer::kv_cache::{BlockTable, KvStorage};
+use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
 use kanso_infer::model::Model;
 
 struct CountingAllocator;
@@ -74,10 +74,10 @@ fn mock() -> Model {
 }
 
 /// A block table covering `ctx` tokens, plus a KV storage sized to match.
-fn kv_for(model: &Model, ctx: usize) -> (KvStorage, BlockTable) {
+fn kv_for(model: &Model, ctx: usize) -> (KvStorageKind, BlockTable) {
     let block_size = model.config.block_size;
     let blocks = ctx.div_ceil(block_size);
-    let kv = KvStorage::new(
+    let kv = KvStorageKind::f32_new(
         model.config.num_hidden_layers,
         blocks,
         block_size,

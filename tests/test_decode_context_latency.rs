@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 
-use kanso_infer::kv_cache::{BlockTable, KvStorage};
+use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
 use kanso_infer::model::Model;
 
 /// SmolLM2-360M: hidden 960, 15 heads / 5 kv heads, 32 layers, vocab 49152.
@@ -28,14 +28,14 @@ const REPS: usize = 7;
 /// Median wall time of a single decode step with `ctx` tokens already cached.
 struct Cached {
     block_table: BlockTable,
-    kv_storage: KvStorage,
+    kv_storage: KvStorageKind,
     pos: usize,
 }
 
 fn cached(model: &Model, ctx: usize) -> Cached {
     let block_size = model.config.block_size;
     let blocks = ctx.div_ceil(block_size);
-    let kv_storage = KvStorage::new(
+    let kv_storage = KvStorageKind::f32_new(
         model.config.num_hidden_layers,
         blocks,
         block_size,

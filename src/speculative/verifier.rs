@@ -1,5 +1,6 @@
 use crate::error::EngineError;
-use crate::kv_cache::{BlockPool, BlockTable, KvStorage, PrefixCache};
+use crate::kv_cache::kind::slot_for as kanso_slot_for;
+use crate::kv_cache::{BlockPool, BlockTable, KvStorageKind, PrefixCache};
 use crate::model::Model;
 use crate::sampler::{greedy_token, sample_from_probs, softmax_probs};
 use crate::scheduler::SamplingParams;
@@ -39,7 +40,7 @@ impl SpeculativeVerifier {
         block_table: &mut BlockTable,
         block_pool: &mut BlockPool,
         prefix_cache: &mut PrefixCache,
-        kv_storage: &mut KvStorage,
+        kv_storage: &mut KvStorageKind,
         block_size: usize,
     ) -> Result<VerificationResult, EngineError> {
         if candidates.is_empty() {
@@ -83,9 +84,31 @@ impl SpeculativeVerifier {
             block_table.push_block(blk);
         }
 
-        // Execute single forward pass verification
-        let logits =
-            model.forward_verify_tokens(&verify_tokens, start_pos, block_table, kv_storage)?;
+        // Execute single forward pass verification. Ticket #90: the candidate block rides
+        // `forward_batch` as one sequence of the step's batch — `[current, candidates...]`
+        // is contiguous and ascending from `start_pos`, and the whole block needs its own
+        // logits row (one per candidate plus the bonus position).
+        let positions: Vec<usize> = (start_pos..start_pos + total_candidate_tokens).collect();
+        let physical_blocks = block_table.blocks();
+        let slot_mapping: Vec<usize> = positions
+            .iter()
+            .map(|&pos| {
+                kanso_slot_for(
+                    physical_blocks[pos / block_size],
+                    pos % block_size,
+                    block_size,
+                )
+            })
+            .collect();
+        let logits = model.forward_batch_all_rows(
+            &verify_tokens,
+            &positions,
+            &slot_mapping,
+            kv_storage,
+            &[physical_blocks.to_vec()],
+            &[start_pos + total_candidate_tokens],
+            &[total_candidate_tokens],
+        )?;
 
         let mut accepted_tokens = Vec::new();
         let mut emitted_token = None;

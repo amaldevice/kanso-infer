@@ -37,7 +37,7 @@ Supports dense Transformer decoders and next-generation hybrid linear-attention 
 - **Batch Size Sweeping**: Sweeps batch sizes (e.g. `--batch-sizes 1,4,8,16,32`) to evaluate saturation points.
 - **Trace Replay**: Replays ShareGPT-style JSONL traces (`--trace-file`) with heterogeneous prompt lengths, generation lengths, and staggered arrival times.
 - **Multi-Model Profile Selection**: `--model-type <mock | smollm2 | granite-dense | granite-h | lfm>` for empirical architecture comparison.
-- **Deterministic 64-bit FNV-1a Checksums**: Order-sensitive token stream hashing to mathematically prove greedy output parity across CPU, NEON, and Metal backends.
+- **Deterministic 64-bit FNV-1a Checksums**: Order-sensitive token stream hashing to mathematically prove greedy output parity across CPU and Metal backends.
 - **Hardware Telemetry & Resource Tracking (Zero-Sudo)**:
   - **Hardware Profiling**: Reads CPU model, core counts, RAM, and model identifier via macOS `sysctl`.
   - **Peak Memory (RSS)**: Tracks peak Resident Set Size in MB via POSIX `libc::getrusage`.
@@ -80,10 +80,10 @@ that every exec pointer resolves to a file in the tree.
 | AMX/Accelerate GEMM path (dense weights) | ✅ | `src/accelerate/amx.rs`, `src/model.rs` (`Model::linear`) |
 | FFN offload seam (per-layer SwiGLU adapters, CPU/AMX execution) | ✅ | `src/ffn_offload/adapter.rs`, `src/model.rs` (`forward_mlp_block`) |
 | Real Core ML / ANE execution (`.mlpackage`, `MLModel`) | 📝 | roadmap |
-| Fused PagedAttention v2 Metal kernel | 🧪 | `src/metal/paged_attention.rs`, `src/metal/kernels/paged_attention_v2.metal` |
-| Fused Metal llama-layer kernel | 🧪 | `src/metal/fused_layer.rs` |
-| Hand-written NEON Q8_0/Q4_K GEMV kernels | 🧪 | `src/quant/neon.rs` (reference/benchmark path; production decode runs off candle's kernels) |
-| Quantized (INT8/FP8) paged KV cache | 🧪 | `src/kv_cache/quantized_storage.rs` |
+| Fused PagedAttention v2 Metal kernel | ✅ | `src/metal/paged_attention.rs`, `src/model/paged_attn.rs`, `src/metal/kernels/paged_attention_v2.metal` (decode: `Model::metal_paged_attention`) |
+| Fused Metal llama-layer kernel | ✅ | `src/metal/fused_layer.rs`, `src/model/fused_decode.rs` — decode: `MetalWeights::decode_step` via `Model::forward_batch`. Wired for the layer **prologue** (fused RMSNorm + QKV + RoPE, one command buffer per layer); one command buffer per *step* covering attention/O/MLP is still debt, see `docs/adr/0002-fused-decode-scope.md` |
+| Hand-written NEON Q8_0/Q4_K GEMV kernels | 🧪 | `src/quant/neon.rs` (benchmark/parity-test path only; `--backend neon` refuses to start — see below) |
+| Quantized (INT8/FP8) paged KV cache | ✅ | `src/kv_cache/kind.rs` (`KvStorageKind`, `KvCacheType`), `src/kv_cache/quantized_storage.rs`, `src/main.rs` — selected by the user via `--kv-type` = f32 / int8 / fp8 (single-shot, chat, serve), plumbed to `Engine::new_with_budget_and_kv`; F32 is the default, Metal refuses INT8/FP8 with an `Err` (its paged-attention kernel reads an F32 pool). **Debt (#82 D1):** the per-token KV byte ratio is asserted in `tests/test_quantized_kv_engine.rs`, not carried in the benchmark report — no `bytes_read_per_step` split by KV type yet |
 | Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation | 📝 | roadmap |
 | `granite-h` / `lfm` bench profiles | 📝 | roadmap |
 
@@ -91,7 +91,6 @@ that every exec pointer resolves to a file in the tree.
 
 - Real Core ML / ANE execution: compile per-layer SwiGLU to `.mlpackage` and run via `MLModel`, behind the `src/ffn_offload` seam.
 - Wire the fused PagedAttention v2 kernel into the Metal decode path (`src/model.rs` names the call site).
-- Wire quantized KV storage into `Engine` (currently always F32 `KvStorage`).
 - Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation — demoted from 🧪 to 📝
   by ticket #83. What exists today is `src/hybrid/recurrent_state.rs` (a rolling
   `0.9*state + 0.1*input` buffer, 72 lines) and `src/kv_cache/`'s `SparseBlockTable`
@@ -105,6 +104,13 @@ that every exec pointer resolves to a file in the tree.
   shape is not an implemented feature, so this is roadmap: load real Granite-hybrid/LFM
   GGUF once the hybrid forward pass above lands.
 - Promote hand-written NEON GEMV kernels from reference path to production decode path.
+  Blocker (ticket #89): the packed layouts differ, so the kernels cannot read the
+  production `LinearWeight` blocks in place. `src/quant::BlockQ8_0` is
+  `{ d: f32, qs: [i8; 32] }` (36 B); candle stores `{ d: f16, qs: [i8; 32] }` (34 B).
+  `src/quant::BlockQ4_K` keeps `d`/`dmin` as f32 where candle keeps f16. Bridging that
+  needs either a repack of every weight per token (costs more bandwidth than the kernel
+  saves, so rejected) or a kernel written against candle's f16-scale blocks. Until then
+  `--backend neon` errors out instead of silently running candle's CPU matmul.
 
 ---
 
@@ -253,17 +259,29 @@ cargo run --release --bin bench -- \
   --backend cpu
 ```
 
-Output format:
+Output format (field names, with `<...>` where a run puts its own numbers):
 ```text
 ============================================================
  kanso-infer multi-engine benchmark suite
- Hardware : Apple A18 Pro (6 cores, 8.0 GB RAM, Model: Mac17,5)
- Thermal  : Fair (Elevated, fans active)
- Backend  : cpu, Model Profile: mock, Warmup: false
+ Model    : <path to the GGUF that ran>
+ Hardware : <chip> (<n> cores, <n> GB RAM, Model: <id>)
+ Thermal  : <thermal state>
+ Backend  : <backend>, Warmup: <bool>
 ============================================================
-batch_size=1    backend=cpu    batch=1    tok/s(total)=245.2    tok/s/req=245.17
-                ttft_ms(mean/max)=22.3/22.3 itl_ms(mean/p99)=1.5/1.7 decode_ms/step=4.08 checksum=a8c7f832281a39c5
-                peak_rss=9.8MB thermal="Fair (Elevated, fans active)" bus_est=93.2GB/s (62.1% bus util)
+batch_size=<n>    backend=<backend>    batch=<n>    tok/s(total)=<t>    tok/s/req=<t>
+                ttft_ms(p50/p90/mean/max)=<t>/<t>/<t>/<t> itl_ms(p50/p90/p99)=<t>/<t>/<t> prefill_tok/s=<t> decode_ms/step=<t> (decode_ms/tok=<t>) prefix_hit=<t>% checksum=<16 hex digits>
+                peak_rss=<t>MB thermal="<thermal state>" bus_est=<t>GB/s (<t>% of <t>GB/s <how the peak was measured>)
+```
+
+Every number above comes from the run, so there is no reference output to
+compare against: the `checksum` is an FNV-1a hash of the tokens that run
+generated, and it differs per model, per prompt and per sampling seed. Two
+profiles reporting the same checksum would mean one of them did not run.
+
+The JSON written by `--json-output` carries a `telemetry` field next to
+`bytes_read_per_step`: `"measured"` when the bytes were weighed from the model
+that ran, `"unmeasured"` when nothing was weighed. `--gate` treats an
+unmeasured report as inconclusive (exit `2`), never as a pass.
 ```
 
 ### 6. Performance Gates
@@ -312,4 +330,5 @@ Reported metrics:
 - **Throughput**: Total tokens/s and per-request tokens/s.
 - **Latency**: Mean/max/p50/p90 Time-to-First-Token (TTFT), p50/p90/p99 Inter-Token Latency (ITL), decode ms/step, and per-token decode latency (ms/token).
 - **Traceable Bus Utilization**: Derived from resident model weight bytes plus active KV cache bytes summed across sequences, evaluated against host DRAM bandwidth measured via the STREAM-triad microbench.
+  **Debt (#82 D1):** the byte total is one number — it does not say how many of those bytes are KV, and nothing in the report distinguishes an F32 pool from an INT8/FP8 one. The memory saving quantized KV buys is therefore asserted only in `tests/test_quantized_kv_engine.rs` (`memory_ratio_vs_f32`), not reported by `bench`.
 - **Determinism**: 64-bit FNV-1a checksums over generated tokens to verify greedy output parity.

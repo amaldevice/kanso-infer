@@ -153,15 +153,25 @@ pub const FEATURES: &[FeatureSpec] = &[
     },
     FeatureSpec {
         name: "Fused PagedAttention v2 Metal kernel",
-        status: FeatureStatus::KernelOnly,
-        exec_pointer: "src/metal/paged_attention.rs src/metal/kernels/paged_attention_v2.metal",
-        wired: None,
+        status: FeatureStatus::Wired,
+        exec_pointer: "src/metal/paged_attention.rs src/model/paged_attn.rs src/metal/kernels/paged_attention_v2.metal",
+        wired: wired!(crate::model::Model::metal_paged_attention),
     },
     FeatureSpec {
+        // Ticket #87: the wired part is the layer *prologue* — fused RMSNorm + QKV + RoPE,
+        // one command buffer per layer, entered from `Model::forward_batch`. Attention
+        // stays on the #86 paged-attention path and O/MLP stay on the tensor path, so the
+        // "one command buffer per step covering attention/O/MLP" criterion is still debt:
+        // chaining it needs a residual-add and a SwiGLU kernel that do not exist yet
+        // (spec #82 puts new kernels out of scope). Recorded in
+        // `docs/adr/0002-fused-decode-scope.md`, not hidden behind the ✅.
         name: "Fused Metal llama-layer kernel",
-        status: FeatureStatus::KernelOnly,
-        exec_pointer: "src/metal/fused_layer.rs",
-        wired: None,
+        status: FeatureStatus::Wired,
+        exec_pointer: "src/metal/fused_layer.rs src/model/fused_decode.rs",
+        wired: wired!(
+            crate::metal::fused_layer::MetalWeights::decode_step,
+            crate::model::Model::forward_batch
+        ),
     },
     FeatureSpec {
         name: "Hand-written NEON Q8_0/Q4_K GEMV kernels",
@@ -170,10 +180,19 @@ pub const FEATURES: &[FeatureSpec] = &[
         wired: None,
     },
     FeatureSpec {
+        // Ticket #88: `--kv-type f32|int8|fp8` is the user-facing selection, parsed into
+        // `KvCacheType` and plumbed through `build_engine` to
+        // `Engine::new_with_budget_and_kv`; `KvStorageKind` is the one seam the decode
+        // path reads through. F32 stays the default, and Metal refuses INT8/FP8 with an
+        // `Err` (its paged-attention kernel reads an F32 pool), so the wired claim covers
+        // the CPU/AMX backends that actually serve it.
         name: "Quantized (INT8/FP8) paged KV cache",
-        status: FeatureStatus::KernelOnly,
-        exec_pointer: "src/kv_cache/quantized_storage.rs",
-        wired: None,
+        status: FeatureStatus::Wired,
+        exec_pointer: "src/kv_cache/kind.rs src/kv_cache/quantized_storage.rs src/main.rs",
+        wired: wired!(
+            crate::engine::Engine::new_with_budget_and_kv,
+            crate::kv_cache::KvStorageKind::quantized
+        ),
     },
     FeatureSpec {
         name: "Hybrid SSM/conv layers (Mamba-2, LIV conv) + sparse KV allocation",

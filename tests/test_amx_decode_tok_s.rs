@@ -8,7 +8,7 @@
 
 use std::time::Instant;
 
-use kanso_infer::kv_cache::{BlockTable, KvStorage};
+use kanso_infer::kv_cache::{BlockTable, KvStorageKind};
 use kanso_infer::model::Model;
 
 /// SmolLM2-360M: hidden 960, 15 heads / 5 kv heads, 32 layers, vocab 49152.
@@ -20,7 +20,7 @@ const VOCAB: usize = 49_152;
 const STEPS: usize = 32;
 
 fn decode_tok_s(model: &Model, steps: usize) -> f64 {
-    let mut kv_storage = KvStorage::new(
+    let mut kv_storage = KvStorageKind::f32_new(
         model.config.num_hidden_layers,
         steps + 2,
         model.config.block_size,

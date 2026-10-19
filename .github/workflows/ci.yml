@@ -22,6 +22,28 @@ jobs:
       - name: test
         run: cargo test
 
+  # F12/F15 budgets (gates/fase1.json, gates/fase2.json) run through `bench --gate`
+  # (ticket #94). No GGUF is downloaded here: without one the asset-backed rows
+  # report SKIPPED (exit 2) from `gates/no-measurement.json`, so the job verifies
+  # the mechanism and stays green. A violated row is still exit 1 and still red.
+  # The real measurement is #95, on a Mac with the model on disk.
+  #
+  # Because "everything skipped" is green, the script also runs a self-check
+  # (spec #82 B2): `gates/self-check-violation.json` is a weighed synthetic report
+  # that breaks `gates/self-check-budget.json`'s floor, and the gate MUST exit 1 on
+  # it. If it ever exits 0, the job fails.
+  budgets:
+    name: F12/F15 budget gates (skipped without a GGUF, never passed; self-check must go red)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build bench
+        run: cargo build --bin bench 2>&1 | tail -20
+      - name: run budget gates
+        run: ./scripts/gate-ci.sh
+
   # The throughput gates are wall-clock measurements: at opt-level 0 candle's per-op
   # overhead swamps the amortization they measure, so the tests are `#[ignore]`d in debug
   # builds (reported as ignored, never as a pass under a lowered floor) and run here

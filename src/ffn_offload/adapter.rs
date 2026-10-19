@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 /// Checks whether Apple Neural Engine (ANE) hardware is present on current platform.
 ///
-/// Always false: there is no Core ML execution path yet (`CoreMlAneAdapter`
+/// Always false: there is no Core ML execution path yet (`PlannedCoreMlAdapter`
 /// runs the CPU/AMX fallback unconditionally), so claiming ANE on the basis
 /// of a chip-name string match would lie on every Mac. Flip this only when a
 /// real dispatch path lands behind it.
@@ -41,8 +41,6 @@ pub trait FfnOffloadAdapter: Send + Sync {
     }
 }
 
-pub use FfnOffloadAdapter as AneLayerAdapter;
-
 /// Fallback adapter executing SwiGLU FFN on CPU or AMX (Accelerate) cores.
 #[derive(Clone)]
 pub struct CpuFallbackAdapter {
@@ -55,8 +53,6 @@ pub struct CpuFallbackAdapter {
     pub backend: crate::hardware::Backend,
     pub device: Device,
 }
-
-pub use CpuFallbackAdapter as CpuFallbackAneAdapter;
 
 impl CpuFallbackAdapter {
     #[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
@@ -178,8 +174,6 @@ pub struct PlannedCoreMlAdapter {
     pub fallback: CpuFallbackAdapter,
     pub compiled_model_path: Option<PathBuf>,
 }
-
-pub use PlannedCoreMlAdapter as CoreMlAneAdapter;
 
 impl PlannedCoreMlAdapter {
     pub fn new(
