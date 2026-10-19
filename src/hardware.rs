@@ -148,24 +148,39 @@ pub fn is_metal_runtime_gap(err: &crate::error::EngineError) -> bool {
     }
 }
 
-/// Parses the major version out of a Darwin `uname -r` release string
-/// (e.g. `"14.2.1"` → `Some(14)`, `"unknown"` → `None`).
-pub fn parse_darwin_major(release: &str) -> Option<u32> {
-    release.split('.').next()?.parse().ok()
+/// Parses the major version out of an OS product version string
+/// (e.g. `"14.7.1"` → `Some(14)`, `"unknown"` → `None`).
+pub fn parse_os_major(version: &str) -> Option<u32> {
+    version.split('.').next()?.parse().ok()
 }
 
-/// Major macOS version from `uname`, or `None` when it cannot be read/parsed.
+/// Major macOS version from `sysctl kern.osproductversion`, or `None` when it
+/// cannot be read/parsed.
+///
+/// Ticket #99: this must NOT be `uname -r` — that returns the *Darwin* version,
+/// and the mapping is not the identity (macOS 14.x = Darwin 23.x). Reading the
+/// Darwin version would let every pre-15 macOS (Darwin 23, 22, 21, …) sail
+/// through the macOS-15 gate below and hit the candle panic again.
+/// `kern.osproductversion` returns the macOS version directly ("14.7.1", "27.0").
 #[cfg(target_os = "macos")]
 pub fn macos_major_version() -> Option<u32> {
     unsafe {
-        let mut buf: libc::utsname = std::mem::zeroed();
-        if libc::uname(&mut buf) != 0 {
+        let mut buf = [0 as libc::c_char; 64];
+        let mut len = buf.len();
+        if libc::sysctlbyname(
+            c"kern.osproductversion".as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
             return None;
         }
-        let release = std::ffi::CStr::from_ptr(buf.release.as_ptr())
+        let version = std::ffi::CStr::from_ptr(buf.as_ptr())
             .to_string_lossy()
             .into_owned();
-        parse_darwin_major(&release)
+        parse_os_major(&version)
     }
 }
 

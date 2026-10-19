@@ -116,29 +116,31 @@ fn test_is_metal_runtime_gap_matches_only_the_capability_prefix() {
     }
 }
 
-/// Ticket #99: `metal_device()` gates on the Darwin release (MTLResidencySet
+/// Ticket #99: `metal_device()` gates on `kern.osproductversion` (MTLResidencySet
 /// needs macOS 15+), so the parsing feeding that gate must be pinned down
 /// without needing a macOS 14 host.
 #[test]
-fn test_parse_darwin_major_releases() {
-    use kanso_infer::hardware::parse_darwin_major;
+fn test_parse_os_major_versions() {
+    use kanso_infer::hardware::parse_os_major;
 
-    for (release, want) in [
-        ("14.2.1", 14),
+    // Note: 23 is Darwin's version for macOS 14. If a value like that ever
+    // reaches the gate, it is rejected (there is no macOS 23) — fail closed.
+    for (version, want) in [
+        ("14.7.1", 14),
         ("15.0", 15),
-        ("23.6.0", 23),
         ("27.0", 27),
+        ("23.6.0", 23),
         ("15", 15),
     ] {
         assert_eq!(
-            parse_darwin_major(release),
+            parse_os_major(version),
             Some(want),
-            "parse release {release:?}"
+            "parse version {version:?}"
         );
     }
-    // Unparseable releases must fail closed: unknown version => no Metal.
-    assert_eq!(parse_darwin_major("unknown"), None);
-    assert_eq!(parse_darwin_major(""), None);
+    // Unparseable versions must fail closed: unknown version => no Metal.
+    assert_eq!(parse_os_major("unknown"), None);
+    assert_eq!(parse_os_major(""), None);
 }
 
 /// This host is macOS 27 (class present), so the version gate must admit it.
@@ -147,7 +149,7 @@ fn test_parse_darwin_major_releases() {
 fn test_macos_host_passes_the_residency_set_version_gate() {
     use kanso_infer::hardware::{macos_has_residency_set_class, macos_major_version};
 
-    let major = macos_major_version().expect("uname release must parse on macOS");
+    let major = macos_major_version().expect("kern.osproductversion must parse on macOS");
     assert!(
         major >= 15,
         "this machine is expected to have the class (macOS 15+), got major {major}"
