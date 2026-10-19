@@ -51,7 +51,7 @@
       "budget": 12.0,
       "status": "measured",
       "owner": "#95",
-      "note": "Target for the real GGUF on wikitext2 at stride 512. `bench --eval-ppl wikitext2 --gate <budget>` now attaches the measured baseline PPL to the report as `perplexity_wikitext2`; a run that never asked for perplexity carries no value and the row skips."
+      "note": "Target for the real GGUF on wikitext2 at stride 512. `bench --eval-ppl <spec> --gate <budget>` resolves the spec: the name `wikitext2` selects the bundled validation slice, anything else must be a readable text file. When the dataset is absent the run reports `perplexity skipped: ...` and the report carries no `perplexity_wikitext2`, so the gate skips this row instead of judging a fixture nobody asked for."
     }
   ]
 }

@@ -319,22 +319,34 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut ppl_value: Option<f64> = None;
     if let Some(dataset) = &args.eval_ppl {
         println!("Evaluating perplexity on dataset: {}", dataset);
-        let report = kanso_infer::bench::run_wikitext2_perplexity_eval(
+        // An absent dataset is not an error and not a fixture: it means the run
+        // has no perplexity to report, so the gate skips the row (#100).
+        match kanso_infer::bench::run_perplexity_eval(
             model_path.to_str().unwrap_or("model"),
+            dataset,
             args.ppl_stride,
-        )?;
-        let ascii_table = kanso_infer::bench::format_ascii_ppl_report(&report);
-        println!("{}", ascii_table);
+        ) {
+            Ok(report) => {
+                let ascii_table = kanso_infer::bench::format_ascii_ppl_report(&report);
+                println!("{}", ascii_table);
 
-        if let Some(json_path) = &args.json_output {
-            let json_content = serde_json::to_string_pretty(&report)?;
-            std::fs::write(json_path, json_content)?;
-            println!("Exported JSON perplexity report to {}", json_path);
+                if let Some(json_path) = &args.json_output {
+                    let json_content = serde_json::to_string_pretty(&report)?;
+                    std::fs::write(json_path, json_content)?;
+                    println!("Exported JSON perplexity report to {}", json_path);
+                }
+                if args.gate.is_none() {
+                    return Ok(());
+                }
+                ppl_value = Some(report.baseline_ppl);
+            }
+            Err(e) => {
+                eprintln!("perplexity skipped: {e}");
+                if args.gate.is_none() {
+                    return Ok(());
+                }
+            }
         }
-        if args.gate.is_none() {
-            return Ok(());
-        }
-        ppl_value = Some(report.baseline_ppl);
     }
     if let Some(trace_path) = &args.trace_file {
         let trace = if args.dataset.to_lowercase() == "sharegpt"

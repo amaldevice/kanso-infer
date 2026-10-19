@@ -486,18 +486,13 @@ fn the_perplexity_dataset_is_resolved_from_the_spec_not_always_the_fixture() {
     );
 
     // A real file on disk is read, and its tokens are what the eval consumes.
-    let path = std::env::temp_dir().join(format!(
-        "kanso-100-ppl-{}.txt",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir().join(format!("kanso-100-ppl-{}.txt", std::process::id()));
     std::fs::write(&path, "the quick brown fox jumps over the lazy dog").expect("write fixture");
     let from_file = resolve_perplexity_dataset(path.to_str().unwrap())
         .expect("an existing dataset path resolves");
     assert_eq!(
         from_file,
-        kanso_infer::bench::tokenize_wikitext2(
-            "the quick brown fox jumps over the lazy dog"
-        ),
+        kanso_infer::bench::tokenize_wikitext2("the quick brown fox jumps over the lazy dog"),
         "the eval must consume the file it was pointed at"
     );
     let _ = std::fs::remove_file(&path);
@@ -513,8 +508,7 @@ fn an_absent_perplexity_dataset_leaves_the_row_skipped() {
         "a run with no dataset evaluates nothing"
     );
 
-    let (measured, verdict) =
-        verdict_of(&budget_for("perplexity_wikitext2", "max", 12.0), &report);
+    let (measured, verdict) = verdict_of(&budget_for("perplexity_wikitext2", "max", 12.0), &report);
     assert_eq!(measured, None);
     assert!(
         matches!(verdict, GateVerdict::Skipped(_)),
