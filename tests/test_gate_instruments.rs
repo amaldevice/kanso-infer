@@ -323,3 +323,44 @@ fn a_legacy_report_without_the_new_fields_still_skips_them() {
     assert_eq!(measured, None, "an absent probe is not a zero");
     assert!(matches!(verdict, GateVerdict::Skipped(_)));
 }
+
+/// B7: the probe itself must produce a number. The tests above inject literals
+/// to prove the gate *reads* a field; this one proves the probe *fills* it.
+#[test]
+fn the_gemv_probe_produces_a_real_figure_from_the_kernel_it_names() {
+    use kanso_infer::bench::{GEMV_PROBE_KERNEL, probe_gemv_peak_pct};
+
+    // On aarch64 the probe must time the NEON kernel, not the scalar reference:
+    // a scalar figure would never reach the 60% peak the budget asks for, so
+    // naming it `gemv_peak_pct` would be a lie.
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            GEMV_PROBE_KERNEL.contains("neon"),
+            "on aarch64 the probe must name the NEON kernel it times, got '{GEMV_PROBE_KERNEL}'"
+        );
+        let peak = 100.0;
+        let first = probe_gemv_peak_pct(peak).expect("the NEON probe runs on aarch64");
+        let second = probe_gemv_peak_pct(peak).expect("the probe is repeatable");
+        assert!(first > 0.0, "a timed kernel reads above zero, got {first}");
+        assert!(
+            first != second,
+            "two timings of the same kernel cannot be identical ({first}); a constant would mean \
+             nothing was timed"
+        );
+        assert!(
+            probe_gemv_peak_pct(0.0).is_none(),
+            "no measured peak bandwidth means no share of peak"
+        );
+    }
+
+    // Everywhere else the NEON kernel does not exist, so the probe must decline
+    // rather than time the scalar fallback under a NEON-shaped name.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        assert!(
+            probe_gemv_peak_pct(100.0).is_none(),
+            "without NEON there is no kernel to time under this name"
+        );
+    }
+}
