@@ -1,13 +1,19 @@
-# Handoff — Debt Closure rantai #82 (spec → 13 tiket → 2 PR)
+# Handoff — Debt Closure rantai #82 (spec → 13 tiket (+2 pecahan) → 3 PR)
 
 > Untuk agent penerus. Dokumen ini ringkasan **state dan konteks**, bukan duplikasi spec.
 > Baca artifact yang dirujuk, jangan tebak.
+>
+> **Sudah diverifikasi terhadap kode** pada `main` @ `4566fae` via codegraph (`codegraph_explore`):
+> nama simbol, nomor baris, varian enum, jumlah baris gate, dan jumlah `#[ignore]` dicek langsung ke
+> sumber. Tujuh ketidakakuratan versi pertama sudah dikoreksi (§0, §1, §2, §3, §4a, §4d). Bila
+> handoff ini dan kode berbeda, **kode yang benar** — rekam koreksinya di sini.
 
 ## 0. Posisi sekarang (2026-10-19)
 
 - `main` @ **`7415e77`** (merge PR #102), worktree bersih, tanpa tiket/branch tiket tersisa.
 - **Tidak ada PR terbuka.**
-- Rantai #82: **12 dari 13 tiket CLOSED**. Sisa satu: **#101** (`ready-for-human`).
+- Rantai #82: **14 dari 15 sub-issue CLOSED** — 13 tiket asli #83–#95 (semua closed) + #100
+  (closed); #95 dipecah menjadi #100 + #101. Sisa satu: **#101** (`ready-for-human`).
 - Sisa issue lain: **#99** (`bug`, CI merah permanen).
 
 | Issue | Label | Arti |
@@ -19,12 +25,14 @@
 ## 1. Flow yang sudah dijalankan
 
 ```text
-#82 spec ──► 13 tiket ──► 2 PR
+#82 spec ──► 13 tiket ──► 3 PR
    │
    ├── PR #96  (MERGED e354663)  #83 #84 #85 #93
    ├── PR #98  (MERGED 0b07121)  #86 #87 #88 #89 #90 #91 #92 #94
    └── PR #102 (MERGED 7415e77)  #100  (pecahan #95)
 ```
+
+Total commit rantai: **81** (`7ec0fa9..HEAD`, termasuk dua commit docs handoff).
 
 - Spec: https://github.com/amaldevice/kanso-infer/issues/82
 - Handoff rantai sebelumnya (konvensi linkage, pelajaran Fase 0–3): `docs/handoff-fase-0.md` §5
@@ -40,18 +48,21 @@ Modul yang **baru ada** karena rantai ini — baca ini sebelum menyentuh area te
 | `src/features.rs` | Registry fitur compile-checked: nama, status (`Wired`/`KernelOnly`/`Planned`), exec pointer, penanda `Option<fn()>`. Menghapus simbol produksi memecahkan build. Diaudit `tests/test_feature_registry.rs` |
 | `src/model/paged_attn.rs` | Seam decode Metal: buffer pool + block table → `gpu_paged_attention_v2_buffer` |
 | `src/model/fused_decode.rs` | Prologue fused (RMSNorm+QKV+RoPE) lewat `MetalWeights::decode_step`; tail per-op masih tensor path (lihat ADR-0002) |
-| `src/kv_cache/kind.rs` | `KvStorageKind` = F32 \| Int8 \| Fp8, dipilih `--kv-type`; Metal menolak INT8/FP8 dengan `Err` |
+| `src/kv_cache/kind.rs` | **Dua enum, jangan tertukar**: `KvCacheType` = `F32 \| Int8 \| Fp8` — sisi user, di-parse dari `--kv-type` (`FromStr`/`Display`), ada di `cli`/`chat`/`serve`. `KvStorageKind` = `F32(KvStorage) \| Quantized(QuantizedKvStorage)` — pool runtime yang dibangun engine. Metal menolak INT8/FP8 saat startup dengan `EngineError`, bukan panic |
 | `src/bench/gate.rs` | Gate budget: baca `BenchmarkReport` JSON, exit 0/1/2, `skipped` ≠ `passed` |
-| `src/bench/probes.rs` | Probe GEMV/NEON, paged-attn GPU, SSE stream, RSS, perplexity. **Prinsip: menolak (`None`) saat kernel/hardware yang namanya disebut tidak ada** |
+| `src/bench/probes.rs` | 5 fungsi: `probe_gemv_peak_pct` (NEON, `None` off-aarch64), `probe_paged_attn_over_theoretical` (GPU, `None` tanpa Metal), `probe_sse_stream_consumed` (HTTP/1.1, bukan SDK), `run_probes`, `attention_geometry`. **Prinsip: menolak (`None`) saat kernel/hardware yang namanya disebut tidak ada.** RSS ada di `src/hardware.rs::get_peak_rss_mb`; perplexity di `src/bench/perplexity.rs` — bukan di sini |
+| `src/bench.rs` (`KernelProbes`) | Empat field `Option<f64>`: `gemv_peak_pct`, `paged_attn_ctx4096_b1_over_theoretical`, `idle_gap_pct`, `sse_stream_consumed`. `None` → gate `skipped`, **tidak pernah** `0.0` yang terbaca sebagai pengukuran |
 | `gates/*.json` | Budget F12/F15 + `no-measurement.json` + dua file self-check |
 | `scripts/gate-ci.sh` | Runner gate di CI; tanpa GGUF → skipped, job tetap hijau |
 
-Perubahan bentuk yang menyebar (49 file): `Model::forward_batch*` dan tipe storage KV. Sudah
+Perubahan bentuk yang menyebar: PR #98 **52 file** (+4239/−301); seluruh rantai `7ec0fa9..HEAD`
+**77 file** (+8672/−335). Inti sebarannya `Model::forward_batch*` dan tipe storage KV. Sudah
 dipropagasi; hati-hati bila menambah parameter decode.
 
 ## 3. Status gate F12/F15 (inti sisa pekerjaan)
 
-`gates/fase1.json` + `gates/fase2.json` → **8 dari 9 baris `measured`**, satu sengaja tidak:
+`gates/fase1.json` (6 baris) + `gates/fase2.json` (4 baris) → **9 dari 10 baris `measured`**, satu
+sengaja tidak:
 
 | Baris | Status | Catatan |
 |---|---|---|
@@ -76,8 +87,18 @@ regresi rantai #82: **8 run `main` berturut-turut** gagal dengan panic identik, 
 Selama belum beres, **setiap PR akan terlihat merah** dan kegagalan nyata tercampur noise environment.
 Dua job lain (`release-gates`, `budgets`) pass.
 
-Arah perbaikan: probe runtime sebelum membuat device Metal, `return` dengan alasan tercetak bila class
-tidak tersedia — pola sama seperti probe #100 yang menolak alih-alih mengukur pengganti.
+**Sumber panic sudah dilacak** (jangan tebak lagi): `src/hardware.rs:78` memanggil candle
+`Device::new_metal(0)`, yang di dalamnya memakai `objc2-metal` dan `.expect()` pada
+`MTLResidencySetDescriptor` → panic, bukan `Err`. Perhatikan `src/metal/context.rs:20` berbeda:
+di sana `metal::Device::system_default()` mengembalikan `Option`, jadi **tidak** panic.
+
+Arah perbaikan (tanpa dependensi baru): bungkus `Device::new_metal(0)` dengan
+`std::panic::catch_unwind(AssertUnwindSafe(...))` di `Backend::device()` dan petakan panic menjadi
+`EngineError::Metal("runner lacks MTLResidencySetDescriptor …")`. Alternatifnya menambah `objc2`
+sebagai dependensi langsung untuk cek `Class::get`, tapi itu memperluas dep produksi hanya demi quirk
+runner — kurang sepadan. Cek dulu `cargo test --test test_backend_enum` di mesin lokal: di macOS 27
+class itu ada, jadi jalur panic tidak pernah tersentuh secara lokal dan harus diuji dengan
+menginduksi panic.
 
 ### 4b. #101 — pengukuran nyata (`ready-for-human`)
 
@@ -95,22 +116,29 @@ Jangan turunkan ambang diam-diam — setiap pelonggaran harus tertulis.
 
 - ~44 remote branch warisan sesi lama (`feat/*`, `spec/fase-1..3`, `ticket/42..62`), **semuanya sudah
   merged ke `main`**. Belum dihapus karena bukan scope rantai ini — menunggu keputusan pemilik repo.
-- 3 `#[ignore]` tersisa (`test_batched_forward` ×1, `test_speculative_draft_kv` ×2) — semuanya
-  wall-clock gate yang dijalankan job `release-gates`, bukan hijau palsu.
+- **2** `#[ignore]` tersisa (bukan 3 — kemunculan ketiga di `rg` adalah prosa di doc-comment):
+  `tests/test_batched_forward.rs:267` dan `tests/test_speculative_draft_kv.rs:225`. Keduanya
+  wall-clock gate `#[ignore = "release-only …"]` yang dijalankan job `release-gates`, bukan hijau palsu.
 
 ## 5. File yang perlu dieksplorasi
 
 **Untuk #99 (CI):**
 - `.github/workflows/ci.yml` — tiga job; yang gagal `check`
-- `tests/test_backend_enum.rs` — dua test yang panic (`test_metal_device_is_honest_gpu`, `test_metal_cpu_parity_mock`)
-- `src/hardware.rs` — `Backend::device()`, `device_label()`
-- `src/metal/context.rs` — pembuatan device/queue
+- `tests/test_backend_enum.rs:54` (`test_metal_device_is_honest_gpu`) dan `:72`
+  (`test_metal_cpu_parity_mock`) — dua test yang panic; keduanya lewat `Backend::device()`
+- `src/hardware.rs:78` — **titik panic**: candle `Device::new_metal(0)` → `objc2-metal` `.expect()`
+- `src/metal/context.rs:20` — bandingkan: `metal::Device::system_default()` mengembalikan `Option`,
+  jadi jalur ini aman dan tidak boleh ikut diubah
+- `src/hardware.rs:102` — `device_label()`, dipakai assertion "Metal GPU"
 
 **Untuk #101 (pengukuran):**
 - `gates/fase1.json`, `gates/fase2.json` — budget dan `note` tiap baris
-- `src/bench/gate.rs` — arti exit 0/1/2 dan `skipped`
+- `src/bench/gate.rs` — `GateRowStatus` (`Measured`/`NotYetInstrumented`), `GateVerdict`
+  (`Passed`/`Violated`/`Skipped`), `metric_value` (~baris 387), `ratio_of` (~baris 648), exit 0/1/2
 - `src/bench/probes.rs` — apa yang benar-benar diukur tiap probe
-- `src/bin/bench.rs` — flag `--gate`, `--gate-report`, `--eval-ppl`, `--ctx-lengths`, `--batch-sizes`
+- `src/bench.rs` — `BenchmarkReport.probes: Option<KernelProbes>` (baris ~157)
+- `src/bin/bench.rs` — flag `--gate`, `--gate-report`, `--eval-ppl`, `--ctx-lengths`, `--batch-sizes`,
+  plus `--probes` dan `--sse-endpoint`
 - `scripts/gate-ci.sh` — cara gate dipanggil
 
 **Untuk memahami klaim README:**
@@ -118,9 +146,12 @@ Jangan turunkan ambang diam-diam — setiap pelonggaran harus tertulis.
 - `docs/adr/0002-fused-decode-scope.md` — kenapa satu command-buffer per step **belum** tercapai
 
 **Untuk menyentuh jalur decode:**
-- `src/model.rs` (`forward_decode_step`, `forward_batch`, `metal_paged_attention`)
+- `src/model.rs` — `forward_decode_step` (:1078), `forward_batch` (:1331), `metal_paged_attention` (:852)
 - `src/model/paged_attn.rs`, `src/model/fused_decode.rs`, `src/kv_cache/kind.rs`
-- `src/engine.rs` (`step`, `speculative_step_sampled`, `new_with_budget_and_kv`)
+- `src/engine.rs` — `new_with_budget_and_kv` (:69), `step` (:211), `speculative_step_sampled` (:613)
+
+**Untuk memverifikasi handoff ini sendiri:** `.codegraph/` sudah terindeks (7.5 MB) — pakai
+`codegraph_explore` lewat codemode, lebih akurat dan jauh lebih murah daripada grep+read berulang.
 
 ## 6. Pelajaran operasional (mahal, jangan diulang)
 
