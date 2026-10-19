@@ -1,0 +1,57 @@
+{
+  "name": "fase1",
+  "rows": [
+    {
+      "metric": "bandwidth_util_pct",
+      "bound": "min",
+      "budget": 60.0,
+      "status": "measured",
+      "requires": {
+        "kind": "file",
+        "path": "models/smollm2-360m-instruct-q8_0.gguf"
+      },
+      "owner": "#95",
+      "note": "F12 GEMV >= 60% of peak, measured on the real GGUF: the decode step's weighed bytes over the step time over the host's measured peak bandwidth. This is the whole-step figure the report already carries, so it is judged here, not in #95."
+    },
+    {
+      "metric": "gemv_peak_pct",
+      "bound": "min",
+      "budget": 60.0,
+      "status": "not-yet-instrumented",
+      "owner": "#95",
+      "note": "Per-kernel GEMV throughput against peak. Needs Instruments / Metal System Trace counters; the decode step is not split per kernel yet. bandwidth_util_pct above is the whole-step proxy, not this number."
+    },
+    {
+      "metric": "paged_attn_ctx4096_b1_over_theoretical",
+      "bound": "max",
+      "budget": 2.0,
+      "status": "not-yet-instrumented",
+      "owner": "#95",
+      "note": "Attention at ctx 4096 / batch 1 over its theoretical floor (2 * ctx * heads * head_dim * bytes / peak bandwidth). Needs per-kernel timings."
+    },
+    {
+      "metric": "idle_gap_pct",
+      "bound": "max",
+      "budget": 5.0,
+      "status": "not-yet-instrumented",
+      "owner": "#95",
+      "note": "CPU-GPU idle gap between encode and commit on the decode steps that are actually wired (fused prologue + paged-attn v2). Needs a Metal System Trace of a real decode loop."
+    },
+    {
+      "metric": "peak_rss_mb",
+      "bound": "max",
+      "budget": 900.0,
+      "status": "not-yet-instrumented",
+      "owner": "#95",
+      "note": "Target for SmolLM2-360M Q8_0 resident weights + KV on the real file. BenchmarkReport does not carry peak RSS, so this is a declared target, not a measurement."
+    },
+    {
+      "metric": "perplexity_wikitext2",
+      "bound": "max",
+      "budget": 12.0,
+      "status": "not-yet-instrumented",
+      "owner": "#95",
+      "note": "Target for the real GGUF on wikitext2 at stride 512. `bench --eval-ppl` prints PPL but does not attach it to the report the gate reads."
+    }
+  ]
+}
