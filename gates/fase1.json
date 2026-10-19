@@ -19,7 +19,7 @@
       "budget": 60.0,
       "status": "measured",
       "owner": "#95",
-      "note": "Per-kernel GEMV throughput against peak: `bench --probes` times one Q8_0 GEMV pass (1024x1024, the size of a real decode GEMV) and divides its throughput by the host's measured peak bandwidth. Report field `probes.gemv_peak_pct`. The probe does not run unless --probes is passed, so the row skips rather than guesses."
+      "note": "Per-kernel GEMV throughput against peak: `bench --probes` times the NEON Q8_0 GEMV kernel (1024x1024, the size of a real decode GEMV) and divides its throughput by the host's measured peak bandwidth. Report field `probes.gemv_peak_pct`, and `bench::GEMV_PROBE_KERNEL` names the kernel that was timed. Off aarch64 the probe declines (row skips) instead of timing the scalar fallback under this name."
     },
     {
       "metric": "paged_attn_ctx4096_b1_over_theoretical",
@@ -27,7 +27,7 @@
       "budget": 2.0,
       "status": "measured",
       "owner": "#95",
-      "note": "Attention at ctx 4096 / batch 1 over its theoretical floor (2 * ctx * kv_heads * head_dim * 4 B / peak bandwidth): `bench --probes` times the paged-attention kernel at exactly that shape. Report field `probes.paged_attn_ctx4096_b1_over_theoretical`. A CPU kernel cannot reach a memory floor, so a real run is expected to land above 1.0 - the max 2.0 budget is what catches it."
+      "note": "Attention at ctx 4096 / batch 1 over its theoretical floor (2 * ctx * kv_heads * head_dim * 4 B / peak bandwidth): `bench --probes` times the GPU paged-attention v2 kernel at exactly that shape and reports the ratio in `probes.paged_attn_ctx4096_b1_over_theoretical`. The probe declines (row skips) when no Metal device is available, rather than timing the CPU reference under the GPU kernel's name."
     },
     {
       "metric": "idle_gap_pct",

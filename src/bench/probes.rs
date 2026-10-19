@@ -5,7 +5,7 @@
 //!
 //! - [`probe_gemv_peak_pct`] times the NEON Q8_0 GEMV kernel and divides its
 //!   throughput by the host's measured peak bandwidth.
-//! - [`probe_paged_attn_over_theoretical`] times the CPU reference paged-attention
+//! - [`probe_paged_attn_over_theoretical`] times the GPU paged-attention v2
 //!   kernel at ctx 4096 / batch 1 and divides by its arithmetic floor.
 //! - [`probe_sse_stream_consumed`] consumes a real `chat.completion.chunk`
 //!   stream off a live `kanso serve` over plain TCP.
@@ -18,7 +18,7 @@
 //! with the reason spelled out, and the report carries no number for it.
 
 use crate::bench::KernelProbes;
-use crate::metal::paged_attention::{PagedAttentionParams, cpu_paged_attention};
+use crate::metal::paged_attention::PagedAttentionParams;
 use crate::model::Model;
 use crate::quant::neon::neon_gemv_q8_0;
 use crate::quant::q8_0::{BlockQ8_0, QK8_0};
@@ -92,13 +92,21 @@ fn attention_floor_bytes(ctx: usize, num_kv_heads: usize, head_dim: usize) -> f6
     2.0 * ctx as f64 * num_kv_heads as f64 * head_dim as f64 * std::mem::size_of::<f32>() as f64
 }
 
-/// Times the CPU paged-attention kernel at ctx 4096 / batch 1 and reports the
+/// The kernel [`probe_paged_attn_over_theoretical`] actually times (#100).
+///
+/// It is the GPU kernel the row's name refers to. When no Metal device is
+/// available the probe declines instead of timing the CPU reference, because a
+/// CPU reference compared against a memory floor is always far above the
+/// `max 2.0` budget — reporting that as `measured` would be a permanent red
+/// verdict about a kernel nobody timed.
+pub const PAGED_ATTN_PROBE_KERNEL: &str = "gpu_paged_attention_v2";
+
+/// Times the GPU paged-attention v2 kernel at ctx 4096 / batch 1 and reports the
 /// elapsed time over the arithmetic floor
 /// `2 * ctx * kv_heads * head_dim * 4 B / peak bandwidth`.
 ///
-/// A CPU kernel cannot reach a memory floor, so the figure is expected to be well
-/// above 1.0 — that is what the row's `max 2.0` budget is there to catch. The
-/// number is real either way: it is this kernel's own measurement.
+/// `None` when there is no Metal device, or no measured peak bandwidth to divide
+/// by: a ratio against a floor nobody measured is not a measurement.
 pub fn probe_paged_attn_over_theoretical(
     peak_bandwidth_gb_s: f64,
     num_kv_heads: usize,
@@ -120,6 +128,8 @@ pub fn probe_paged_attn_over_theoretical(
         scale: 1.0 / (head_dim as f32).sqrt(),
     };
 
+    let ctx_metal = crate::metal::context::MetalContext::new().ok()?;
+
     let q = vec![0.01f32; num_kv_heads * head_dim];
     let kv_elems = blocks * block_size * num_kv_heads * head_dim;
     let k_cache = vec![0.01f32; kv_elems];
@@ -127,25 +137,24 @@ pub fn probe_paged_attn_over_theoretical(
     let block_tables: Vec<u32> = (0..blocks as u32).collect();
     let context_lens = vec![ctx as u32];
 
-    // Warm-up: the first pass pays for the allocation's page faults.
-    cpu_paged_attention(
-        &q,
-        &k_cache,
-        &v_cache,
-        &block_tables,
-        &context_lens,
-        &params,
-    );
+    let dispatch = || {
+        crate::metal::paged_attention::gpu_paged_attention_v2(
+            &ctx_metal,
+            &q,
+            &k_cache,
+            &v_cache,
+            &block_tables,
+            &context_lens,
+            &params,
+        )
+        .ok()
+    };
+
+    // Warm-up: the first dispatch pays for pipeline setup and buffer allocation.
+    dispatch()?;
 
     let started = Instant::now();
-    let _ = cpu_paged_attention(
-        &q,
-        &k_cache,
-        &v_cache,
-        &block_tables,
-        &context_lens,
-        &params,
-    );
+    dispatch()?;
     let elapsed_s = started.elapsed().as_secs_f64();
     if elapsed_s <= 0.0 {
         return None;
