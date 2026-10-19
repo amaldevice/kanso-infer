@@ -143,21 +143,66 @@ fn test_parse_os_major_versions() {
     assert_eq!(parse_os_major(""), None);
 }
 
-/// This host is macOS 27 (class present), so the version gate must admit it.
+/// The gate must REJECT on pre-15 macOS (the `macos-14` CI runner): the
+/// refusal is an `Err` classified as a runtime gap, never a panic.
 #[cfg(target_os = "macos")]
 #[test]
-fn test_macos_host_passes_the_residency_set_version_gate() {
-    use kanso_infer::hardware::{macos_has_residency_set_class, macos_major_version};
+fn test_version_gate_rejects_pre_15_macos() {
+    use kanso_infer::hardware::{
+        is_metal_runtime_gap, macos_has_residency_set_class, macos_major_version, metal_device,
+    };
 
     let major = macos_major_version().expect("kern.osproductversion must parse on macOS");
-    assert!(
-        major >= 15,
-        "this machine is expected to have the class (macOS 15+), got major {major}"
-    );
-    assert!(
-        macos_has_residency_set_class(),
-        "macOS {major} must pass the residency-set version gate"
-    );
+    if major >= 15 {
+        assert!(
+            macos_has_residency_set_class(),
+            "macOS {major} must pass the gate"
+        );
+        metal_device().expect("macOS 15+ must create a metal device");
+    } else {
+        assert!(
+            !macos_has_residency_set_class(),
+            "macOS {major} must NOT pass the residency-set gate"
+        );
+        let err = metal_device().expect_err("pre-15 macOS must not produce a device");
+        assert!(
+            is_metal_runtime_gap(&err),
+            "the refusal must be a runtime gap, got: {err}"
+        );
+    }
+}
+
+/// The gate must PASS on macOS 15+: the device is a real GPU device, which is
+/// what every metal test on this host relies on.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_version_gate_passes_on_15_plus() {
+    use kanso_infer::hardware::{
+        is_metal_runtime_gap, macos_has_residency_set_class, macos_major_version, metal_device,
+    };
+
+    let major = macos_major_version().expect("kern.osproductversion must parse on macOS");
+    if major >= 15 {
+        assert!(
+            macos_has_residency_set_class(),
+            "macOS {major} must pass the gate"
+        );
+        let dev = metal_device().expect("macOS 15+ must create a metal device");
+        assert!(
+            matches!(dev, Device::Metal(_)),
+            "gate passed, so the device must be a GPU device, got {dev:?}"
+        );
+    } else {
+        assert!(
+            !macos_has_residency_set_class(),
+            "macOS {major} must NOT pass the residency-set gate"
+        );
+        let err = metal_device().expect_err("pre-15 macOS must not produce a device");
+        assert!(
+            is_metal_runtime_gap(&err),
+            "the refusal must be a runtime gap, got: {err}"
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
