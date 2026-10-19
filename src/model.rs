@@ -50,6 +50,68 @@ pub struct PagedAttnContext {
     pub slots: Vec<usize>,
 }
 
+/// The block geometry of a pure-decode batch, padded to the batch's longest table.
+///
+/// One builder for every consumer: the Metal paged-attention kernel, the padded
+/// layout's `index_select` ids and the quantized pool's per-block walk all read the
+/// same padded table, so a second copy of this padding could disagree with the first
+/// about which block a lane points at. Padding repeats a real block (the attention
+/// mask zeroes those lanes out), and a short table is an error rather than a clamp —
+/// clamping would attend over a block the scheduler never allocated.
+struct PaddedDecodeTables {
+    block_size: usize,
+    max_blocks: usize,
+    /// `[num_seqs * max_blocks]` physical block ids, padded.
+    blocks: Vec<u32>,
+}
+
+impl PaddedDecodeTables {
+    fn new(
+        block_size: usize,
+        block_tables: &[Vec<usize>],
+        context_lens: &[usize],
+    ) -> Result<Self, EngineError> {
+        if block_tables.len() != context_lens.len() {
+            return Err(EngineError::Model(format!(
+                "decode batch has {} block tables for {} context lengths",
+                block_tables.len(),
+                context_lens.len()
+            )));
+        }
+        let max_blocks = context_lens
+            .iter()
+            .map(|&ctx| ctx.div_ceil(block_size).max(1))
+            .max()
+            .unwrap_or(1);
+        let mut blocks = Vec::with_capacity(block_tables.len() * max_blocks);
+        for (s, table) in block_tables.iter().enumerate() {
+            let needed = context_lens[s].div_ceil(block_size).max(1);
+            if table.len() < needed {
+                return Err(EngineError::Model(format!(
+                    "forward_batch: sequence {} attends {} tokens but its block table has \
+                     {} of the {} blocks needed",
+                    s,
+                    context_lens[s],
+                    table.len(),
+                    needed
+                )));
+            }
+            for b in 0..max_blocks {
+                blocks.push(table[b.min(needed - 1)] as u32);
+            }
+        }
+        Ok(Self {
+            block_size,
+            max_blocks,
+            blocks,
+        })
+    }
+
+    fn padded_ctx(&self) -> usize {
+        self.max_blocks * self.block_size
+    }
+}
+
 impl PagedAttnContext {
     /// The context of a pure-decode batch: every sequence's block table padded to the
     /// batch's longest, its context length, and the pool row its token landed in.
@@ -58,28 +120,14 @@ impl PagedAttnContext {
         block_tables: &[Vec<usize>],
         context_lens: &[usize],
         slot_mapping: &[usize],
-    ) -> Self {
-        let block_size = kv_storage.block_size();
-        let max_blocks = context_lens
-            .iter()
-            .map(|&ctx| ctx.div_ceil(block_size).max(1))
-            .max()
-            .unwrap_or(1);
-        let mut tables = Vec::with_capacity(block_tables.len() * max_blocks);
-        for (s, blocks) in block_tables.iter().enumerate() {
-            let needed = context_lens[s].div_ceil(block_size).max(1);
-            for b in 0..max_blocks {
-                // Padding repeats the last real block; the kernel never reads past
-                // `context_lens[s]`, so those ids are never dereferenced.
-                tables.push(blocks[b.min(needed - 1).min(blocks.len() - 1)] as u32);
-            }
-        }
-        Self {
-            block_tables: tables,
-            max_blocks,
+    ) -> Result<Self, EngineError> {
+        let tables = PaddedDecodeTables::new(kv_storage.block_size(), block_tables, context_lens)?;
+        Ok(Self {
+            block_tables: tables.blocks,
+            max_blocks: tables.max_blocks,
             context_lens: context_lens.iter().map(|&c| c as u32).collect(),
             slots: slot_mapping.to_vec(),
-        }
+        })
     }
 }
 
@@ -1438,7 +1486,7 @@ impl Model {
                 block_tables,
                 context_lens,
                 slot_mapping,
-            )),
+            )?),
             _ => None,
         };
 
@@ -1631,47 +1679,28 @@ impl Model {
     ) -> Result<DecodeLayout, EngineError> {
         let num_kv_heads = self.config.num_key_value_heads;
         let num_seqs = block_tables.len();
-        let block_size = kv_storage.block_size();
+        // Same builder the paged-attention seam uses: one padding rule, one bounds check.
+        let tables = PaddedDecodeTables::new(kv_storage.block_size(), block_tables, context_lens)?;
+        let max_blocks = tables.max_blocks;
+        let padded_ctx = tables.padded_ctx();
 
-        let max_blocks = context_lens
-            .iter()
-            .map(|&ctx| ctx.div_ceil(block_size))
-            .max()
-            .unwrap_or(1);
-        let padded_ctx = max_blocks * block_size;
-
-        let mut indices = Vec::with_capacity(num_seqs * max_blocks);
-        let mut blocks_padded = Vec::with_capacity(num_seqs * max_blocks);
         let mut mask_data = vec![0.0f32; num_seqs * num_kv_heads * padded_ctx];
-        for s in 0..num_seqs {
-            let blocks = &block_tables[s];
-            let needed = context_lens[s].div_ceil(block_size).max(1);
-            if blocks.len() < needed {
-                return Err(EngineError::Model(format!(
-                    "forward_batch: sequence {} attends {} tokens but its block table has \
-                     {} of the {} blocks needed",
-                    s,
-                    context_lens[s],
-                    blocks.len(),
-                    needed
-                )));
-            }
-            for b in 0..max_blocks {
-                let block = blocks[b.min(needed - 1)];
-                indices.push(block as u32);
-                blocks_padded.push(block as u32);
-            }
+        for (s, &ctx_len) in context_lens.iter().enumerate() {
             for g in 0..num_kv_heads {
                 let row = (s * num_kv_heads + g) * padded_ctx;
-                for j in context_lens[s]..padded_ctx {
+                for j in ctx_len..padded_ctx {
                     mask_data[row + j] = -1e9f32;
                 }
             }
         }
 
         Ok(DecodeLayout {
-            indices: Tensor::from_vec(indices, (num_seqs * max_blocks,), &self.device)?,
-            blocks: blocks_padded,
+            indices: Tensor::from_vec(
+                tables.blocks.clone(),
+                (num_seqs * max_blocks,),
+                &self.device,
+            )?,
+            blocks: tables.blocks,
             max_blocks,
             mask: Tensor::from_vec(
                 mask_data,
