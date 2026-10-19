@@ -3,7 +3,7 @@
 //!
 //! Three of them are real measurements taken on the host:
 //!
-//! - [`probe_gemv_peak_pct`] times one Q8_0 GEMV kernel and divides its
+//! - [`probe_gemv_peak_pct`] times the NEON Q8_0 GEMV kernel and divides its
 //!   throughput by the host's measured peak bandwidth.
 //! - [`probe_paged_attn_over_theoretical`] times the CPU reference paged-attention
 //!   kernel at ctx 4096 / batch 1 and divides by its arithmetic floor.
@@ -20,7 +20,8 @@
 use crate::bench::KernelProbes;
 use crate::metal::paged_attention::{PagedAttentionParams, cpu_paged_attention};
 use crate::model::Model;
-use crate::quant::q8_0::{BlockQ8_0, scalar_gemv_q8_0};
+use crate::quant::neon::neon_gemv_q8_0;
+use crate::quant::q8_0::{BlockQ8_0, QK8_0};
 use std::time::Instant;
 
 /// Attention context the `paged_attn_ctx4096_b1_over_theoretical` row names.
@@ -33,22 +34,37 @@ const PROBE_GEMV_ROWS: usize = 1024;
 const PROBE_GEMV_COLS: usize = 1024;
 
 /// Bytes one Q8_0 block occupies in the packed layout (f32 scale + 32 i8).
-const Q8_0_BLOCK_BYTES: f64 = 4.0 + 32.0;
+const Q8_0_BLOCK_BYTES: f64 = (std::mem::size_of::<f32>() + QK8_0) as f64;
 
-/// Runs one Q8_0 GEMV kernel over a 1024x1024 matrix and reports its throughput
-/// as a percentage of the host's measured peak bandwidth.
+/// The kernel [`probe_gemv_peak_pct`] actually times, so a reader can tell which
+/// number the `gemv_peak_pct` row judged (#100).
+///
+/// On aarch64 this is the hand-written NEON kernel. Elsewhere it is the scalar
+/// reference, which cannot approach a memory peak — so the probe declines to run
+/// there rather than report a figure the row's `>= 60%` budget would misread.
+pub const GEMV_PROBE_KERNEL: &str = if cfg!(target_arch = "aarch64") {
+    "neon_gemv_q8_0"
+} else {
+    "scalar_gemv_q8_0"
+};
+
+/// Runs the NEON Q8_0 GEMV kernel over a 1024x1024 matrix and reports its
+/// throughput as a percentage of the host's measured peak bandwidth.
 ///
 /// The kernel reads every weight byte exactly once, so
 /// `weights_bytes / elapsed / peak` is the share of peak the kernel reached.
+///
+/// `None` off aarch64: the NEON kernel does not exist there, and timing the
+/// scalar fallback would answer a question nobody asked under this name.
 pub fn probe_gemv_peak_pct(peak_bandwidth_gb_s: f64) -> Option<f64> {
-    if peak_bandwidth_gb_s <= 0.0 {
+    if peak_bandwidth_gb_s <= 0.0 || !cfg!(target_arch = "aarch64") {
         return None;
     }
-    let blocks_per_row = PROBE_GEMV_COLS / crate::quant::q8_0::QK8_0;
+    let blocks_per_row = PROBE_GEMV_COLS / QK8_0;
     let weights: Vec<BlockQ8_0> = vec![
         BlockQ8_0 {
             d: 0.01,
-            qs: [1i8; crate::quant::q8_0::QK8_0],
+            qs: [1i8; QK8_0],
         };
         PROBE_GEMV_ROWS * blocks_per_row
     ];
@@ -56,10 +72,10 @@ pub fn probe_gemv_peak_pct(peak_bandwidth_gb_s: f64) -> Option<f64> {
     let mut out = vec![0.0f32; PROBE_GEMV_ROWS];
 
     // One warm-up pass so the first-touch page faults are not billed as time.
-    scalar_gemv_q8_0(&weights, &x, &mut out, PROBE_GEMV_ROWS, PROBE_GEMV_COLS);
+    neon_gemv_q8_0(&weights, &x, &mut out, PROBE_GEMV_ROWS, PROBE_GEMV_COLS);
 
     let started = Instant::now();
-    scalar_gemv_q8_0(&weights, &x, &mut out, PROBE_GEMV_ROWS, PROBE_GEMV_COLS);
+    neon_gemv_q8_0(&weights, &x, &mut out, PROBE_GEMV_ROWS, PROBE_GEMV_COLS);
     let elapsed_s = started.elapsed().as_secs_f64();
     if elapsed_s <= 0.0 {
         return None;
