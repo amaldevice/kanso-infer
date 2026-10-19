@@ -364,3 +364,37 @@ fn the_gemv_probe_produces_a_real_figure_from_the_kernel_it_names() {
         );
     }
 }
+
+/// B3: the paged-attention probe must time the **GPU** kernel its row names, not
+/// the CPU reference. A CPU reference compared against a bandwidth floor is
+/// always far above the budget, so reporting it as `measured` would be a
+/// permanently-red lie about a kernel nobody timed.
+#[test]
+fn the_paged_attn_probe_times_the_gpu_kernel_or_declines() {
+    use kanso_infer::bench::{PAGED_ATTN_PROBE_KERNEL, probe_paged_attn_over_theoretical};
+
+    assert!(
+        PAGED_ATTN_PROBE_KERNEL.contains("gpu"),
+        "the probe must name the GPU kernel it times, got '{PAGED_ATTN_PROBE_KERNEL}'"
+    );
+
+    match probe_paged_attn_over_theoretical(100.0, 5, 64) {
+        // A Metal device was available: the figure is a real timing of the
+        // kernel at ctx 4096 / batch 1, so it is finite and positive.
+        Some(ratio) => {
+            assert!(ratio > 0.0, "a timed kernel reads above zero, got {ratio}");
+            assert!(ratio.is_finite(), "a timing is finite, got {ratio}");
+        }
+        // No Metal device on this box: the probe declines rather than timing the
+        // CPU reference under the GPU kernel's name.
+        None => assert!(
+            kanso_infer::metal::context::MetalContext::new().is_err(),
+            "the probe may only decline when there is no Metal device"
+        ),
+    }
+
+    assert!(
+        probe_paged_attn_over_theoretical(0.0, 5, 64).is_none(),
+        "no measured peak bandwidth means no share of the theoretical floor"
+    );
+}
