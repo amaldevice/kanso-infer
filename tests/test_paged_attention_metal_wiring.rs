@@ -9,6 +9,9 @@
 //!    surface as `Err` instead of a silent fallback to the copying path.
 
 #[cfg(target_os = "macos")]
+mod common;
+
+#[cfg(target_os = "macos")]
 mod metal_paged_attention_wiring {
     use candle_core::{Device, Tensor};
     use kanso_infer::hardware::Backend;
@@ -89,7 +92,9 @@ mod metal_paged_attention_wiring {
 
     #[test]
     fn metal_decode_dispatches_paged_attention_kernel() {
-        let dev = Device::new_metal(0).expect("Metal device");
+        let Some(dev) = crate::common::metal_device_or_skip() else {
+            return;
+        };
         let metal_model = mock(&dev, Backend::Metal);
         let cpu_model = mock(&Device::Cpu, Backend::Cpu);
 
@@ -132,7 +137,9 @@ mod metal_paged_attention_wiring {
 
     #[test]
     fn metal_batched_decode_dispatches_kernel_and_keeps_parity() {
-        let dev = Device::new_metal(0).expect("Metal device");
+        let Some(dev) = crate::common::metal_device_or_skip() else {
+            return;
+        };
         let metal_model = mock(&dev, Backend::Metal);
         let cpu_model = mock(&Device::Cpu, Backend::Cpu);
 
@@ -165,7 +172,9 @@ mod metal_paged_attention_wiring {
 
     #[test]
     fn metal_decode_logits_match_reference_across_contexts() {
-        let dev = Device::new_metal(0).expect("Metal device");
+        let Some(dev) = crate::common::metal_device_or_skip() else {
+            return;
+        };
         let metal_model = mock(&dev, Backend::Metal);
         let cpu_model = mock(&Device::Cpu, Backend::Cpu);
 
@@ -198,7 +207,9 @@ mod metal_paged_attention_wiring {
 
     #[test]
     fn metal_decode_rejects_unrepresentable_kernel_params() {
-        let dev = Device::new_metal(0).expect("Metal device");
+        let Some(dev) = crate::common::metal_device_or_skip() else {
+            return;
+        };
 
         // head_dim 512 exceeds the kernel's MAX_HEAD_DIM (256).
         let mut wide =

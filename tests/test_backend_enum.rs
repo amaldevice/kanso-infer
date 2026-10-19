@@ -1,3 +1,5 @@
+mod common;
+
 use candle_core::Device;
 use kanso_infer::hardware::Backend;
 use kanso_infer::model::Model;
@@ -52,7 +54,9 @@ fn test_neon_backend_refuses_placebo_cpu_run() {
 #[cfg(target_os = "macos")]
 #[test]
 fn test_metal_device_is_honest_gpu() {
-    let device = Backend::Metal.device().expect("metal device");
+    let Some(device) = common::metal_device_or_skip() else {
+        return;
+    };
     assert!(
         matches!(device, Device::Metal(_)),
         "metal backend must resolve to a GPU device, got {device:?}"
@@ -115,11 +119,12 @@ fn test_is_metal_runtime_gap_matches_only_the_capability_prefix() {
 #[cfg(target_os = "macos")]
 #[test]
 fn test_metal_cpu_parity_mock() {
+    let Some(dev) = common::metal_device_or_skip() else {
+        return;
+    };
     let cpu = Model::create_mock_tiny(64, 4, 2, 2, 256).expect("cpu mock");
     let mut metal = Model::create_mock_tiny(64, 4, 2, 2, 256).expect("metal mock");
-    metal
-        .to_device(&Backend::Metal.device().expect("metal device"))
-        .expect("move to metal");
+    metal.to_device(&dev).expect("move to metal");
     metal.set_backend(Backend::Metal);
     assert!(matches!(metal.device, Device::Metal(_)));
 
@@ -154,9 +159,11 @@ fn test_metal_cpu_parity_real_model() {
     else {
         return;
     };
+    let Some(dev) = common::metal_device_or_skip() else {
+        return;
+    };
     let cpu = Model::load_gguf(&path, Device::Cpu).expect("cpu load");
-    let metal = Model::load_gguf(&path, Backend::Metal.device().expect("metal device"))
-        .expect("metal load");
+    let metal = Model::load_gguf(&path, dev).expect("metal load");
     assert!(matches!(metal.device, Device::Metal(_)));
 
     let prompt = vec![1u32, 5, 42];

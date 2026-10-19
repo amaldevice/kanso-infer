@@ -20,6 +20,9 @@
 //! kernel.
 
 #[cfg(target_os = "macos")]
+mod common;
+
+#[cfg(target_os = "macos")]
 mod fused_metal_decode {
     use candle_core::{Device, Tensor};
     use kanso_infer::hardware::Backend;
@@ -126,7 +129,9 @@ mod fused_metal_decode {
 
     #[test]
     fn metal_decode_step_runs_fused_layer_path() {
-        let dev = Device::new_metal(0).expect("Metal device");
+        let Some(dev) = crate::common::metal_device_or_skip() else {
+            return;
+        };
         let metal_model = mock(&dev, Backend::Metal);
         let cpu_model = mock(&Device::Cpu, Backend::Cpu);
 
@@ -148,7 +153,9 @@ mod fused_metal_decode {
 
     #[test]
     fn metal_fused_decode_logits_match_reference() {
-        let dev = Device::new_metal(0).expect("Metal device");
+        let Some(dev) = crate::common::metal_device_or_skip() else {
+            return;
+        };
         let metal_model = mock(&dev, Backend::Metal);
         let cpu_model = mock(&Device::Cpu, Backend::Cpu);
 
@@ -180,7 +187,9 @@ mod fused_metal_decode {
     /// below must not be cited as evidence for it.
     #[test]
     fn metal_fused_decode_submits_one_command_buffer_per_layer_prologue() {
-        let dev = Device::new_metal(0).expect("Metal device");
+        let Some(dev) = crate::common::metal_device_or_skip() else {
+            return;
+        };
         let model = mock(&dev, Backend::Metal);
 
         // Warm-up step: the first step builds the resident weights.
@@ -204,7 +213,9 @@ mod fused_metal_decode {
     /// must fall back to the pre-existing path, with the same logits and no error.
     #[test]
     fn metal_fused_decode_falls_back_outside_kernel_geometry() {
-        let dev = Device::new_metal(0).expect("Metal device");
+        let Some(dev) = crate::common::metal_device_or_skip() else {
+            return;
+        };
         let falls_back = {
             let mut model =
                 Model::create_mock_tiny(66, 3, 1, LAYERS, VOCAB).expect("mock hidden 66");
