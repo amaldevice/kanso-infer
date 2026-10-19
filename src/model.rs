@@ -131,6 +131,19 @@ impl PagedAttnContext {
     }
 }
 
+/// Which logit rows a batched forward keeps.
+///
+/// The serving path samples one token per sequence; the speculative verifier needs the
+/// distribution under every candidate (ticket #90). One flag on the shared body, so the
+/// two entry points cannot drift in anything but the row selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowSelection {
+    /// `[num_seqs, vocab]`: each sequence's last new token.
+    LastPerSequence,
+    /// `[total tokens, vocab]`: every new token.
+    EveryToken,
+}
+
 /// The fused Metal llama-layer kernel on the production decode path (ticket #87).
 mod fused_decode;
 /// Device copy of the block pool plus the kernel dispatch that reads it (ticket #86).
@@ -1325,8 +1338,6 @@ impl Model {
         context_lens: &[usize],
         query_lens: &[usize],
     ) -> Result<Tensor, EngineError> {
-        self.forward_batch_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.forward_batch_rows(
             tokens,
             positions,
@@ -1335,7 +1346,7 @@ impl Model {
             block_tables,
             context_lens,
             query_lens,
-            false,
+            RowSelection::LastPerSequence,
         )
     }
 
@@ -1356,8 +1367,6 @@ impl Model {
         context_lens: &[usize],
         query_lens: &[usize],
     ) -> Result<Tensor, EngineError> {
-        self.forward_batch_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.forward_batch_rows(
             tokens,
             positions,
@@ -1366,10 +1375,16 @@ impl Model {
             block_tables,
             context_lens,
             query_lens,
-            true,
+            RowSelection::EveryToken,
         )
     }
 
+    /// The one implementation behind [`Model::forward_batch`] and
+    /// [`Model::forward_batch_all_rows`]; they differ only in which logit rows survive.
+    ///
+    /// The `forward_batch_calls` counter lives here rather than in the wrappers, so
+    /// "counted exactly once per forward" is a property of the shared body instead of
+    /// something both wrappers have to remember.
     #[allow(clippy::too_many_arguments)]
     fn forward_batch_rows(
         &self,
@@ -1380,8 +1395,11 @@ impl Model {
         block_tables: &[Vec<usize>],
         context_lens: &[usize],
         query_lens: &[usize],
-        all_rows: bool,
+        rows: RowSelection,
     ) -> Result<Tensor, EngineError> {
+        self.forward_batch_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let all_rows = rows == RowSelection::EveryToken;
         let num_seqs = block_tables.len();
         let total: usize = query_lens.iter().sum();
         if num_seqs == 0 {
