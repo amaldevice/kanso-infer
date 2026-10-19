@@ -241,32 +241,51 @@ fn test_perplexity_report_ascii_and_json_serialization() {
     assert_eq!(deserialized.quantized_evals.len(), 3);
 }
 
-/// Legacy reports (ticket #92) wrote `backend` as a lowercase free-form string
-/// (`"cpu"`, `"amx"`, ...). The field is now a typed `Backend` enum, so the
-/// enum must still accept that exact wire form — otherwise every archived
-/// report on disk stops deserializing.
+/// Legacy reports (pre-#92) wrote `backend` as a **PascalCase** string.
+///
+/// `Backend` on `origin/main` derived `Serialize` with no `rename_all`, so
+/// `Backend::Cpu` went to disk as `"Cpu"` — not `"cpu"`. Ticket #92 pinned the wire
+/// form to lowercase and kept the old spelling as `#[serde(alias = "Cpu")]`, which
+/// is the compatibility that actually has to hold: every archived report on disk
+/// carries the PascalCase spelling.
+///
+/// An earlier version of this test asserted `"cpu"`, a form `main` never produced;
+/// it proved nothing. This one round-trips the real historical spelling.
 #[test]
-fn test_legacy_string_backend_report_still_deserializes() {
+fn test_legacy_pascalcase_backend_report_still_deserializes() {
     let legacy = r#"{
         "dataset": "wikitext2",
         "num_tokens": 64,
         "stride": 32,
         "baseline_ppl": 12.5,
         "backends": [
-            {"backend": "cpu", "perplexity": 12.5, "delta_vs_fp32": 0.0},
-            {"backend": "amx", "perplexity": 12.6, "delta_vs_fp32": 0.1}
+            {"backend": "Cpu", "perplexity": 12.5, "delta_vs_fp32": 0.0},
+            {"backend": "Amx", "perplexity": 12.6, "delta_vs_fp32": 0.1}
         ],
         "quantized_evals": [],
         "delta_threshold": 0.15,
         "all_passed": true
     }"#;
     let report: PerplexityReport =
-        serde_json::from_str(legacy).expect("legacy report must deserialize");
+        serde_json::from_str(legacy).expect("a report written by main must still deserialize");
     assert_eq!(report.backends.len(), 2);
     assert_eq!(report.backends[0].backend, kanso_infer::Backend::Cpu);
     assert_eq!(report.backends[1].backend, kanso_infer::Backend::Amx);
 
-    // New reports must keep writing the same lowercase wire form.
+    // New reports write the pinned lowercase wire form; the old one still reads.
     let json = serde_json::to_string(&report).expect("serialize");
     assert!(json.contains("\"backend\":\"cpu\""), "got: {json}");
+    let round_trip: PerplexityReport =
+        serde_json::from_str(&json).expect("the new wire form reads back");
+    assert_eq!(round_trip.backends[0].backend, kanso_infer::Backend::Cpu);
+}
+
+/// The lowercase form #92 pinned must read too, so a report written by this branch
+/// is readable by this branch and by anything that adopted the pinned form early.
+#[test]
+fn test_pinned_lowercase_backend_report_deserializes() {
+    let pinned = r#"{"backend": "cpu", "perplexity": 12.5, "delta_vs_fp32": 0.0}"#;
+    let entry: kanso_infer::bench::BackendPpl =
+        serde_json::from_str(pinned).expect("lowercase backend must deserialize");
+    assert_eq!(entry.backend, kanso_infer::Backend::Cpu);
 }
