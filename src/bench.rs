@@ -10,6 +10,8 @@ pub mod sharegpt;
 pub use sharegpt::*;
 pub mod perplexity;
 pub use perplexity::*;
+pub mod probes;
+pub use probes::*;
 pub mod gate;
 pub use gate::*;
 
@@ -136,8 +138,46 @@ pub struct BenchmarkReport {
     /// Whether the byte fields above came from a weighing (#91).
     #[serde(default)]
     pub telemetry: TelemetryStatus,
+    /// Peak resident set size of the measuring process, straight from
+    /// `hardware::get_peak_rss_mb()` (#100). Zero = predates the field.
+    #[serde(default)]
+    pub peak_rss_mb: f64,
+    /// Perplexity on the bundled WikiText-2 slice, attached only by a run that
+    /// asked for it (`--eval-ppl`). `None` = never evaluated (#100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perplexity_wikitext2: Option<f64>,
+    /// Context length this report ran, so a ctx sweep can pair two reports (#100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_len: Option<usize>,
+    /// The per-kernel / functional probes that ran alongside this workload.
+    /// Absent when no probe was asked for (#100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probes: Option<KernelProbes>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speculative: Option<crate::speculative::profiler::SpeculativeReport>,
+}
+
+/// The numbers that only a dedicated probe can produce (#100).
+///
+/// Every field is an `Option` on purpose: a probe that did not run is `None`
+/// (the gate skips the row), never a `0.0` that would read as a measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct KernelProbes {
+    /// GEMV throughput of one Q8_0 kernel over the host's measured peak
+    /// bandwidth, in percent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemv_peak_pct: Option<f64>,
+    /// Attention at ctx 4096 / batch 1 over its theoretical floor (2 * ctx *
+    /// heads * head_dim * bytes / peak bandwidth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paged_attn_ctx4096_b1_over_theoretical: Option<f64>,
+    /// CPU-GPU idle gap as a percentage of decode step wall time (Metal only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_gap_pct: Option<f64>,
+    /// 1.0 when the SSE smoke harness consumed a whole `chat.completion.chunk`
+    /// stream, 0.0 when it did not. A functional result, not a rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse_sdk_stream_consumed: Option<f64>,
 }
 
 impl BenchmarkReport {
@@ -146,6 +186,34 @@ impl BenchmarkReport {
         speculative: crate::speculative::profiler::SpeculativeReport,
     ) -> Self {
         self.speculative = Some(speculative);
+        self
+    }
+
+    /// Attaches peak RSS, the figure `peak_rss_mb` rows judge (#100).
+    #[must_use]
+    pub fn with_peak_rss_mb(mut self, peak_rss_mb: f64) -> Self {
+        self.peak_rss_mb = peak_rss_mb;
+        self
+    }
+
+    /// Attaches the perplexity a `--eval-ppl` run measured (#100).
+    #[must_use]
+    pub fn with_perplexity_wikitext2(mut self, perplexity: f64) -> Self {
+        self.perplexity_wikitext2 = Some(perplexity);
+        self
+    }
+
+    /// Records the context length this report ran (#100).
+    #[must_use]
+    pub fn with_context_len(mut self, context_len: usize) -> Self {
+        self.context_len = Some(context_len);
+        self
+    }
+
+    /// Attaches the probe results gathered alongside this workload (#100).
+    #[must_use]
+    pub fn with_probes(mut self, probes: KernelProbes) -> Self {
+        self.probes = Some(probes);
         self
     }
 
@@ -320,6 +388,10 @@ pub fn evaluate_run_with_timings(
         peak_bandwidth_gb_s,
         peak_bandwidth_source,
         telemetry: TelemetryStatus::from_bytes(bytes_read_per_step),
+        peak_rss_mb: crate::hardware::get_peak_rss_mb(),
+        perplexity_wikitext2: None,
+        context_len: None,
+        probes: None,
         speculative: None,
     }
 }

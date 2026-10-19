@@ -331,10 +331,24 @@ pub const GATE_METRICS: &[&str] = &[
     "spec_speedup_ratio",
     "batch_scale_ratio",
     "ctx_latency_ratio",
+    "peak_rss_mb",
+    "perplexity_wikitext2",
+    "gemv_peak_pct",
+    "paged_attn_ctx4096_b1_over_theoretical",
+    "idle_gap_pct",
+    "sse_sdk_stream_consumed",
 ];
 
 /// Metrics that need a second report: `last / first` over the run's sweep.
 pub const GATE_RATIO_METRICS: &[&str] = &["batch_scale_ratio", "ctx_latency_ratio"];
+
+/// Metrics a dedicated probe produces; absent means the probe did not run (#100).
+pub const PROBE_METRICS: &[&str] = &[
+    "gemv_peak_pct",
+    "paged_attn_ctx4096_b1_over_theoretical",
+    "idle_gap_pct",
+    "sse_sdk_stream_consumed",
+];
 
 /// A row's number, or why it has none. `Missing` means the metric exists but
 /// this report does not carry it — a skip, never a pass.
@@ -369,6 +383,20 @@ fn metric_value(report: &BenchmarkReport, metric: &str) -> Option<f64> {
             util_pct
         }
         "spec_speedup_ratio" => report.speculative.as_ref()?.speedup_ratio?,
+        // Peak RSS is a whole-process figure every run has (#100).
+        "peak_rss_mb" => report.peak_rss_mb,
+        // Perplexity only exists when the run asked for it (#100).
+        "perplexity_wikitext2" => report.perplexity_wikitext2?,
+        // Probe figures: absent when the probe did not run (#100).
+        "gemv_peak_pct" => report.probes.as_ref()?.gemv_peak_pct?,
+        "paged_attn_ctx4096_b1_over_theoretical" => {
+            report
+                .probes
+                .as_ref()?
+                .paged_attn_ctx4096_b1_over_theoretical?
+        }
+        "idle_gap_pct" => report.probes.as_ref()?.idle_gap_pct?,
+        "sse_sdk_stream_consumed" => report.probes.as_ref()?.sse_sdk_stream_consumed?,
         _ => return None,
     };
     Some(value)
@@ -389,6 +417,11 @@ fn read_metric(report: &BenchmarkReport, metric: &str) -> Reading {
         },
         None if GATE_RATIO_METRICS.contains(&metric) => Reading::Missing(format!(
             "'{metric}' needs two reports (first vs last of the run)"
+        )),
+        // A probe that never ran is a skip with a reason a reader can act on,
+        // not a silent zero (#100).
+        None if PROBE_METRICS.contains(&metric) => Reading::Missing(format!(
+            "report carries no '{metric}': the probe that produces it did not run"
         )),
         None => Reading::Missing(format!("report carries no '{metric}'")),
     }

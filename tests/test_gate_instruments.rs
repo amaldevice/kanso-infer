@@ -85,11 +85,17 @@ fn gate_reads_peak_rss_from_the_report() {
 fn gate_reads_perplexity_only_when_the_report_carries_it() {
     let with_ppl = weighed_report(10.0).with_perplexity_wikitext2(9.5);
 
-    let (measured, verdict) = verdict_of(&budget_for("perplexity_wikitext2", "max", 12.0), &with_ppl);
-    assert_eq!(measured, Some(9.5), "the gate must report 9.5, not a target");
+    let (measured, verdict) =
+        verdict_of(&budget_for("perplexity_wikitext2", "max", 12.0), &with_ppl);
+    assert_eq!(
+        measured,
+        Some(9.5),
+        "the gate must report 9.5, not a target"
+    );
     assert_eq!(verdict, GateVerdict::Passed);
 
-    let (measured, verdict) = verdict_of(&budget_for("perplexity_wikitext2", "max", 8.0), &with_ppl);
+    let (measured, verdict) =
+        verdict_of(&budget_for("perplexity_wikitext2", "max", 8.0), &with_ppl);
     assert_eq!(measured, Some(9.5));
     assert_eq!(
         verdict,
@@ -98,7 +104,10 @@ fn gate_reads_perplexity_only_when_the_report_carries_it() {
     );
 
     let without_ppl = weighed_report(10.0);
-    let (measured, verdict) = verdict_of(&budget_for("perplexity_wikitext2", "max", 12.0), &without_ppl);
+    let (measured, verdict) = verdict_of(
+        &budget_for("perplexity_wikitext2", "max", 12.0),
+        &without_ppl,
+    );
     assert_eq!(measured, None, "no eval, no number");
     assert!(
         matches!(verdict, GateVerdict::Skipped(_)),
@@ -158,7 +167,10 @@ fn gate_reads_idle_gap_from_the_report() {
     let (_, verdict) = verdict_of(&budget_for("idle_gap_pct", "max", 2.0), &report);
     assert_eq!(verdict, GateVerdict::Violated);
 
-    let (measured, verdict) = verdict_of(&budget_for("idle_gap_pct", "max", 5.0), &weighed_report(10.0));
+    let (measured, verdict) = verdict_of(
+        &budget_for("idle_gap_pct", "max", 5.0),
+        &weighed_report(10.0),
+    );
     assert_eq!(measured, None);
     assert!(matches!(verdict, GateVerdict::Skipped(_)));
 }
@@ -169,7 +181,10 @@ fn gate_reads_idle_gap_from_the_report() {
 fn ctx_latency_ratio_comes_from_a_ctx_sweep_of_reports() {
     let short = weighed_report(5.0).with_context_len(128);
     let long = weighed_report(7.0).with_context_len(2048);
-    assert_eq!((short.context_len, long.context_len), (128, 2048));
+    assert_eq!(
+        (short.context_len, long.context_len),
+        (Some(128), Some(2048))
+    );
 
     let budget = budget_for("ctx_latency_ratio", "max", 1.3);
     let outcome = evaluate_gate_run(&budget, &[short, long]).expect("gate evaluates");
@@ -191,7 +206,10 @@ fn gate_reads_the_sse_stream_probe_from_the_report() {
         sse_sdk_stream_consumed: Some(1.0),
         ..KernelProbes::default()
     });
-    let (measured, verdict) = verdict_of(&budget_for("sse_sdk_stream_consumed", "min", 1.0), &consumed);
+    let (measured, verdict) = verdict_of(
+        &budget_for("sse_sdk_stream_consumed", "min", 1.0),
+        &consumed,
+    );
     assert_eq!(measured, Some(1.0));
     assert_eq!(verdict, GateVerdict::Passed);
 
@@ -199,13 +217,21 @@ fn gate_reads_the_sse_stream_probe_from_the_report() {
         sse_sdk_stream_consumed: Some(0.0),
         ..KernelProbes::default()
     });
-    let (measured, verdict) =
-        verdict_of(&budget_for("sse_sdk_stream_consumed", "min", 1.0), &not_consumed);
-    assert_eq!(measured, Some(0.0), "a failed smoke run reports 0, not nothing");
+    let (measured, verdict) = verdict_of(
+        &budget_for("sse_sdk_stream_consumed", "min", 1.0),
+        &not_consumed,
+    );
+    assert_eq!(
+        measured,
+        Some(0.0),
+        "a failed smoke run reports 0, not nothing"
+    );
     assert_eq!(verdict, GateVerdict::Violated);
 
-    let (measured, verdict) =
-        verdict_of(&budget_for("sse_sdk_stream_consumed", "min", 1.0), &weighed_report(10.0));
+    let (measured, verdict) = verdict_of(
+        &budget_for("sse_sdk_stream_consumed", "min", 1.0),
+        &weighed_report(10.0),
+    );
     assert_eq!(measured, None);
     assert!(matches!(verdict, GateVerdict::Skipped(_)));
 }
@@ -229,7 +255,7 @@ fn the_new_fields_survive_the_report_json_round_trip() {
 
     assert!((parsed.peak_rss_mb - report.peak_rss_mb).abs() < 1e-9);
     assert_eq!(parsed.perplexity_wikitext2, Some(11.25));
-    assert_eq!(parsed.context_len, 2048);
+    assert_eq!(parsed.context_len, Some(2048));
     let probes = parsed.probes.expect("probes survive JSON");
     assert_eq!(probes.gemv_peak_pct, Some(64.0));
     assert_eq!(probes.paged_attn_ctx4096_b1_over_theoretical, Some(1.9));
