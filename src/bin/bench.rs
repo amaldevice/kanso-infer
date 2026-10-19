@@ -170,14 +170,10 @@ fn run_gate(
         ],
     };
 
-    let mut violated = false;
-    let mut skipped = false;
-    for report in &parsed {
-        let outcome = kanso_infer::bench::evaluate_gate(&budget, report)?;
-        print!("{}", outcome.format_table());
-        violated |= outcome.code() == 1;
-        skipped |= outcome.code() == 2;
-    }
+    let outcome = kanso_infer::bench::evaluate_gate_run(&budget, &parsed)?;
+    print!("{}", outcome.format_table());
+    let violated = outcome.code() == 1;
+    let skipped = outcome.code() == 2;
     println!("evidence: budget JSON {gate_path}");
     println!("evidence: report JSON {report_path}");
     std::io::stdout().flush()?;
@@ -202,15 +198,19 @@ fn gate_reports(
     use std::io::Write;
 
     let budget = kanso_infer::bench::GateBudget::from_file(std::path::Path::new(gate_path))?;
-    let mut violated = false;
-    let mut skipped = false;
-    for (label, report) in labeled {
-        let outcome = kanso_infer::bench::evaluate_gate(&budget, report)?;
-        println!("[{label}]");
-        print!("{}", outcome.format_table());
-        violated |= outcome.code() == 1;
-        skipped |= outcome.code() == 2;
-    }
+    let reports: Vec<BenchmarkReport> = labeled.iter().map(|(_, r)| (*r).clone()).collect();
+    let outcome = kanso_infer::bench::evaluate_gate_run(&budget, &reports)?;
+    println!(
+        "[{}]",
+        labeled
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    print!("{}", outcome.format_table());
+    let violated = outcome.code() == 1;
+    let skipped = outcome.code() == 2;
 
     let evidence_path = match json_output {
         Some(path) => std::path::PathBuf::from(path),
@@ -220,10 +220,9 @@ fn gate_reports(
                 budget.name,
                 std::process::id()
             ));
-            let json = if labeled.len() == 1 {
-                serde_json::to_string_pretty(labeled[0].1)?
+            let json = if reports.len() == 1 {
+                serde_json::to_string_pretty(&reports[0])?
             } else {
-                let reports: Vec<&BenchmarkReport> = labeled.iter().map(|(_, r)| *r).collect();
                 serde_json::to_string_pretty(&reports)?
             };
             std::fs::write(&path, json)?;

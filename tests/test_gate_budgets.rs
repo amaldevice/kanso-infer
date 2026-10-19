@@ -14,8 +14,8 @@
 //! budget, not a measurement. The real run is #95.
 
 use kanso_infer::bench::{
-    BenchmarkReport, GateBudget, GateRowStatus, GateVerdict, evaluate_gate,
-    evaluate_gate_run, evaluate_run_with_timings,
+    BenchmarkReport, GateBudget, GateRowStatus, GateVerdict, evaluate_gate, evaluate_gate_run,
+    evaluate_run_with_timings,
 };
 use kanso_infer::speculative::profiler::SpeculativeProfiler;
 use std::path::{Path, PathBuf};
@@ -48,7 +48,6 @@ fn asset_free(budget: &GateBudget, metrics: &[&str]) -> GateBudget {
         .cloned()
         .map(|mut r| {
             r.requires = None;
-            r.status = GateRowStatus::Measured;
             r
         })
         .collect();
@@ -80,6 +79,17 @@ fn weighed_report(decode_ms_per_step: f64, total_tokens_per_sec: f64) -> Benchma
     report.peak_bandwidth_source = "measured: synthetic test peak".to_string();
     report.total_tokens_per_sec = total_tokens_per_sec;
     report
+}
+
+/// The same rows with the `not-yet-instrumented` declaration cleared, for tests
+/// that exercise the comparison itself on a synthetic pair. The shipped budget
+/// keeps the declaration — see `fase2_declares_which_f15_rows_are_measurable_today`.
+fn forced_measured(budget: &GateBudget, metrics: &[&str]) -> GateBudget {
+    let mut out = asset_free(budget, metrics);
+    for r in &mut out.rows {
+        r.status = GateRowStatus::Measured;
+    }
+    out
 }
 
 fn row<'a>(
@@ -156,7 +166,10 @@ fn every_not_yet_instrumented_row_names_an_owner_and_a_note() {
 /// The whole point of the two classes: an uninstrumented target is never green.
 #[test]
 fn not_yet_instrumented_rows_report_skipped_never_passed() {
-    let budget = asset_free(&fase1(), &["bandwidth_util_pct", "idle_gap_pct", "gemv_peak_pct"]);
+    let budget = asset_free(
+        &fase1(),
+        &["bandwidth_util_pct", "idle_gap_pct", "gemv_peak_pct"],
+    );
     let outcome = evaluate_gate(&budget, &weighed_report(10.0, 200.0)).expect("gate evaluates");
 
     let idle = row(&outcome, "idle_gap_pct");
@@ -170,7 +183,10 @@ fn not_yet_instrumented_rows_report_skipped_never_passed() {
     assert_eq!(idle.measured, None, "an unmeasured row has no number");
     assert_eq!(idle.ratio, None, "an unmeasured row has no ratio");
     assert!(
-        matches!(row(&outcome, "gemv_peak_pct").verdict, GateVerdict::Skipped(_)),
+        matches!(
+            row(&outcome, "gemv_peak_pct").verdict,
+            GateVerdict::Skipped(_)
+        ),
         "gemv_peak_pct must be skipped until #95 instruments it:\n{}",
         outcome.format_table()
     );
@@ -208,6 +224,26 @@ fn fase1_declares_the_uninstrumented_f12_targets() {
     );
 }
 
+/// F15's measured rows are the ones a real run can actually fill today.
+#[test]
+fn fase2_declares_which_f15_rows_are_measurable_today() {
+    let budget = fase2();
+    for metric in ["batch_scale_ratio", "spec_speedup_ratio"] {
+        assert_eq!(
+            row_in(&budget, metric).status,
+            GateRowStatus::Measured,
+            "'{metric}' is read straight off the report a real run writes"
+        );
+    }
+    for metric in ["ctx_latency_ratio", "sse_sdk_stream_consumed"] {
+        assert_eq!(
+            row_in(&budget, metric).status,
+            GateRowStatus::NotYetInstrumented,
+            "'{metric}' has no bench path producing it yet"
+        );
+    }
+}
+
 fn row_in<'a>(budget: &'a GateBudget, metric: &str) -> &'a kanso_infer::bench::GateRow {
     budget
         .rows
@@ -226,7 +262,11 @@ fn bandwidth_util_pct_is_derived_from_weighed_bytes_and_measured_peak() {
 
     let util = row(&outcome, "bandwidth_util_pct");
     assert_eq!(util.measured.expect("measured"), 50.0);
-    assert_eq!(util.verdict, GateVerdict::Violated, "50% is under the 60% bar");
+    assert_eq!(
+        util.verdict,
+        GateVerdict::Violated,
+        "50% is under the 60% bar"
+    );
 }
 
 /// A step that does reach the bar passes. 100 MB/step at 8 ms/step is 12.5 GB/s
@@ -252,7 +292,7 @@ fn asset_rows_are_skipped_not_passed_when_the_gguf_is_absent() {
 
     let outcome = evaluate_gate(&fase2(), &weighed_report(10.0, 200.0)).expect("gate evaluates");
 
-    for metric in ["batch_scale_ratio", "ctx_latency_ratio", "spec_speedup_ratio"] {
+    for metric in ["batch_scale_ratio", "spec_speedup_ratio"] {
         match &row(&outcome, metric).verdict {
             GateVerdict::Skipped(reason) => assert!(
                 reason.contains("missing required asset"),
@@ -261,13 +301,15 @@ fn asset_rows_are_skipped_not_passed_when_the_gguf_is_absent() {
             other => panic!("'{metric}' must not be {other:?} without the GGUF"),
         }
     }
-    assert!(
-        matches!(
-            row(&outcome, "sse_sdk_stream_consumed").verdict,
-            GateVerdict::Skipped(_)
+    // `sse_sdk_stream_consumed` has no asset requirement, so the asset check
+    // does not skip it — but nothing measures it yet, so it is skipped too.
+    match &row(&outcome, "sse_sdk_stream_consumed").verdict {
+        GateVerdict::Skipped(reason) => assert!(
+            reason.contains("not yet instrumented"),
+            "the SDK stream row must say it is not instrumented, got '{reason}'"
         ),
-        "the SDK stream row is not instrumented either"
-    );
+        other => panic!("sse_sdk_stream_consumed must not be {other:?}"),
+    }
     assert_eq!(outcome.code(), 2, "no GGUF means exit 2, never 0");
     assert!(!outcome.passed());
 }
@@ -277,9 +319,10 @@ fn asset_rows_are_skipped_not_passed_when_the_gguf_is_absent() {
 #[test]
 fn spec_speedup_below_one_is_reported_as_a_violation() {
     let mut profiler = SpeculativeProfiler::new();
+    // One speculative step costing 20 ms; a 16.8 ms autoregressive baseline for
+    // the same tokens is the 0.84x #55 measured on the real pair.
     profiler.record_step(4, 3, Duration::from_millis(20), true);
-    // 40 ms autoregressive over 47.6 ms speculative = 0.84x.
-    let spec = profiler.report_with_speedup(Duration::from_millis(47.6));
+    let spec = profiler.report_with_speedup(Duration::from_micros(16_800));
 
     let budget = asset_free(&fase2(), &["spec_speedup_ratio"]);
     let report = weighed_report(10.0, 200.0).with_speculative(spec);
@@ -340,7 +383,7 @@ fn batch_scale_ratio_is_last_report_over_first() {
 /// Context latency: ctx 2048 costs at most 1.3x ctx 128 on the same weights.
 #[test]
 fn ctx_latency_ratio_compares_the_last_step_to_the_first() {
-    let budget = asset_free(&fase2(), &["ctx_latency_ratio"]);
+    let budget = forced_measured(&fase2(), &["ctx_latency_ratio"]);
     let run = vec![weighed_report(5.0, 100.0), weighed_report(7.0, 100.0)];
     let outcome = evaluate_gate_run(&budget, &run).expect("gate evaluates");
 
@@ -356,7 +399,7 @@ fn ctx_latency_ratio_compares_the_last_step_to_the_first() {
 /// A ratio row needs two reports; one report alone cannot say 4x or 1.3x.
 #[test]
 fn ratio_rows_are_skipped_when_the_run_has_only_one_report() {
-    let budget = asset_free(&fase2(), &["batch_scale_ratio", "ctx_latency_ratio"]);
+    let budget = forced_measured(&fase2(), &["batch_scale_ratio", "ctx_latency_ratio"]);
     let run = vec![weighed_report(10.0, 200.0)];
     let outcome = evaluate_gate_run(&budget, &run).expect("gate evaluates");
 
@@ -369,4 +412,60 @@ fn ratio_rows_are_skipped_when_the_run_has_only_one_report() {
             other => panic!("'{metric}' must not be {other:?} from one report"),
         }
     }
+}
+
+/// The CI invariant: on a runner with no model, the gate reads the shipped
+/// `gates/no-measurement.json` and every row of both budgets comes back
+/// `skipped`. Zero passes, exit 2 — so CI can run the gate without a GGUF and
+/// without pretending it measured anything.
+#[test]
+fn the_ci_no_measurement_report_skips_every_row_of_both_budgets() {
+    let evidence = std::fs::read_to_string(repo_path("gates/no-measurement.json"))
+        .expect("gates/no-measurement.json is committed for CI");
+    let report: BenchmarkReport =
+        serde_json::from_str(&evidence).expect("the CI evidence report parses");
+
+    for budget in [fase1(), fase2()] {
+        let outcome = evaluate_gate(&budget, &report).expect("gate evaluates");
+        assert_eq!(
+            outcome.code(),
+            2,
+            "gate '{}' must exit 2 without a model:\n{}",
+            budget.name,
+            outcome.format_table()
+        );
+        assert!(
+            !outcome.passed(),
+            "gate '{}' must not pass on an unweighed report:\n{}",
+            budget.name,
+            outcome.format_table()
+        );
+        for r in &outcome.rows {
+            assert!(
+                matches!(r.verdict, GateVerdict::Skipped(_)),
+                "row '{}' in gate '{}' must be skipped, got {:?}",
+                r.metric,
+                budget.name,
+                r.verdict
+            );
+            assert_eq!(r.measured, None, "a skipped row carries no number");
+        }
+    }
+}
+
+/// A broken budget must be loud: a violation in any row of the shipped file is
+/// exit 1, and the reasons name the row.
+#[test]
+fn a_violated_row_makes_the_whole_budget_red_and_names_itself() {
+    let budget = asset_free(&fase1(), &["bandwidth_util_pct"]);
+    let outcome = evaluate_gate(&budget, &weighed_report(10.0, 200.0)).expect("gate evaluates");
+
+    assert_eq!(outcome.code(), 1);
+    let reasons = outcome.reasons();
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.starts_with("bandwidth_util_pct: violated")),
+        "the reasons must name the broken row: {reasons:?}"
+    );
 }
