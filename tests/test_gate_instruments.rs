@@ -395,3 +395,70 @@ fn the_paged_attn_probe_times_the_gpu_kernel_or_declines() {
         "no measured peak bandwidth means no share of the theoretical floor"
     );
 }
+
+/// B5: `ctx_latency_ratio` must be a *context* ratio. Two reports that differ
+/// only in batch size are not a context sweep, so the row must skip rather than
+/// relabel batch latency as context latency.
+#[test]
+fn ctx_latency_ratio_skips_a_batch_sweep() {
+    // A `--batch-sizes 1,8` run: same context, different batch, different latency.
+    let batch1 = weighed_report(5.0).with_context_len(128);
+    let batch8 = weighed_report(7.0).with_context_len(128);
+
+    let budget = budget_for("ctx_latency_ratio", "max", 1.3);
+    let outcome = evaluate_gate_run(&budget, &[batch1, batch8]).expect("gate evaluates");
+    let row = &outcome.rows[0];
+    assert_eq!(
+        row.measured, None,
+        "a batch sweep has no context ratio to report, got {:?}",
+        row.measured
+    );
+    match &row.verdict {
+        GateVerdict::Skipped(reason) => assert!(
+            reason.contains("context") || reason.contains("context_len"),
+            "the skip reason must say this is not a context pair, got '{reason}'"
+        ),
+        other => panic!("a batch sweep must not read as a ctx ratio, got {other:?}"),
+    }
+}
+
+/// B5: the numerator is always the *larger* context, so `--ctx-lengths 2048,128`
+/// and `--ctx-lengths 128,2048` must produce the same ratio instead of silently
+/// inverting it.
+#[test]
+fn ctx_latency_ratio_orders_the_pair_by_context_not_by_run_order() {
+    let budget = budget_for("ctx_latency_ratio", "max", 1.3);
+
+    let short = weighed_report(5.0).with_context_len(128);
+    let long = weighed_report(7.0).with_context_len(2048);
+
+    let forward = evaluate_gate_run(&budget, &[short.clone(), long.clone()]).expect("gate");
+    let reversed = evaluate_gate_run(&budget, &[long, short]).expect("gate");
+
+    assert_eq!(
+        forward.rows[0].measured,
+        Some(1.4),
+        "ctx 2048 at 7 ms over ctx 128 at 5 ms is 1.4x"
+    );
+    assert_eq!(
+        reversed.rows[0].measured,
+        forward.rows[0].measured,
+        "reversing the sweep order must not invert the ratio"
+    );
+    assert_eq!(reversed.rows[0].verdict, GateVerdict::Violated);
+}
+
+/// B5: a report that never recorded its context length cannot be paired, even
+/// when two of them are present.
+#[test]
+fn ctx_latency_ratio_skips_reports_without_a_context_len() {
+    let budget = budget_for("ctx_latency_ratio", "max", 1.3);
+    let run = vec![weighed_report(5.0), weighed_report(7.0)];
+    let outcome = evaluate_gate_run(&budget, &run).expect("gate evaluates");
+
+    assert_eq!(outcome.rows[0].measured, None);
+    assert!(matches!(
+        outcome.rows[0].verdict,
+        GateVerdict::Skipped(_)
+    ));
+}
