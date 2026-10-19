@@ -393,7 +393,11 @@ fn batch_scale_ratio_is_last_report_over_first() {
 #[test]
 fn ctx_latency_ratio_compares_the_last_step_to_the_first() {
     let budget = forced_measured(&fase2(), &["ctx_latency_ratio"]);
-    let run = vec![weighed_report(5.0, 100.0), weighed_report(7.0, 100.0)];
+    // A real context pair: the run must say which context each report ran (#100).
+    let run = vec![
+        weighed_report(5.0, 100.0).with_context_len(128),
+        weighed_report(7.0, 100.0).with_context_len(2048),
+    ];
     let outcome = evaluate_gate_run(&budget, &run).expect("gate evaluates");
 
     let ratio = row(&outcome, "ctx_latency_ratio");

@@ -441,8 +441,7 @@ fn ctx_latency_ratio_orders_the_pair_by_context_not_by_run_order() {
         "ctx 2048 at 7 ms over ctx 128 at 5 ms is 1.4x"
     );
     assert_eq!(
-        reversed.rows[0].measured,
-        forward.rows[0].measured,
+        reversed.rows[0].measured, forward.rows[0].measured,
         "reversing the sweep order must not invert the ratio"
     );
     assert_eq!(reversed.rows[0].verdict, GateVerdict::Violated);
@@ -457,8 +456,5 @@ fn ctx_latency_ratio_skips_reports_without_a_context_len() {
     let outcome = evaluate_gate_run(&budget, &run).expect("gate evaluates");
 
     assert_eq!(outcome.rows[0].measured, None);
-    assert!(matches!(
-        outcome.rows[0].verdict,
-        GateVerdict::Skipped(_)
-    ));
+    assert!(matches!(outcome.rows[0].verdict, GateVerdict::Skipped(_)));
 }
