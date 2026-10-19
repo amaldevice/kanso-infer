@@ -1,0 +1,13 @@
+{
+  "name": "self-check",
+  "rows": [
+    {
+      "metric": "bandwidth_util_pct",
+      "bound": "min",
+      "budget": 60.0,
+      "status": "measured",
+      "owner": "#82",
+      "note": "F12's bandwidth floor, restated without the GGUF requirement so a CI runner without the model can still prove the comparison works. Paired with gates/self-check-violation.json this budget MUST exit 1 (spec #82 B2)."
+    }
+  ]
+}

@@ -27,8 +27,13 @@ jobs:
   # report SKIPPED (exit 2) from `gates/no-measurement.json`, so the job verifies
   # the mechanism and stays green. A violated row is still exit 1 and still red.
   # The real measurement is #95, on a Mac with the model on disk.
+  #
+  # Because "everything skipped" is green, the script also runs a self-check
+  # (spec #82 B2): `gates/self-check-violation.json` is a weighed synthetic report
+  # that breaks `gates/self-check-budget.json`'s floor, and the gate MUST exit 1 on
+  # it. If it ever exits 0, the job fails.
   budgets:
-    name: F12/F15 budget gates (skipped without a GGUF, never passed)
+    name: F12/F15 budget gates (skipped without a GGUF, never passed; self-check must go red)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4

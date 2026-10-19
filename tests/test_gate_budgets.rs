@@ -469,3 +469,60 @@ fn a_violated_row_makes_the_whole_budget_red_and_names_itself() {
         "the reasons must name the broken row: {reasons:?}"
     );
 }
+
+/// Spec #82 B2: CI runs the budget gates against `gates/no-measurement.json`, where
+/// every row skips and the job stays green. That verifies the plumbing, not the
+/// budget — a gate that can never go red is only a name.
+///
+/// This is the self-check that proves it can: a *weighed* synthetic report that
+/// breaks a real shipped row must exit 1, not 2 and not 0. The evidence is
+/// committed at `gates/self-check-violation.json` and read by
+/// `scripts/gate-ci.sh --self-check`, so CI fails if the gate ever stops failing.
+#[test]
+fn the_ci_self_check_evidence_makes_the_gate_red() {
+    let evidence = std::fs::read_to_string(repo_path("gates/self-check-violation.json"))
+        .expect("gates/self-check-violation.json is committed for the CI self-check");
+    let report: BenchmarkReport =
+        serde_json::from_str(&evidence).expect("the self-check evidence report parses");
+    assert!(
+        !report.is_unweighed(),
+        "the self-check must carry weighed bytes, otherwise the gate skips instead of judging"
+    );
+
+    // `gates/self-check-budget.json` is the shipped asset-free restatement of
+    // fase1's bandwidth floor: the same 60% bound, no GGUF requirement, so CI can
+    // judge it on a runner without the model.
+    let budget = GateBudget::from_file(&repo_path("gates/self-check-budget.json"))
+        .expect("gates/self-check-budget.json parses");
+    let outcome = evaluate_gate(&budget, &report).expect("gate evaluates");
+
+    assert_eq!(
+        outcome.code(),
+        1,
+        "the self-check evidence must VIOLATE fase1's bandwidth floor:\n{}",
+        outcome.format_table()
+    );
+    assert!(!outcome.passed(), "a violated gate is never a pass");
+    let reasons = outcome.reasons();
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.starts_with("bandwidth_util_pct: violated")),
+        "the red verdict must name the broken row: {reasons:?}"
+    );
+
+    // The same budget on the unweighed CI report must skip (2), never pass: the
+    // self-check has to distinguish "no evidence" from "evidence that fails".
+    let unweighed: BenchmarkReport = serde_json::from_str(
+        &std::fs::read_to_string(repo_path("gates/no-measurement.json"))
+            .expect("gates/no-measurement.json is committed for CI"),
+    )
+    .expect("the CI evidence report parses");
+    let skipped = evaluate_gate(&budget, &unweighed).expect("gate evaluates");
+    assert_eq!(
+        skipped.code(),
+        2,
+        "an unweighed report must skip, not pass or fail:\n{}",
+        skipped.format_table()
+    );
+}
