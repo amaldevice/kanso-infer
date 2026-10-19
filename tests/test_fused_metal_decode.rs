@@ -163,12 +163,21 @@ mod fused_metal_decode {
         }
     }
 
-    /// Acceptance #4: the fused chain is one submission per layer, read from the
-    /// production entry point rather than from the kernel harness.
+    /// Acceptance #4, scoped to what is actually observable: the fused **prologue**
+    /// is one submission per layer, read from the production entry point rather than
+    /// from the kernel harness.
     ///
-    /// Before #87 the prologue cost one command buffer per op (RMSNorm, three projections,
-    /// two RoPE passes). The fused kernel encodes the whole prologue into one buffer and
-    /// waits once, so a step's fused submissions must equal the layer count — not more.
+    /// Before #87 the prologue cost one command buffer per op (RMSNorm, three
+    /// projections, two RoPE passes). The fused kernel encodes the whole prologue into
+    /// one buffer and waits once, so a step's *prologue* submissions must equal the
+    /// layer count.
+    ///
+    /// This is deliberately NOT a claim about command buffers per decode step.
+    /// `fused_prologue_command_buffers` reads the fused seam's own `MetalContext`;
+    /// the paged-attention seam has a second context and candle submits the tensor
+    /// path on the device queue, so the per-step total is structurally invisible from
+    /// here. ADR-0002 records the one-buffer-per-step goal as unpaid debt; the number
+    /// below must not be cited as evidence for it.
     #[test]
     fn metal_fused_decode_submits_one_command_buffer_per_layer_prologue() {
         let dev = Device::new_metal(0).expect("Metal device");
@@ -177,17 +186,17 @@ mod fused_metal_decode {
         // Warm-up step: the first step builds the resident weights.
         let _ = batch_logits(&model, 128);
         assert!(
-            model.metal_command_buffers() > 0,
-            "the fused decode path must submit command buffers through its own Metal context"
+            model.fused_prologue_command_buffers() > 0,
+            "the fused prologue must submit command buffers through its own Metal context"
         );
 
-        let before = model.metal_command_buffers();
+        let before = model.fused_prologue_command_buffers();
         let _ = batch_logits(&model, 128);
         assert_eq!(
-            model.metal_command_buffers() - before,
+            model.fused_prologue_command_buffers() - before,
             LAYERS,
             "the fused prologue must be one command buffer per layer (RMSNorm + QKV + RoPE \
-             chained), not one per op"
+             chained), not one per op — this says nothing about the per-op tail"
         );
     }
 

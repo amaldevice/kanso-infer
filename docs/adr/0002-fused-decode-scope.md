@@ -53,7 +53,12 @@ production entry point:
   zero on CPU);
 * logits match the CPU reference within `1e-3` relative, at ctx 128 and 512;
 * the prologue is one command buffer **per layer**, not one per op — the property
-  `tests/test_single_command_buffer.rs` proves for the kernel in isolation;
+  `tests/test_single_command_buffer.rs` proves for the kernel in isolation. What
+  `tests/test_fused_metal_decode.rs` asserts is scoped to the prologue's own
+  `MetalContext` (`Model::fused_prologue_command_buffers`); it cannot see the
+  paged-attention seam's second context or candle's device-queue submissions, so it
+  is evidence for "one buffer per layer prologue" and **not** for "one buffer per
+  step". Nothing in this change measures the per-step total;
 * a hidden size off the float4 geometry (`66`, not a multiple of 4) falls back with
   unchanged logits and zero fused calls.
 

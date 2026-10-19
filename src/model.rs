@@ -196,7 +196,14 @@ impl Model {
     }
 
     /// Command buffers the fused decode seam submitted.
-    pub fn metal_command_buffers(&self) -> usize {
+    ///
+    /// This counts **only the fused prologue's own Metal context**. It is not a
+    /// total for the step: the paged-attention seam owns a second `MetalContext`,
+    /// and the tensor path's GEMMs are submitted by candle on the device queue,
+    /// neither of which is visible here. Read it as "the prologue's submissions",
+    /// never as "command buffers per decode step" — the per-step total does not
+    /// exist yet (ADR-0002 records that debt).
+    pub fn fused_prologue_command_buffers(&self) -> usize {
         self.fused_decode
             .borrow()
             .as_ref()
