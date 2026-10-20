@@ -22,6 +22,8 @@
 //! Timing/memory criteria are only meaningful in release builds; in debug builds
 //! the heavy SmolLM2-shaped cases short-circuit with a printed note.
 
+mod common;
+
 use candle_core::quantized::gguf_file::{self, Value};
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{Device, Tensor};
@@ -561,8 +563,7 @@ fn test_quantized_weights_run_on_metal() {
     let q8_path = fixture_path("q8_0-small", &SMALL, GgmlDType::Q8_0, scale);
     let cpu_model = Model::load_gguf(&q8_path, Device::Cpu).expect("load q8_0 fixture");
 
-    let Ok(metal) = Device::new_metal(0) else {
-        eprintln!("SKIP: no Metal device available");
+    let Some(metal) = common::metal_device_or_skip() else {
         return;
     };
     let mut model = Model::new(
