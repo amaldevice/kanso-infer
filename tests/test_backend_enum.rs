@@ -123,15 +123,13 @@ fn test_is_metal_runtime_gap_matches_only_the_capability_prefix() {
 fn test_parse_os_major_versions() {
     use kanso_infer::hardware::parse_os_major;
 
-    // Note: 23 is Darwin's version for macOS 14. If a value like that ever
-    // reaches the gate, it is rejected (there is no macOS 23) — fail closed.
-    for (version, want) in [
-        ("14.7.1", 14),
-        ("15.0", 15),
-        ("27.0", 27),
-        ("23.6.0", 23),
-        ("15", 15),
-    ] {
+    // Note: this only parses the number; it does NOT validate a macOS range.
+    // A Darwin value like "23.6.0" parses to 23 and would PASS the `>= 15`
+    // gate — which is exactly why the version source must be
+    // `kern.osproductversion` (real macOS), not `uname -r` (Darwin).
+    // Fail-closed lives one level up: `macos_major_version() -> None`
+    // (unreadable) makes the gate reject.
+    for (version, want) in [("14.7.1", 14), ("15.0", 15), ("27.0", 27), ("15", 15)] {
         assert_eq!(
             parse_os_major(version),
             Some(want),
