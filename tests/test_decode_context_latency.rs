@@ -104,6 +104,10 @@ fn decode_step_ms(model: &Model, reps: usize) -> (f64, f64, f64) {
 }
 
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only latency gate (ticket #104): run `cargo test --release`"
+)]
 fn decode_latency_does_not_scale_with_context() {
     let mut model = Model::create_mock_tiny(HIDDEN, Q_HEADS, KV_HEADS, LAYERS, VOCAB)
         .expect("mock model at SmolLM2-360M dimensions");

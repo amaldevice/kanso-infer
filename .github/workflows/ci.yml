@@ -49,7 +49,7 @@ jobs:
   # builds (reported as ignored, never as a pass under a lowered floor) and run here
   # (ticket #61 F5).
   release-gates:
-    name: release-only gates (batch-8 4x, speculative 1.3x)
+    name: release-only gates (batch-8 4x, speculative 1.3x, ctx-latency 1.3x)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -61,3 +61,5 @@ jobs:
         run: cargo test --release --test test_batched_forward
       - name: speculative speedup gate
         run: cargo test --release --test test_speculative_draft_kv
+      - name: decode-context-latency gate
+        run: cargo test --release --test test_decode_context_latency
