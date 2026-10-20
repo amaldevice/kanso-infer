@@ -87,6 +87,7 @@ impl PagedAttnSeam {
         max_blocks: usize,
         context_lens: &[u32],
         slots: &[usize],
+        recycled_blocks: &[usize],
         shape: &AttnShape,
     ) -> Result<Tensor, EngineError> {
         let num_seqs = context_lens.len();
@@ -138,7 +139,7 @@ impl PagedAttnSeam {
         self.upload_q(&q_host);
         self.reserve_out(out_elems);
 
-        self.refresh_pool(kv, layer, slots)?;
+        self.refresh_pool(kv, layer, slots, recycled_blocks)?;
 
         let pool = self.pools[layer]
             .as_ref()
@@ -213,13 +214,16 @@ impl PagedAttnSeam {
 
     /// Brings `layer`'s device copy of the pool up to date: whole-pool upload the first
     /// time this layer is seen (or when the pool tensor is replaced), then one row copy
-    /// per slot the step wrote. A rewritten slot — block reuse, speculation rollback — is
-    /// just another row copy, so it needs no special case.
+    /// per slot the step wrote, plus whole-block copies for blocks the pool erased since
+    /// the last step (ticket #106). A rewritten slot — speculation rollback — is just
+    /// another row copy; a recycled block needs every row because the previous request's
+    /// prompt rows never passed through this seam and must not be read as the new one's.
     fn refresh_pool(
         &mut self,
         kv: &KvStorage,
         layer: usize,
         slots: &[usize],
+        recycled_blocks: &[usize],
     ) -> Result<(), EngineError> {
         let source = kv.kv_k[layer].id();
         let rows = kv.num_blocks * kv.block_size;
@@ -235,7 +239,12 @@ impl PagedAttnSeam {
             return Ok(());
         }
 
-        for &slot in slots {
+        let mut refresh = slots.to_vec();
+        for &block in recycled_blocks {
+            let start = block * kv.block_size;
+            refresh.extend(start..start + kv.block_size);
+        }
+        for slot in refresh {
             if slot >= rows {
                 return Err(EngineError::Metal(format!(
                     "metal paged attention: slot {slot} outside the {rows}-row pool"

@@ -48,6 +48,9 @@ pub struct PagedAttnContext {
     pub context_lens: Vec<u32>,
     /// Pool row each sequence's query token was just written to.
     pub slots: Vec<usize>,
+    /// Blocks erased since the last decode step (ticket #106): the seam's device copy
+    /// still holds their old contents, so it copies these blocks whole from the pool.
+    pub recycled_blocks: Vec<usize>,
 }
 
 /// The block geometry of a pure-decode batch, padded to the batch's longest table.
@@ -120,6 +123,7 @@ impl PagedAttnContext {
         block_tables: &[Vec<usize>],
         context_lens: &[usize],
         slot_mapping: &[usize],
+        recycled_blocks: Vec<usize>,
     ) -> Result<Self, EngineError> {
         let tables = PaddedDecodeTables::new(kv_storage.block_size(), block_tables, context_lens)?;
         Ok(Self {
@@ -127,6 +131,7 @@ impl PagedAttnContext {
             max_blocks: tables.max_blocks,
             context_lens: context_lens.iter().map(|&c| c as u32).collect(),
             slots: slot_mapping.to_vec(),
+            recycled_blocks,
         })
     }
 }
@@ -883,6 +888,7 @@ impl Model {
             paged.max_blocks,
             &paged.context_lens,
             &paged.slots,
+            &paged.recycled_blocks,
             &shape,
         )?;
         self.paged_attention_calls
@@ -1091,6 +1097,11 @@ impl Model {
         let mut hidden = self.embed(&token_ids)?;
 
         let block_size = kv_storage.block_size();
+        let recycled_blocks = if matches!(self.backend, Backend::Metal) {
+            kv_storage.take_recycled_blocks()
+        } else {
+            Vec::new()
+        };
         let block_idx = pos / block_size;
         let offset = pos % block_size;
 
@@ -1157,6 +1168,7 @@ impl Model {
                     offset,
                     block_size,
                 )],
+                recycled_blocks: recycled_blocks.clone(),
             };
             let attn_out = self.decode_attention_paged(&q, &paged, kv_storage, layer_idx)?;
             // Merge heads back: [1, hidden_size]
@@ -1440,6 +1452,14 @@ impl Model {
         // (query i of sequence s sits at absolute position `positions[offset + i]`).
         // Pure decode batches attend in one padded pass and need no mask at all.
         let pure_decode = query_lens.iter().all(|&q_len| q_len == 1);
+        // #106: the Metal seam reads its own device copy of the pool, so blocks erased
+        // since the last decode step must be re-copied whole before it runs. Only drain
+        // when the seam will actually dispatch; otherwise the next decode picks them up.
+        let recycled_blocks = if matches!(self.backend, Backend::Metal) && pure_decode {
+            kv_storage.take_recycled_blocks()
+        } else {
+            Vec::new()
+        };
         let mut offsets = Vec::with_capacity(num_seqs);
         let mut masks: Vec<Option<Tensor>> = Vec::with_capacity(num_seqs);
         let mut offset = 0usize;
@@ -1504,6 +1524,7 @@ impl Model {
                 block_tables,
                 context_lens,
                 slot_mapping,
+                recycled_blocks,
             )?),
             _ => None,
         };

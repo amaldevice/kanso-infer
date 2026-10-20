@@ -11,6 +11,10 @@ pub struct KvStorage {
     pub block_size: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
+    /// Blocks erased since the last consumer picked them up (ticket #106). The Metal
+    /// paged-attention seam keeps a device copy of this pool, so an erase has to reach
+    /// that copy too: the seam refreshes every block listed here from the pool.
+    recycled_blocks: Vec<usize>,
 }
 
 impl KvStorage {
@@ -78,6 +82,7 @@ impl KvStorage {
             block_size,
             n_kv_heads,
             head_dim,
+            recycled_blocks: Vec::new(),
         })
     }
 
@@ -94,6 +99,7 @@ impl KvStorage {
             block_size: self.block_size,
             n_kv_heads: self.n_kv_heads,
             head_dim: self.head_dim,
+            recycled_blocks: self.recycled_blocks.clone(),
         })
     }
 
@@ -136,6 +142,44 @@ impl KvStorage {
             .slice_set(&run_v, 1, offset)?;
 
         Ok(())
+    }
+
+    /// Erases one physical block across all layers (ticket #106).
+    ///
+    /// A block is erased when it is handed to a new request, so a recycled block cannot
+    /// expose the previous request's KV in the `[ctx_len..block_size)` tail that
+    /// attention still reads.
+    pub fn reset_block(&mut self, block: usize) -> Result<(), EngineError> {
+        if block >= self.num_blocks {
+            return Err(EngineError::Model(format!(
+                "Block index {} out of bounds ({})",
+                block, self.num_blocks
+            )));
+        }
+        let zeros = Tensor::zeros(
+            (1, self.block_size, self.n_kv_heads, self.head_dim),
+            DType::F32,
+            self.kv_k[0].device(),
+        )?;
+        for layer in 0..self.num_layers {
+            self.kv_k[layer]
+                .narrow(0, block, 1)?
+                .slice_set(&zeros, 0, 0)?;
+            self.kv_v[layer]
+                .narrow(0, block, 1)?
+                .slice_set(&zeros, 0, 0)?;
+        }
+        if !self.recycled_blocks.contains(&block) {
+            self.recycled_blocks.push(block);
+        }
+        Ok(())
+    }
+
+    /// Takes the blocks erased since the last call (ticket #106). The Metal
+    /// paged-attention seam owns a device copy of this pool, so it must copy these
+    /// blocks again before reading them; every other consumer reads the pool directly.
+    pub fn take_recycled_blocks(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.recycled_blocks)
     }
 
     /// The `[len, n_kv_heads, head_dim]` slot ids [`Self::write_kv_slots`] scatters with,
