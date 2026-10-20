@@ -363,6 +363,29 @@ impl KvStorageKind {
         }
     }
 
+    /// Erases one physical block on either pool (ticket #106). Both variants keep a
+    /// block's rows until they are overwritten, so recycling a block without this leaves
+    /// the previous request's KV readable past the new request's `ctx_len`.
+    pub fn reset_block(&mut self, block: usize) -> Result<(), EngineError> {
+        match self {
+            Self::F32(kv) => kv.reset_block(block),
+            Self::Quantized(q) => {
+                q.reset_block(block);
+                Ok(())
+            }
+        }
+    }
+
+    /// Erased blocks the Metal paged-attention seam must re-copy from the pool. The
+    /// quantized pool never reaches that seam (it refuses a non-F32 pool), so it has no
+    /// device copy to invalidate.
+    pub fn take_recycled_blocks(&mut self) -> Vec<usize> {
+        match self {
+            Self::F32(kv) => kv.take_recycled_blocks(),
+            Self::Quantized(_) => Vec::new(),
+        }
+    }
+
     /// Reads back one token's K and V as `[n_kv_heads, head_dim]`.
     pub fn read_kv_token(
         &self,

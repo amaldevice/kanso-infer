@@ -1,6 +1,6 @@
 use crate::error::EngineError;
 use crate::kv_cache::kind::slot_for as kanso_slot_for;
-use crate::kv_cache::{BlockPool, BlockTable, KvStorageKind, PrefixCache};
+use crate::kv_cache::{BlockPool, BlockTable, KvStorageKind, PrefixCache, allocate_zeroed};
 use crate::model::Model;
 use crate::sampler::{greedy_token, sample_from_probs, softmax_probs};
 use crate::scheduler::SamplingParams;
@@ -46,7 +46,7 @@ impl SpeculativeVerifier {
         if candidates.is_empty() {
             let needed_blocks = (start_pos + 1).div_ceil(block_size);
             while block_table.blocks().len() < needed_blocks {
-                let blk = block_pool.allocate().ok_or_else(|| {
+                let blk = allocate_zeroed(block_pool, kv_storage)?.ok_or_else(|| {
                     EngineError::Model("Out of memory: cannot allocate KV block".to_string())
                 })?;
                 // #44/F3: block is about to be overwritten — drop stale prefix entries.
@@ -76,7 +76,7 @@ impl SpeculativeVerifier {
         // Ensure sufficient blocks are allocated for speculative tokens
         let needed_blocks = (start_pos + total_candidate_tokens).div_ceil(block_size);
         while block_table.blocks().len() < needed_blocks {
-            let blk = block_pool.allocate().ok_or_else(|| {
+            let blk = allocate_zeroed(block_pool, kv_storage)?.ok_or_else(|| {
                 EngineError::Model("Out of memory: cannot allocate KV block".to_string())
             })?;
             // #44/F3: block is about to be overwritten — drop stale prefix entries.

@@ -1,7 +1,9 @@
 use candle_core::Tensor;
 
 use crate::error::EngineError;
-use crate::kv_cache::{BlockPool, BlockTable, KvStorageKind, PrefixCache, QuantMode};
+use crate::kv_cache::{
+    BlockPool, BlockTable, KvStorageKind, PrefixCache, QuantMode, allocate_zeroed,
+};
 use crate::model::Model;
 use crate::sampler::sample_logits;
 use crate::scheduler::{SamplingParams, Sequence, SequenceStatus};
@@ -245,7 +247,7 @@ impl Engine {
             // short, blocks are taken from the lowest-priority (newest) sequence, which
             // then recomputes; if there is nothing left to take, this sequence waits a
             // step instead of decoding past the end of its block table.
-            if self.decode_needs_block(idx) && !self.ensure_blocks(idx, 1, &planned_flags) {
+            if self.decode_needs_block(idx) && !self.ensure_blocks(idx, 1, &planned_flags)? {
                 continue;
             }
 
@@ -343,7 +345,7 @@ impl Engine {
                 .div_ceil(self.block_size);
             let current_blocks = seq.block_table.blocks().len();
             if needed_blocks > current_blocks
-                && !self.ensure_blocks(idx, needed_blocks - current_blocks, &planned_flags)
+                && !self.ensure_blocks(idx, needed_blocks - current_blocks, &planned_flags)?
             {
                 continue;
             }
@@ -540,23 +542,28 @@ impl Engine {
     ///
     /// `planned` marks the sequences this step has already planned (ticket #61 F11): they
     /// are not valid victims, because the step's budget was already spent on their forward.
-    fn ensure_blocks(&mut self, idx: usize, want: usize, planned: &[bool]) -> bool {
+    fn ensure_blocks(
+        &mut self,
+        idx: usize,
+        want: usize,
+        planned: &[bool],
+    ) -> Result<bool, EngineError> {
         while self.block_pool.free_blocks_count() < want {
             if !self.preempt_lowest_priority_after(idx, planned) {
-                return false;
+                return Ok(false);
             }
         }
         let seq = &mut self.sequences[idx];
         for _ in 0..want {
-            let Some(blk) = self.block_pool.allocate() else {
+            let Some(blk) = allocate_zeroed(&mut self.block_pool, &mut self.kv_storage)? else {
                 // Unreachable: the loop above just secured `want` free blocks.
-                return false;
+                return Ok(false);
             };
             // #44: block is about to be overwritten — drop stale prefix entries.
             self.prefix_cache.invalidate_block(blk);
             seq.block_table.push_block(blk);
         }
-        true
+        Ok(true)
     }
 
     /// Picks the newest running sequence after `idx` (lowest priority) that this step has

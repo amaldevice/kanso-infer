@@ -1,5 +1,5 @@
 use crate::error::EngineError;
-use crate::kv_cache::{BlockPool, BlockTable, KvStorageKind};
+use crate::kv_cache::{BlockPool, BlockTable, KvStorageKind, allocate_zeroed};
 use crate::model::Model;
 use crate::sampler::{greedy_token, sample_from_probs, softmax_probs};
 use crate::scheduler::SamplingParams;
@@ -107,7 +107,13 @@ impl DraftCache {
         }
 
         let mut logits = if slot.tokens.is_empty() {
-            ensure_blocks(pool, &mut slot.block_table, block_size, prefix.len())?;
+            ensure_blocks(
+                pool,
+                &mut slot.block_table,
+                block_size,
+                prefix.len(),
+                storage,
+            )?;
             let logits = model.forward_prefill(prefix, 0, &slot.block_table, storage)?;
             slot.tokens.extend_from_slice(prefix);
             logits
@@ -116,7 +122,7 @@ impl DraftCache {
             let pending = prefix[slot.tokens.len()..].to_vec();
             for tok in pending {
                 let pos = slot.tokens.len();
-                ensure_blocks(pool, &mut slot.block_table, block_size, pos + 1)?;
+                ensure_blocks(pool, &mut slot.block_table, block_size, pos + 1, storage)?;
                 logits = Some(model.forward_decode_step(tok, pos, &slot.block_table, storage)?);
                 slot.tokens.push(tok);
             }
@@ -142,7 +148,7 @@ impl DraftCache {
             }
 
             let pos = slot.tokens.len();
-            ensure_blocks(pool, &mut slot.block_table, block_size, pos + 1)?;
+            ensure_blocks(pool, &mut slot.block_table, block_size, pos + 1, storage)?;
             logits = model.forward_decode_step(token, pos, &slot.block_table, storage)?;
             slot.tokens.push(token);
         }
@@ -182,10 +188,11 @@ fn ensure_blocks(
     table: &mut BlockTable,
     block_size: usize,
     up_to: usize,
+    storage: &mut KvStorageKind,
 ) -> Result<(), EngineError> {
     let needed = up_to.div_ceil(block_size);
     while table.blocks().len() < needed {
-        let blk = pool.allocate().ok_or_else(|| {
+        let blk = allocate_zeroed(pool, storage)?.ok_or_else(|| {
             EngineError::Model("Draft KV: out of memory: cannot allocate block".to_string())
         })?;
         table.push_block(blk);
