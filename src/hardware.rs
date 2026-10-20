@@ -58,7 +58,7 @@ impl std::str::FromStr for Backend {
 
 impl Backend {
     /// Resolves the candle device this backend really executes on.
-    /// Metal goes to the GPU via `Device::new_metal(0)`; `cpu` and `amx` run on
+    /// Metal goes to the GPU via `metal_device()`; `cpu` and `amx` run on
     /// CPU (`amx` because the AMX/Accelerate GEMM path lives there).
     ///
     /// `neon` deliberately returns an error (ticket #89). The hand-written kernels
@@ -72,18 +72,7 @@ impl Backend {
     /// kernels are wired to the packed production layout.
     pub fn device(&self) -> Result<Device, crate::error::EngineError> {
         match self {
-            Self::Metal => {
-                #[cfg(target_os = "macos")]
-                {
-                    Ok(Device::new_metal(0)?)
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    Err(crate::error::EngineError::Metal(
-                        "metal backend requires macOS".to_string(),
-                    ))
-                }
-            }
+            Self::Metal => metal_device(),
             Self::Neon => Err(crate::error::EngineError::Config(
                 "backend 'neon' is not available: the hand-written NEON Q8_0/Q4_K kernels \
                  (src/quant/neon.rs) are not wired to the packed LinearWeight blocks, so this \
@@ -94,6 +83,123 @@ impl Backend {
             )),
             Self::Cpu | Self::Amx => Ok(Device::Cpu),
         }
+    }
+}
+
+/// Stable prefix separating "this runtime cannot do Metal" from a real failure.
+/// `is_metal_runtime_gap` matches on it, so do not reword it.
+pub const METAL_RUNTIME_GAP_PREFIX: &str = "metal runtime lacks a required class";
+
+/// Creates the candle Metal device, turning the objc2 panic for a class this
+/// runtime does not have into an error.
+///
+/// `MetalDevice::new` builds a `ResidencySet`, and candle-metal-kernels asks
+/// objc2 for `MTLResidencySetDescriptor` with an `extern_class!` lookup that
+/// `.expect`s the class to exist. On an older Metal runtime (the `macos-14` CI
+/// runner) the class is absent, so the lookup panics and takes the whole process
+/// with it — `--backend metal` crashed instead of reporting it could not run.
+/// candle itself already degrades gracefully below that lookup (`ResidencySet`
+/// keeps `raw: Option` and `.ok()`s the call), so the class lookup is the only
+/// thing that has to be caught. Other panics are real bugs and are re-raised.
+pub fn metal_device() -> Result<Device, crate::error::EngineError> {
+    #[cfg(target_os = "macos")]
+    {
+        // Ticket #99: `MTLResidencySetDescriptor` exists only since macOS 15 (Metal
+        // 3.2), and candle calls `MTLResidencySetDescriptor::new()` during
+        // `Device::new_metal(0)`. objc2 panics when the class is absent (the
+        // `macos-14` CI runner is macOS 14.x), so the OS version is a deterministic
+        // gate: below 15 we report the gap WITHOUT ever touching candle, meaning no
+        // panic can occur at all. The `catch_unwind` below stays as a second layer.
+        if !macos_has_residency_set_class() {
+            return Err(crate::error::EngineError::Metal(format!(
+                "{METAL_RUNTIME_GAP_PREFIX}: macOS {} lacks MTLResidencySetDescriptor (needs 15+)",
+                macos_major_version().map_or_else(|| "unknown".to_string(), |v| v.to_string())
+            )));
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Device::new_metal(0))) {
+            Ok(Ok(device)) => Ok(device),
+            Ok(Err(e)) => Err(e.into()),
+            Err(payload) => {
+                let msg = panic_message(&payload);
+                if msg.contains("could not be found") {
+                    Err(crate::error::EngineError::Metal(format!(
+                        "{METAL_RUNTIME_GAP_PREFIX}: {msg}"
+                    )))
+                } else {
+                    std::panic::resume_unwind(payload)
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(crate::error::EngineError::Metal(
+            "metal backend requires macOS".to_string(),
+        ))
+    }
+}
+
+/// True when the error means "this runtime does not support Metal", not a
+/// genuine failure. Callers skip with a printed reason instead of failing.
+pub fn is_metal_runtime_gap(err: &crate::error::EngineError) -> bool {
+    match err {
+        crate::error::EngineError::Metal(msg) => msg.starts_with(METAL_RUNTIME_GAP_PREFIX),
+        _ => false,
+    }
+}
+
+/// Parses the major version out of an OS product version string
+/// (e.g. `"14.7.1"` → `Some(14)`, `"unknown"` → `None`).
+pub fn parse_os_major(version: &str) -> Option<u32> {
+    version.split('.').next()?.parse().ok()
+}
+
+/// Major macOS version from `sysctl kern.osproductversion`, or `None` when it
+/// cannot be read/parsed.
+///
+/// Ticket #99: this must NOT be `uname -r` — that returns the *Darwin* version,
+/// and the mapping is not the identity (macOS 14.x = Darwin 23.x). Reading the
+/// Darwin version would let every pre-15 macOS (Darwin 23, 22, 21, …) sail
+/// through the macOS-15 gate below and hit the candle panic again.
+/// `kern.osproductversion` returns the macOS version directly ("14.7.1", "27.0").
+#[cfg(target_os = "macos")]
+pub fn macos_major_version() -> Option<u32> {
+    unsafe {
+        let mut buf = [0 as libc::c_char; 64];
+        let mut len = buf.len();
+        if libc::sysctlbyname(
+            c"kern.osproductversion".as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return None;
+        }
+        let version = std::ffi::CStr::from_ptr(buf.as_ptr())
+            .to_string_lossy()
+            .into_owned();
+        parse_os_major(&version)
+    }
+}
+
+/// Whether this macOS has the Metal classes candle requires (ticket #99).
+/// `MTLResidencySet` ships with macOS 15; anything older (including the
+/// `macos-14` CI runner) cannot create a candle Metal device at all.
+/// Unknown version → `false` (skip rather than crash).
+#[cfg(target_os = "macos")]
+pub fn macos_has_residency_set_class() -> bool {
+    matches!(macos_major_version(), Some(v) if v >= 15)
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        String::from("panic payload was not a string")
     }
 }
 

@@ -1,3 +1,5 @@
+mod common;
+
 use candle_core::Device;
 use kanso_infer::hardware::Backend;
 use kanso_infer::model::Model;
@@ -52,7 +54,9 @@ fn test_neon_backend_refuses_placebo_cpu_run() {
 #[cfg(target_os = "macos")]
 #[test]
 fn test_metal_device_is_honest_gpu() {
-    let device = Backend::Metal.device().expect("metal device");
+    let Some(device) = common::metal_device_or_skip() else {
+        return;
+    };
     assert!(
         matches!(device, Device::Metal(_)),
         "metal backend must resolve to a GPU device, got {device:?}"
@@ -67,14 +71,147 @@ fn test_metal_device_unavailable_off_macos() {
     assert!(Backend::Metal.device().is_err());
 }
 
+/// Ticket #99: on the `macos-14` CI runner `Device::new_metal(0)` panics inside
+/// objc2 (`.expect("class MTLResidencySetDescriptor could not be found")`) instead
+/// of returning `Err`. `metal_device()` must report that runtime gap as a plain
+/// error, and on a host that does have the class it must still hand back a GPU.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_metal_device_reports_ok_or_a_runtime_gap() {
+    match kanso_infer::hardware::metal_device() {
+        Ok(dev) => assert!(
+            matches!(dev, Device::Metal(_)),
+            "metal_device must return a GPU device, got {dev:?}"
+        ),
+        Err(err) => assert!(
+            kanso_infer::hardware::is_metal_runtime_gap(&err),
+            "a metal_device failure that is not a runtime gap must not be \
+             reported as one: {err}"
+        ),
+    }
+}
+
+/// The classifier is what every test uses to decide "skip" instead of "fail",
+/// so it has to match the capability prefix and nothing else.
+#[test]
+fn test_is_metal_runtime_gap_matches_only_the_capability_prefix() {
+    use kanso_infer::error::EngineError;
+    use kanso_infer::hardware::{METAL_RUNTIME_GAP_PREFIX, is_metal_runtime_gap};
+
+    let gap = EngineError::Metal(format!(
+        "{METAL_RUNTIME_GAP_PREFIX}: class MTLResidencySetDescriptor could not be found"
+    ));
+    assert!(is_metal_runtime_gap(&gap), "prefixed metal error is a gap");
+
+    for other in [
+        EngineError::Metal("metal command buffer failed".to_string()),
+        EngineError::Config("unknown backend 'foo'".to_string()),
+        EngineError::Model("weights are truncated".to_string()),
+        EngineError::Candle(candle_core::Error::Msg("cup failed".to_string())),
+    ] {
+        assert!(
+            !is_metal_runtime_gap(&other),
+            "only the capability prefix counts as a gap, got: {other}"
+        );
+    }
+}
+
+/// Ticket #99: `metal_device()` gates on `kern.osproductversion` (MTLResidencySet
+/// needs macOS 15+), so the parsing feeding that gate must be pinned down
+/// without needing a macOS 14 host.
+#[test]
+fn test_parse_os_major_versions() {
+    use kanso_infer::hardware::parse_os_major;
+
+    // Note: this only parses the number; it does NOT validate a macOS range.
+    // A Darwin value like "23.6.0" parses to 23 and would PASS the `>= 15`
+    // gate — which is exactly why the version source must be
+    // `kern.osproductversion` (real macOS), not `uname -r` (Darwin).
+    // Fail-closed lives one level up: `macos_major_version() -> None`
+    // (unreadable) makes the gate reject.
+    for (version, want) in [("14.7.1", 14), ("15.0", 15), ("27.0", 27), ("15", 15)] {
+        assert_eq!(
+            parse_os_major(version),
+            Some(want),
+            "parse version {version:?}"
+        );
+    }
+    // Unparseable versions must fail closed: unknown version => no Metal.
+    assert_eq!(parse_os_major("unknown"), None);
+    assert_eq!(parse_os_major(""), None);
+}
+
+/// The gate must REJECT on pre-15 macOS (the `macos-14` CI runner): the
+/// refusal is an `Err` classified as a runtime gap, never a panic.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_version_gate_rejects_pre_15_macos() {
+    use kanso_infer::hardware::{
+        is_metal_runtime_gap, macos_has_residency_set_class, macos_major_version, metal_device,
+    };
+
+    let major = macos_major_version().expect("kern.osproductversion must parse on macOS");
+    if major >= 15 {
+        assert!(
+            macos_has_residency_set_class(),
+            "macOS {major} must pass the gate"
+        );
+        metal_device().expect("macOS 15+ must create a metal device");
+    } else {
+        assert!(
+            !macos_has_residency_set_class(),
+            "macOS {major} must NOT pass the residency-set gate"
+        );
+        let err = metal_device().expect_err("pre-15 macOS must not produce a device");
+        assert!(
+            is_metal_runtime_gap(&err),
+            "the refusal must be a runtime gap, got: {err}"
+        );
+    }
+}
+
+/// The gate must PASS on macOS 15+: the device is a real GPU device, which is
+/// what every metal test on this host relies on.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_version_gate_passes_on_15_plus() {
+    use kanso_infer::hardware::{
+        is_metal_runtime_gap, macos_has_residency_set_class, macos_major_version, metal_device,
+    };
+
+    let major = macos_major_version().expect("kern.osproductversion must parse on macOS");
+    if major >= 15 {
+        assert!(
+            macos_has_residency_set_class(),
+            "macOS {major} must pass the gate"
+        );
+        let dev = metal_device().expect("macOS 15+ must create a metal device");
+        assert!(
+            matches!(dev, Device::Metal(_)),
+            "gate passed, so the device must be a GPU device, got {dev:?}"
+        );
+    } else {
+        assert!(
+            !macos_has_residency_set_class(),
+            "macOS {major} must NOT pass the residency-set gate"
+        );
+        let err = metal_device().expect_err("pre-15 macOS must not produce a device");
+        assert!(
+            is_metal_runtime_gap(&err),
+            "the refusal must be a runtime gap, got: {err}"
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn test_metal_cpu_parity_mock() {
+    let Some(dev) = common::metal_device_or_skip() else {
+        return;
+    };
     let cpu = Model::create_mock_tiny(64, 4, 2, 2, 256).expect("cpu mock");
     let mut metal = Model::create_mock_tiny(64, 4, 2, 2, 256).expect("metal mock");
-    metal
-        .to_device(&Backend::Metal.device().expect("metal device"))
-        .expect("move to metal");
+    metal.to_device(&dev).expect("move to metal");
     metal.set_backend(Backend::Metal);
     assert!(matches!(metal.device, Device::Metal(_)));
 
@@ -109,9 +246,11 @@ fn test_metal_cpu_parity_real_model() {
     else {
         return;
     };
+    let Some(dev) = common::metal_device_or_skip() else {
+        return;
+    };
     let cpu = Model::load_gguf(&path, Device::Cpu).expect("cpu load");
-    let metal = Model::load_gguf(&path, Backend::Metal.device().expect("metal device"))
-        .expect("metal load");
+    let metal = Model::load_gguf(&path, dev).expect("metal load");
     assert!(matches!(metal.device, Device::Metal(_)));
 
     let prompt = vec![1u32, 5, 42];

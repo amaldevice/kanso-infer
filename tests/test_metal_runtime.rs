@@ -1,4 +1,7 @@
 #[cfg(target_os = "macos")]
+mod common;
+
+#[cfg(target_os = "macos")]
 mod macos_tests {
     use kanso_infer::metal::context::MetalContext;
     use kanso_infer::metal::ops::{
@@ -17,8 +20,9 @@ mod macos_tests {
 
     #[test]
     fn test_candle_metal_device_creation() {
-        let dev = candle_core::Device::new_metal(0)
-            .expect("Candle Metal device initialization should succeed on macOS");
+        let Some(dev) = crate::common::metal_device_or_skip() else {
+            return;
+        };
         let t = candle_core::Tensor::new(&[1.0f32, 2.0, 3.0], &dev).unwrap();
         let sum = t.sum_all().unwrap().to_scalar::<f32>().unwrap();
         assert_eq!(sum, 6.0);
@@ -26,8 +30,9 @@ mod macos_tests {
 
     #[test]
     fn test_candle_metal_gguf_loading() {
-        let dev = candle_core::Device::new_metal(0)
-            .expect("Candle Metal device initialization should succeed on macOS");
+        let Some(dev) = crate::common::metal_device_or_skip() else {
+            return;
+        };
         if let Ok(model_path) =
             kanso_infer::weights::resolve_model_path("smollm2-360m-instruct-q8_0.gguf")
         {
