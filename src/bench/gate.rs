@@ -333,6 +333,7 @@ pub const GATE_METRICS: &[&str] = &[
     "ctx_latency_ratio",
     "peak_rss_mb",
     "perplexity_wikitext2",
+    "ratio_vs_f32",
     "gemv_peak_pct",
     "paged_attn_ctx4096_b1_over_theoretical",
     "idle_gap_pct",
@@ -388,6 +389,14 @@ fn metric_value(report: &BenchmarkReport, metric: &str) -> Option<f64> {
         "peak_rss_mb" => report.peak_rss_mb?,
         // Perplexity only exists when the run asked for it (#100).
         "perplexity_wikitext2" => report.perplexity_wikitext2?,
+        // The KV pool's saving against the F32 pool (#111). The F32 pool IS the
+        // baseline — 1.0x by definition — so an F32 run makes no compression
+        // claim for this floor to judge: it reads as missing and the row skips
+        // instead of going red on an honest f32 run.
+        "ratio_vs_f32" => match report.kv_type? {
+            crate::kv_cache::KvCacheType::F32 => return None,
+            _ => report.ratio_vs_f32?,
+        },
         // Probe figures: absent when the probe did not run (#100).
         "gemv_peak_pct" => report.probes.as_ref()?.gemv_peak_pct?,
         "paged_attn_ctx4096_b1_over_theoretical" => {
@@ -424,6 +433,18 @@ fn read_metric(report: &BenchmarkReport, metric: &str) -> Reading {
         None if PROBE_METRICS.contains(&metric) => Reading::Missing(format!(
             "report carries no '{metric}': the probe that produces it did not run"
         )),
+        // The kv floor judges a quantized pool's compression claim (#111): the
+        // F32 pool is the baseline it is measured against, so there is no claim
+        // to judge, and a report no engine filled has no number at all.
+        None if metric == "ratio_vs_f32" => match report.kv_type {
+            Some(crate::kv_cache::KvCacheType::F32) => Reading::Missing(
+                "the F32 pool is the baseline (1.0x by definition): the floor judges a quantized pool"
+                    .to_string(),
+            ),
+            _ => Reading::Missing(format!(
+                "report carries no '{metric}': no engine run attached the KV pool's numbers"
+            )),
+        },
         None => Reading::Missing(format!("report carries no '{metric}'")),
     }
 }

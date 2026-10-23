@@ -381,10 +381,8 @@ fn engine_run_report_carries_the_pools_kv_memory_numbers() {
     ] {
         let mut engine = match mode {
             None => Engine::new(mock(), 1, 64, 16).expect("f32 engine"),
-            Some(mode) => {
-                Engine::new_with_budget_and_kv(mock(), 1, 64, 16, usize::MAX, Some(mode))
-                    .expect("quantized engine")
-            }
+            Some(mode) => Engine::new_with_budget_and_kv(mock(), 1, 64, 16, usize::MAX, Some(mode))
+                .expect("quantized engine"),
         };
         let report = run_synthetic_benchmark(&mut engine, 1, 8, 2, false)
             .expect("the workload must run to produce a report");
@@ -396,7 +394,8 @@ fn engine_run_report_carries_the_pools_kv_memory_numbers() {
             "the report must name the pool type that served the run"
         );
         assert_eq!(
-            json.get("bytes_per_token").and_then(serde_json::Value::as_u64),
+            json.get("bytes_per_token")
+                .and_then(serde_json::Value::as_u64),
             Some(engine.kv_storage.memory_bytes_per_token() as u64),
             "the report must carry the pool's own bytes-per-token, not a claim"
         );
