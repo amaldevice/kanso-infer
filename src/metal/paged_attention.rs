@@ -1,6 +1,6 @@
 use crate::error::EngineError;
 use crate::metal::context::MetalContext;
-use metal::{Buffer, MTLSize};
+use metal::{Buffer, CommandBufferRef, MTLSize};
 
 /// Tokens handled per context partition by the stage-1 kernel (vLLM's PARTITION_SIZE).
 const PARTITION_SIZE: u32 = 256;
@@ -177,12 +177,22 @@ pub fn cpu_paged_attention(
     out
 }
 
-/// Dispatches PagedAttention v2: stage 1 splits the context over partitions, stage 2
-/// merges them. Partition scratch is allocated here because the caller-facing buffers
-/// are only q/k/v/tables/lens/out; both passes share one command buffer.
-#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
-pub fn gpu_paged_attention_v2_buffer(
+/// Encodes PagedAttention v2 — stage 1 splits the context over partitions, stage 2
+/// merges them — into a command buffer owned by the caller (ticket #109).
+///
+/// This is the one encoding logic both submit strategies share (#86: one encoding
+/// logic, two submit strategies): it never creates a command buffer of its own and
+/// never commits or waits, so a caller building one command buffer per decode step
+/// (#110) can chain attention into it. Partition scratch is allocated here because
+/// the caller-facing buffers are only q/k/v/tables/lens/out.
+///
+/// Two separate compute encoders on the same command buffer, not one: stage 2 reads
+/// the partials stage 1 writes, and dispatches within a single encoder are not
+/// guaranteed to be ordered.
+#[allow(clippy::too_many_arguments)] // kernel surface: one per dispatch argument
+pub fn encode_paged_attention_v2(
     ctx: &MetalContext,
+    command_buffer: &CommandBufferRef,
     q_buf: &Buffer,
     k_cache_buf: &Buffer,
     v_cache_buf: &Buffer,
@@ -211,8 +221,6 @@ pub fn gpu_paged_attention_v2_buffer(
     let partial_out_buf = ctx.alloc_buffer::<f32>(slots * head_dim);
     // float2 per (seq, head, partition): running max m and running denominator d.
     let partial_stats_buf = ctx.alloc_buffer::<[f32; 2]>(slots);
-
-    let command_buffer = ctx.new_command_buffer();
 
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(stage1);
@@ -281,6 +289,35 @@ pub fn gpu_paged_attention_v2_buffer(
     );
     encoder.end_encoding();
 
+    Ok(())
+}
+
+/// Dispatches PagedAttention v2 on a self-created command buffer: encode via
+/// [`encode_paged_attention_v2`], commit, wait. Today's behavior, unchanged — the
+/// submit strategy callers that do not own a command buffer keep (ticket #109).
+#[allow(clippy::too_many_arguments)] // #57: public API; regrouping params out of scope
+pub fn gpu_paged_attention_v2_buffer(
+    ctx: &MetalContext,
+    q_buf: &Buffer,
+    k_cache_buf: &Buffer,
+    v_cache_buf: &Buffer,
+    block_tables_buf: &Buffer,
+    context_lens_buf: &Buffer,
+    out_buf: &Buffer,
+    params: &PagedAttentionParams,
+) -> Result<(), EngineError> {
+    let command_buffer = ctx.new_command_buffer();
+    encode_paged_attention_v2(
+        ctx,
+        command_buffer,
+        q_buf,
+        k_cache_buf,
+        v_cache_buf,
+        block_tables_buf,
+        context_lens_buf,
+        out_buf,
+        params,
+    )?;
     command_buffer.commit();
     command_buffer.wait_until_completed();
 
