@@ -388,10 +388,5 @@ pub fn gpu_residual_add(
 
     gpu_residual_add_buffer(ctx, &proj_buf, &hidden_buf, len, scale)?;
 
-    let mut out = vec![0.0f32; len];
-    unsafe {
-        let ptr = hidden_buf.contents() as *const f32;
-        std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len);
-    }
-    Ok(out)
+    Ok(crate::metal::fused_layer::read_f32(&hidden_buf, len))
 }

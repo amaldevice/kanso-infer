@@ -44,7 +44,7 @@ pub(crate) struct FusedDecodeSeam {
     layers: Vec<ResidentLayer>,
     /// Largest position the resident rotary tables cover.
     max_pos: usize,
-    steps: u64,
+    layer_sweeps: u64,
     /// The step's residual stream, `[hidden_dim]`: the host stages the embedding
     /// row before the step, layer 0's prologue reads it, and every residual add
     /// (inside the step's single command buffer) updates it in place.
@@ -106,7 +106,7 @@ impl FusedDecodeSeam {
             dims,
             layers,
             max_pos,
-            steps: 0,
+            layer_sweeps: 0,
         }))
     }
 
@@ -115,10 +115,11 @@ impl FusedDecodeSeam {
         self.max_pos
     }
 
-    /// Decode steps' layer sweeps this seam has served (one increment per layer,
-    /// whether the layer ran through [`Self::decode_step`] or the one-buffer step).
-    pub(crate) fn steps(&self) -> u64 {
-        self.steps
+    /// Layer sweeps this seam has served — one increment per layer, whether the
+    /// layer ran through the per-layer [`Self::prologue`] or the one-buffer step.
+    /// Model::fused_layer_calls reads it, so the name says what is counted.
+    pub(crate) fn layer_sweeps(&self) -> u64 {
+        self.layer_sweeps
     }
 
     /// Command buffers this seam submitted: exactly one per one-buffer decode step
@@ -146,15 +147,15 @@ impl FusedDecodeSeam {
                 self.max_pos
             )));
         }
-        // Direct field lookup, so the `steps` counter (a different field) can be
-        // bumped while the returned layer reference is still held.
+        // Direct field lookup, so the `layer_sweeps` counter (a different field)
+        // can be bumped while the returned layer reference is still held.
         let resident = self.layers.get(layer).ok_or_else(|| {
             EngineError::Metal(format!(
                 "fused decode: layer {layer} outside the {} resident layers",
                 self.layers.len()
             ))
         })?;
-        self.steps += 1;
+        self.layer_sweeps += 1;
         resident
             .as_metal_weights()
             .decode_step(&self.ctx, hidden, pos, eps)
@@ -271,7 +272,7 @@ impl FusedDecodeSeam {
                 eps,
                 &self.dims,
             )?;
-            self.steps += 1;
+            self.layer_sweeps += 1;
         }
 
         command_buffer.commit();

@@ -259,7 +259,7 @@ impl Model {
         self.fused_decode
             .borrow()
             .as_ref()
-            .map(FusedDecodeSeam::steps)
+            .map(FusedDecodeSeam::layer_sweeps)
             .unwrap_or(0)
     }
 
@@ -271,8 +271,11 @@ impl Model {
     /// attention, O + residual and SwiGLU MLP + residual for every layer chained
     /// into it), and the paged-attention seam spends none while riding that
     /// buffer — so a fused step moves this by 1. A step on the fallback loop
-    /// instead spends one per layer through the paged-attention wrapper, so it
-    /// moves by the layer count. What stays outside the metric on purpose
+    /// instead spends, per layer, the paged-attention wrapper's buffer plus the
+    /// fused prologue's when the seam exists: the geometry fallback (no seam
+    /// built, per-op prologue on the device queue) moves by the layer count,
+    /// the hybrid-offload step (seam built, FFN dispatched per layer) by twice
+    /// that. What stays outside the metric on purpose
     /// (ADR 0002 scope): the final norm and lm_head run on the tensor path,
     /// submitted by candle on the device queue.
     pub fn metal_decode_command_buffers(&self) -> usize {
