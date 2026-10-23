@@ -1,5 +1,5 @@
 {
-  "_note": "Synthetic, deliberately failing evidence for the CI self-check (spec #82 B2). 1 GB weighed per step at 100 ms/step over a 20 GB/s peak is 50% bandwidth utilisation, below fase1's `>= 60%` floor, so the gate MUST exit 1. This file exists only to prove the gate can go red; it is not a measurement.",
+  "_note": "Synthetic, deliberately failing evidence for the CI self-check (spec #82 B2). 1 GB weighed per step at 100 ms/step over a 20 GB/s peak is 50% bandwidth utilisation, below fase1's `>= 60%` floor, so the gate MUST exit 1. Its synthetic INT8 pool (2 kv heads x head_dim 4: 32 bytes/token against F32's 64, i.e. 2.0x) breaks fase2's `>= 3.0x` kv floor the same way (ticket #111). This file exists only to prove the gate can go red; it is not a measurement.",
   "total_tokens": 100,
   "total_duration_secs": 1.0,
   "num_requests": 1,
@@ -22,5 +22,8 @@
   "bytes_read_per_step": 1000000000,
   "peak_bandwidth_gb_s": 20.0,
   "peak_bandwidth_source": "synthetic: CI self-check, not a measurement",
-  "telemetry": "measured"
+  "telemetry": "measured",
+  "kv_type": "int8",
+  "bytes_per_token": 32,
+  "ratio_vs_f32": 2.0
 }

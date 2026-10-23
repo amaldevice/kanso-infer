@@ -8,6 +8,14 @@
       "status": "measured",
       "owner": "#82",
       "note": "F12's bandwidth floor, restated without the GGUF requirement so a CI runner without the model can still prove the comparison works. Paired with gates/self-check-violation.json this budget MUST exit 1 (spec #82 B2)."
+    },
+    {
+      "metric": "ratio_vs_f32",
+      "bound": "min",
+      "budget": 3.0,
+      "status": "measured",
+      "owner": "#111",
+      "note": "The quantized-KV memory floor from gates/fase2.json, restated for the CI self-check: the violation evidence's synthetic INT8 pool sits at 2.0x, under the 3.0x floor, so this row MUST exit 1 too (spec #82 B2, ticket #111) — proving the kv floor can go red, not just the bandwidth one."
     }
   ]
 }

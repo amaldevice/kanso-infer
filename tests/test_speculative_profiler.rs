@@ -219,6 +219,9 @@ fn test_benchmark_report_speculative_integration() {
         perplexity_wikitext2: None,
         context_len: None,
         probes: None,
+        kv_type: None,
+        bytes_per_token: None,
+        ratio_vs_f32: None,
         speculative: None,
     }
     .with_speculative(spec_report);

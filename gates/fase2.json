@@ -40,6 +40,14 @@
       "status": "measured",
       "owner": "#95",
       "note": "One chat.completion.chunk stream consumed end-to-end. `bench --probes --sse-endpoint host:port` opens a plain TCP connection to a live `kanso serve`, reads the SSE frames to the [DONE] sentinel, and reports 1.0/0.0 in `probes.sse_stream_consumed`. This is a hand-rolled HTTP/1.1 client, NOT the official OpenAI SDK, which is why the row is named `sse_stream_consumed` and not `sse_sdk_stream_consumed`. Consuming the same stream through a real SDK client (openai-python / eventsource) is owner #101's addition. No server listening = the probe does not run, so the row skips rather than reporting a stream nobody opened."
+    },
+    {
+      "metric": "ratio_vs_f32",
+      "bound": "min",
+      "budget": 3.0,
+      "status": "measured",
+      "owner": "#111",
+      "note": "Quantized KV memory floor, calibrated from the pools' layout arithmetic (per token, per layer): F32 = 8*h*d bytes; INT8/FP8 = 2*h*d + 8*h bytes (one byte per element plus an F32 scale per token per head, K and V), so the ratio is 4*head_dim/(head_dim+4), independent of n_kv_heads — 3.76x at SmolLM2-360M's head_dim 64. The 3.0x floor sits below every geometry a real bench can run (3.56x at head_dim 32) with margin, while a pool that saves nothing stays red. An F32 run skips this row: it is the baseline (1.0x by definition), and `bench --kv-type int8|fp8` is how a quantized pool reaches it. The floor's derivation is also written out in tests/test_quantized_kv_engine.rs."
     }
   ]
 }
