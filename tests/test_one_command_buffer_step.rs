@@ -166,13 +166,19 @@ mod one_command_buffer_step {
     /// Acceptance #3: the one-buffer step's logits stay within tolerance of the
     /// discrete reference path — and the step it measures is provably the
     /// single-buffer one (its metric moves by exactly 1).
+    ///
+    /// `max_seq_len` is widened past the mock default (128) so the seam's resident
+    /// rotary tables cover ctx 512 too — without that, pos 511 would exceed the
+    /// tables and the step would rightly fall back to the per-layer loop.
     #[test]
     fn one_buffer_step_logits_match_discrete_reference() {
         let Some(dev) = crate::common::metal_device_or_skip() else {
             return;
         };
-        let metal_model = mock(&dev, Backend::Metal);
-        let cpu_model = mock(&Device::Cpu, Backend::Cpu);
+        let mut metal_model = mock(&dev, Backend::Metal);
+        metal_model.config.max_seq_len = 1024;
+        let mut cpu_model = mock(&Device::Cpu, Backend::Cpu);
+        cpu_model.config.max_seq_len = 1024;
 
         for ctx in CONTEXTS {
             let reference = batch_logits(&cpu_model, ctx);
