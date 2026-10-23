@@ -168,17 +168,18 @@ pub struct FusedLayerWeights {
     pub w_v: Vec<f32>,
 }
 
-/// Device-resident weights, tables and scratch for one layer (ticket #49).
+/// Device-resident weights, tables and scratch for one layer's prologue (ticket #49).
 ///
 /// Upload once at load, then call [`MetalWeights::decode_step`] per token: the step
 /// allocates nothing, re-uploads nothing, and submits exactly one command buffer for
 /// the whole fused RMSNorm + QKV + RoPE chain.
 ///
-/// Harness-only path (review F1): production decode is `Model::forward_decode_step`
-/// (`crate::model`, candle tensors, full layer incl. attention + MLP). This resident path covers
-/// the QKV prologue only and is exercised by `tests/test_single_command_buffer.rs`
-/// plus the GEMV bandwidth bench — wiring it into production means a full Metal
-/// decode loop (attn/O/MLP buffers, `w_o`/`ffn_*` residency), which is its own ticket.
+/// Production entry (since #87, widened by #110): the one-command-buffer decode
+/// step in `src/model/fused_decode.rs` holds these inside a [`ResidentLayer`] and
+/// drives the prologue through [`Self::encode_prologue`] on the step's command
+/// buffer. `decode_step` — create, commit, wait — is the per-layer submit
+/// strategy the paths that cannot chain a whole step keep, and the harness entry
+/// `tests/test_single_command_buffer.rs` asserts.
 pub struct MetalWeights {
     dims: FusedLayerDimensions,
     norm_weight: Buffer,

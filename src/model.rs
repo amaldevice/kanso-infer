@@ -186,9 +186,11 @@ pub struct Model {
     /// The single seam that lets a decode step attend over the block pool instead of a
     /// per-layer gather: `Some` only once a Metal decode step has run (ticket #86).
     paged_attn: RefCell<Option<PagedAttnSeam>>,
-    /// #87: the fused Metal prologue (RMSNorm + QKV + RoPE) as the decode path. `None`
-    /// means this model is outside the kernel geometry, or has not decoded on Metal yet,
-    /// and the per-op path runs instead.
+    /// #87/#110: the fused Metal decode step. Since #110 a whole layer sweep —
+    /// prologue, paged attention, O + residual, SwiGLU MLP + residual — runs on
+    /// one command buffer per step through this seam. `None` means this model is
+    /// outside the kernel geometry, or has not decoded on Metal yet, and the
+    /// per-op path runs instead.
     fused_decode: RefCell<Option<FusedDecodeSeam>>,
 }
 
