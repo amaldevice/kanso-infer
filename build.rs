@@ -15,6 +15,7 @@ const KERNEL_FILES: &[&str] = &[
     "rmsnorm.metal",
     "rope.metal",
     "silu_gate.metal",
+    "residual_add.metal",
     "paged_kv.metal",
     "paged_attention_v2.metal",
     "fused_llama_layer.metal",

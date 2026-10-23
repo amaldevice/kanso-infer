@@ -20,6 +20,9 @@ mod aot {
             "silu_gate.metal" => {
                 &include_bytes!(concat!(env!("OUT_DIR"), "/kernels/silu_gate.metallib"))[..]
             }
+            "residual_add.metal" => {
+                &include_bytes!(concat!(env!("OUT_DIR"), "/kernels/residual_add.metallib"))[..]
+            }
             "paged_kv.metal" => {
                 &include_bytes!(concat!(env!("OUT_DIR"), "/kernels/paged_kv.metallib"))[..]
             }
@@ -73,6 +76,11 @@ const KERNEL_SOURCES: &[KernelSource] = &[
         file: "silu_gate.metal",
         source: shaders::SILU_GATE_SHADER,
         kernels: &[("silu_gate_kernel", "silu_gate")],
+    },
+    KernelSource {
+        file: "residual_add.metal",
+        source: shaders::RESIDUAL_ADD_SHADER,
+        kernels: &[("residual_add_kernel", "residual_add")],
     },
     KernelSource {
         file: "paged_kv.metal",
