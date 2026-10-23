@@ -6,18 +6,16 @@
 //! 1. a Metal decode step really runs the fused kernel (observable counter), while the CPU
 //!    backend leaves that counter at zero;
 //! 2. its logits stay within tolerance of the CPU reference path;
-//! 3. the fused prologue is one command buffer per layer on the production path, not one
-//!    per op — the property `tests/test_single_command_buffer.rs` proves for the kernel and
-//!    this file proves for the decode loop that uses it;
+//! 3. the decode step is one command buffer **per step** on the production path:
+//!    since ticket #110 the whole layer sweep (prologue + attention + O + MLP) is
+//!    chained into a single submission — the property this file asserted per layer
+//!    prologue before #110 subsumed;
 //! 4. dimensions outside the kernel geometry fall back to the per-op path instead of
 //!    erroring or changing the numbers.
 //!
-//! What is *not* asserted here, because it is not reachable with the kernels that already
-//! exist: one command buffer for the **whole** step (attention + O + MLP in the same
-//! submission as the prologue). `src/metal/fused_layer.rs` covers the QKV prologue only,
-//! and the only existing attention entry point owns its command buffer. That gap is
-//! recorded as debt in `docs/adr/0002-fused-decode-scope.md`, not papered over with a new
-//! kernel.
+//! The per-step command-buffer metric is `Model::metal_decode_command_buffers`,
+//! introduced by ticket #110; `tests/test_one_command_buffer_step.rs` pins the same
+//! property from a fresh angle (counting across several steps, plus logits parity).
 
 #[cfg(target_os = "macos")]
 mod common;
@@ -170,42 +168,44 @@ mod fused_metal_decode {
         }
     }
 
-    /// Acceptance #4, scoped to what is actually observable: the fused **prologue**
-    /// is one submission per layer, read from the production entry point rather than
+    /// Acceptance #4 as it stands since ticket #110: the whole decode step —
+    /// prologue, paged attention, O + residual, MLP + residual, for every layer —
+    /// is ONE command buffer, read from the production entry point rather than
     /// from the kernel harness.
     ///
-    /// Before #87 the prologue cost one command buffer per op (RMSNorm, three
-    /// projections, two RoPE passes). The fused kernel encodes the whole prologue into
-    /// one buffer and waits once, so a step's *prologue* submissions must equal the
-    /// layer count.
+    /// Before #87 the prologue alone cost one command buffer per op (RMSNorm,
+    /// three projections, two RoPE passes); #87 made it one per layer; #110 chains
+    /// the whole layer sweep into a single submission per step. The per-layer
+    /// property this test pinned until #110 is subsumed: one per step is strictly
+    /// fewer submissions than one per layer.
     ///
-    /// This is deliberately NOT a claim about command buffers per decode step.
-    /// `fused_prologue_command_buffers` reads the fused seam's own `MetalContext`;
-    /// the paged-attention seam has a second context and candle submits the tensor
-    /// path on the device queue, so the per-step total is structurally invisible from
-    /// here. ADR-0002 records the one-buffer-per-step goal as unpaid debt; the number
-    /// below must not be cited as evidence for it.
+    /// `metal_decode_command_buffers` sums the decode seams' submissions, so the
+    /// number a step moves it by is the per-step total on those seams: 1 on the
+    /// fused path, the layer count on the fallback loop. The final norm and
+    /// lm_head stay on the tensor path by ADR 0002's scope (submitted by candle on
+    /// the device queue, outside this metric).
     #[test]
-    fn metal_fused_decode_submits_one_command_buffer_per_layer_prologue() {
+    fn metal_fused_decode_submits_one_command_buffer_per_step() {
         let Some(dev) = crate::common::metal_device_or_skip() else {
             return;
         };
         let model = mock(&dev, Backend::Metal);
 
-        // Warm-up step: the first step builds the resident weights.
+        // Warm-up step: the first step builds the resident weights and the seams.
         let _ = batch_logits(&model, 128);
         assert!(
-            model.fused_prologue_command_buffers() > 0,
-            "the fused prologue must submit command buffers through its own Metal context"
+            model.metal_decode_command_buffers() > 0,
+            "the decode step must submit command buffers through the decode seams"
         );
 
-        let before = model.fused_prologue_command_buffers();
+        let before = model.metal_decode_command_buffers();
         let _ = batch_logits(&model, 128);
         assert_eq!(
-            model.fused_prologue_command_buffers() - before,
-            LAYERS,
-            "the fused prologue must be one command buffer per layer (RMSNorm + QKV + RoPE \
-             chained), not one per op — this says nothing about the per-op tail"
+            model.metal_decode_command_buffers() - before,
+            1,
+            "the whole layer sweep — fused prologue + paged attention + O + residual + \
+             SwiGLU MLP + residual, every layer — must be ONE command buffer per step, \
+             committed once"
         );
     }
 
