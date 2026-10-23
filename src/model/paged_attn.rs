@@ -17,7 +17,7 @@ use crate::metal::paged_attention::{
     PagedAttentionParams, gpu_paged_attention_v2_buffer, validate_paged_attention_params,
 };
 use candle_core::{Device, Tensor, TensorId};
-use metal::Buffer;
+use metal::{BlitCommandEncoderRef, Buffer};
 
 /// Attention shapes the kernel needs, taken from the model config once per call.
 pub(crate) struct AttnShape {
@@ -34,6 +34,20 @@ struct LayerPool {
     source: TensorId,
     k: Buffer,
     v: Buffer,
+}
+
+/// Buffers and kernel parameters one attention dispatch needs, cloned (a
+/// refcount bump) out of the seam once its device copy of the pool is current
+/// (ticket #110). Owning the clones keeps the seam usable while the caller
+/// encodes — the caller owns the command buffer and supplies the query buffer,
+/// encoding through [`encode_paged_attention_v2`] or the self-committing wrapper.
+pub(crate) struct PreparedAttention {
+    pub k: Buffer,
+    pub v: Buffer,
+    pub tables: Buffer,
+    pub lens: Buffer,
+    pub out: Buffer,
+    pub params: PagedAttentionParams,
 }
 
 pub(crate) struct PagedAttnSeam {
@@ -90,6 +104,104 @@ impl PagedAttnSeam {
         recycled_blocks: &[usize],
         shape: &AttnShape,
     ) -> Result<Tensor, EngineError> {
+        let q_host = q
+            .to_device(&Device::Cpu)?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        self.upload_q(&q_host);
+        let prepared = self.prepare_common(
+            kv,
+            layer,
+            block_tables,
+            max_blocks,
+            context_lens,
+            slots,
+            recycled_blocks,
+            shape,
+            q_host.len(),
+        )?;
+        let q_buf = self
+            .q_buf
+            .as_ref()
+            .ok_or_else(|| EngineError::Metal("metal paged attention: q missing".into()))?;
+
+        gpu_paged_attention_v2_buffer(
+            &self.ctx,
+            q_buf,
+            &prepared.k,
+            &prepared.v,
+            &prepared.tables,
+            &prepared.lens,
+            &prepared.out,
+            &prepared.params,
+        )?;
+
+        let out_elems = prepared.params.num_seqs as usize * shape.num_heads * shape.head_dim;
+        let mut out = vec![0.0f32; out_elems];
+        unsafe {
+            let ptr = prepared.out.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), out_elems);
+        }
+        Ok(Tensor::from_vec(
+            out,
+            (
+                prepared.params.num_seqs as usize,
+                shape.num_heads * shape.head_dim,
+            ),
+            &self.device,
+        )?)
+    }
+
+    /// Makes the seam's device state current for encoding `layer`'s attention into
+    /// a **caller-owned** command buffer (ticket #110): validates the shape,
+    /// uploads the tables when they changed, refreshes the pool copy and reserves
+    /// the output — everything except the encoding itself, which the caller does
+    /// through `encode_paged_attention_v2` with its own query buffer (typically
+    /// the fused prologue's `q_out`, still on the device).
+    #[allow(clippy::too_many_arguments)] // kernel surface: one per dispatch argument
+    pub(crate) fn prepare_encode(
+        &mut self,
+        q_buf: &Buffer,
+        kv: &KvStorage,
+        layer: usize,
+        block_tables: &[u32],
+        max_blocks: usize,
+        context_lens: &[u32],
+        slots: &[usize],
+        recycled_blocks: &[usize],
+        shape: &AttnShape,
+    ) -> Result<PreparedAttention, EngineError> {
+        let q_elems = (q_buf.length() / std::mem::size_of::<f32>() as u64) as usize;
+        self.prepare_common(
+            kv,
+            layer,
+            block_tables,
+            max_blocks,
+            context_lens,
+            slots,
+            recycled_blocks,
+            shape,
+            q_elems,
+        )
+    }
+
+    /// Shared preparation behind [`Self::attention`] and [`Self::prepare_encode`]:
+    /// validation, table upload, output reservation and pool refresh, returning
+    /// the buffers one dispatch reads and writes.
+    #[allow(clippy::too_many_arguments)] // kernel surface: one per dispatch argument
+    fn prepare_common(
+        &mut self,
+        kv: &KvStorage,
+        layer: usize,
+        block_tables: &[u32],
+        max_blocks: usize,
+        context_lens: &[u32],
+        slots: &[usize],
+        recycled_blocks: &[usize],
+        shape: &AttnShape,
+        q_elems: usize,
+    ) -> Result<PreparedAttention, EngineError> {
         let num_seqs = context_lens.len();
         if num_seqs == 0 || max_blocks == 0 {
             return Err(EngineError::Metal(
@@ -122,23 +234,16 @@ impl PagedAttnSeam {
         // to the copying path (ticket #51 / #86).
         validate_paged_attention_params(&params)?;
 
-        self.upload_tables(block_tables, context_lens);
-
-        let q_host = q
-            .to_device(&Device::Cpu)?
-            .contiguous()?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
         let out_elems = num_seqs * shape.num_heads * shape.head_dim;
-        if q_host.len() != out_elems {
+        if q_elems != out_elems {
             return Err(EngineError::Metal(format!(
                 "metal paged attention: q holds {} floats, expected {out_elems}",
-                q_host.len()
+                q_elems
             )));
         }
-        self.upload_q(&q_host);
-        self.reserve_out(out_elems);
 
+        self.upload_tables(block_tables, context_lens);
+        self.reserve_out(out_elems);
         self.refresh_pool(kv, layer, slots, recycled_blocks)?;
 
         let pool = self.pools[layer]
@@ -152,29 +257,64 @@ impl PagedAttnSeam {
             .lens_buf
             .as_ref()
             .ok_or_else(|| EngineError::Metal("metal paged attention: lens missing".into()))?;
-        let q_buf = self
-            .q_buf
-            .as_ref()
-            .ok_or_else(|| EngineError::Metal("metal paged attention: q missing".into()))?;
         let out_buf = self
             .out_buf
             .as_ref()
             .ok_or_else(|| EngineError::Metal("metal paged attention: out missing".into()))?;
+        Ok(PreparedAttention {
+            k: pool.k.clone(),
+            v: pool.v.clone(),
+            tables: tables_buf.clone(),
+            lens: lens_buf.clone(),
+            out: out_buf.clone(),
+            params,
+        })
+    }
 
-        gpu_paged_attention_v2_buffer(
-            &self.ctx, q_buf, &pool.k, &pool.v, tables_buf, lens_buf, out_buf, &params,
-        )?;
-
-        let mut out = vec![0.0f32; out_elems];
-        unsafe {
-            let ptr = out_buf.contents() as *const f32;
-            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), out_elems);
+    /// Copies one pool row (`slot`) of this layer's K/V from the fused prologue's
+    /// output buffers into the seam's device pool copy, on the caller's command
+    /// buffer (ticket #110) — the GPU-side publication of the step's fresh token
+    /// K/V, so the attention dispatch on the same buffer attends over it without a
+    /// host round trip. Must run after [`Self::prepare_encode`] refreshed the pool
+    /// buffers (a whole-pool upload replaces them) and before the attention
+    /// dispatch reads them; encoders on one command buffer execute in encode order.
+    #[allow(clippy::too_many_arguments)] // kernel surface: one per dispatch argument
+    pub(crate) fn blit_slot_row(
+        &self,
+        blit: &BlitCommandEncoderRef,
+        layer: usize,
+        slot: usize,
+        k_src: &Buffer,
+        v_src: &Buffer,
+        rows: usize,
+        row_elems: usize,
+    ) -> Result<(), EngineError> {
+        let pool = self.pools[layer]
+            .as_ref()
+            .ok_or_else(|| EngineError::Metal("metal paged attention: pool missing".into()))?;
+        if slot >= rows {
+            return Err(EngineError::Metal(format!(
+                "metal paged attention: slot {slot} outside the {rows}-row pool"
+            )));
         }
-        Ok(Tensor::from_vec(
-            out,
-            (num_seqs, shape.num_heads * shape.head_dim),
-            &self.device,
-        )?)
+        let byte_offset = (slot * row_elems * std::mem::size_of::<f32>()) as u64;
+        let byte_len = (row_elems * std::mem::size_of::<f32>()) as u64;
+        blit.copy_from_buffer(k_src, 0, &pool.k, byte_offset, byte_len);
+        blit.copy_from_buffer(v_src, 0, &pool.v, byte_offset, byte_len);
+        Ok(())
+    }
+
+    /// The seam's Metal context — the one-command-buffer step encodes attention
+    /// with it (pipelines and partition scratch) while spending the fused seam's
+    /// command buffer (ticket #110).
+    pub(crate) fn ctx(&self) -> &MetalContext {
+        &self.ctx
+    }
+
+    /// Command buffers this seam's context submitted (ticket #110: the per-step
+    /// metric sums this with the fused seam's).
+    pub(crate) fn command_buffers(&self) -> usize {
+        self.ctx.command_buffers_created()
     }
 
     /// Uploads the block table and context lens when they change. The engine builds them

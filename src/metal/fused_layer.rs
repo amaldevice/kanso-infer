@@ -1,6 +1,8 @@
 use crate::error::EngineError;
 use crate::metal::context::MetalContext;
-use crate::metal::ops::{gpu_rmsnorm_buffer, gpu_rope_buffer};
+use crate::metal::ops::{
+    encode_residual_add, encode_silu_gate_multiply, gpu_rmsnorm_buffer, gpu_rope_buffer,
+};
 use metal::{Buffer, MTLSize, ResourceRef};
 
 /// Threads per threadgroup required by the kernels in `fused_llama_layer.metal`
@@ -138,7 +140,7 @@ fn validate_layer_inputs(
 }
 
 /// Read `len` floats back out of a shared (zero-copy) device buffer.
-fn read_f32(buf: &Buffer, len: usize) -> Vec<f32> {
+pub(crate) fn read_f32(buf: &Buffer, len: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; len];
     unsafe {
         std::ptr::copy_nonoverlapping(buf.contents() as *const f32, out.as_mut_ptr(), len);
@@ -147,7 +149,7 @@ fn read_f32(buf: &Buffer, len: usize) -> Vec<f32> {
 }
 
 /// Stage host floats into a shared device buffer without reallocating it.
-fn write_f32(buf: &Buffer, data: &[f32]) {
+pub(crate) fn write_f32(buf: &Buffer, data: &[f32]) {
     debug_assert!(buf.length() as usize >= std::mem::size_of_val(data));
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents() as *mut f32, data.len());
@@ -285,20 +287,44 @@ impl MetalWeights {
         let kv_dim = self.dims.kv_dim();
         write_f32(&self.in_buf, hidden_in);
 
+        let command_buffer = ctx.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode_prologue(ctx, encoder, &self.in_buf, pos, eps)?;
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        Ok((
+            read_f32(&self.q_out, q_dim),
+            read_f32(&self.k_out, kv_dim),
+            read_f32(&self.v_out, kv_dim),
+        ))
+    }
+
+    /// Encodes the fused RMSNorm + QKV + RoPE chain into a caller-owned compute
+    /// encoder (ticket #110). The three dispatches write disjoint outputs and only
+    /// read shared inputs, so one encoder covers them — the same contract as
+    /// [`Self::decode_step`], minus the command buffer. `in_buf` may be the
+    /// caller's residual-stream buffer instead of this layer's staging input.
+    pub fn encode_prologue(
+        &self,
+        ctx: &MetalContext,
+        encoder: &metal::ComputeCommandEncoderRef,
+        in_buf: &Buffer,
+        pos: usize,
+        eps: f32,
+    ) -> Result<(), EngineError> {
         let pipeline = ctx.pipelines.get("fused_rmsnorm_qkv_rope").ok_or_else(|| {
             EngineError::Metal("Pipeline 'fused_rmsnorm_qkv_rope' not found in cache".into())
         })?;
 
-        let command_buffer = ctx.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-
+        let q_dim = self.dims.q_dim();
+        let kv_dim = self.dims.kv_dim();
         // Q and K are RoPE-rotated on the fly (row pairs are rotation pairs), V is not.
-        // All three write disjoint outputs and only read shared inputs, so no barrier is
-        // needed between them inside this encoder.
         encode_fused_qkv_gemv(
             encoder,
             pipeline,
-            &self.in_buf,
+            in_buf,
             &self.norm_weight,
             &self.w_q,
             &self.cos,
@@ -313,7 +339,7 @@ impl MetalWeights {
         encode_fused_qkv_gemv(
             encoder,
             pipeline,
-            &self.in_buf,
+            in_buf,
             &self.norm_weight,
             &self.w_k,
             &self.cos,
@@ -328,7 +354,7 @@ impl MetalWeights {
         encode_fused_qkv_gemv(
             encoder,
             pipeline,
-            &self.in_buf,
+            in_buf,
             &self.norm_weight,
             &self.w_v,
             &self.cos,
@@ -340,16 +366,323 @@ impl MetalWeights {
             eps,
             false,
         );
+        Ok(())
+    }
 
+    /// This layer's fused RoPE output row (the query the step's attention reads).
+    pub fn q_out(&self) -> &Buffer {
+        &self.q_out
+    }
+
+    /// This layer's roped K output row, staged for the pool copy.
+    pub fn k_out(&self) -> &Buffer {
+        &self.k_out
+    }
+
+    /// This layer's V output row, staged for the pool copy.
+    pub fn v_out(&self) -> &Buffer {
+        &self.v_out
+    }
+
+    /// The resident rotary tables, bindable for rope-off fused GEMV dispatches
+    /// (the kernel only indexes them when `apply_rope` is set).
+    pub fn rope_tables(&self) -> (&Buffer, &Buffer) {
+        (&self.cos, &self.sin)
+    }
+}
+
+/// Host-side weights for one whole decoder layer on the one-command-buffer step
+/// (ticket #110): the prologue plus the O projection, the FFN norm and the SwiGLU
+/// MLP. Dense F32 rows only — the same contract as [`FusedLayerWeights`], so a
+/// quantized projection keeps the pre-existing path.
+#[derive(Debug, Clone)]
+pub struct FullLayerWeights {
+    pub prologue: FusedLayerWeights,
+    /// `[hidden, q_dim]` attention output projection.
+    pub w_o: Vec<f32>,
+    /// FFN RMSNorm weight, `[hidden]`.
+    pub ffn_norm: Vec<f32>,
+    /// `[intermediate, hidden]` gate projection.
+    pub w_gate: Vec<f32>,
+    /// `[intermediate, hidden]` up projection.
+    pub w_up: Vec<f32>,
+    /// `[hidden, intermediate]` down projection.
+    pub w_down: Vec<f32>,
+}
+
+/// Slice-shape contract of the full-layer weights (ticket #110).
+fn validate_full_layer_shapes(
+    dims: &FusedLayerDimensions,
+    intermediate: usize,
+    weights: &FullLayerWeights,
+) -> Result<(), EngineError> {
+    validate_weight_shapes(dims, &weights.prologue)?;
+    let hidden = dims.hidden_dim;
+    let expect = |name: &str, got: usize, want: usize| -> Result<(), EngineError> {
+        if got == want {
+            Ok(())
+        } else {
+            Err(EngineError::Metal(format!(
+                "{name} has {got} elements, expected {want} (hidden_dim {hidden}, \
+                 intermediate {intermediate})"
+            )))
+        }
+    };
+    if intermediate == 0 || !intermediate.is_multiple_of(4) {
+        return Err(EngineError::Metal(format!(
+            "intermediate_dim must be a non-zero multiple of 4 (down GEMV reads float4 \
+             lanes, gate/up cover row pairs), got {intermediate}"
+        )));
+    }
+    if !dims.q_dim().is_multiple_of(4) {
+        return Err(EngineError::Metal(format!(
+            "q_dim {} must be a multiple of 4 (the O-projection GEMV reads float4 lanes)",
+            dims.q_dim()
+        )));
+    }
+    expect("w_o", weights.w_o.len(), hidden * dims.q_dim())?;
+    expect("ffn_norm", weights.ffn_norm.len(), hidden)?;
+    expect("w_gate", weights.w_gate.len(), intermediate * hidden)?;
+    expect("w_up", weights.w_up.len(), intermediate * hidden)?;
+    expect("w_down", weights.w_down.len(), hidden * intermediate)?;
+    Ok(())
+}
+
+/// Device-resident full layer plus the scratch the one-command-buffer step needs
+/// (ticket #110): the prologue's [`MetalWeights`] plus the O/FFN weights and the
+/// per-layer intermediate buffers. Uploaded once at build; a step allocates
+/// nothing and encodes into the step's command buffer.
+pub struct ResidentLayer {
+    prologue: MetalWeights,
+    intermediate: usize,
+    w_o: Buffer,
+    ffn_norm: Buffer,
+    w_gate: Buffer,
+    w_up: Buffer,
+    w_down: Buffer,
+    o_out: Buffer,
+    gate_out: Buffer,
+    up_out: Buffer,
+    silu_out: Buffer,
+    down_out: Buffer,
+}
+
+impl ResidentLayer {
+    /// Uploads the whole layer's weights into device buffers once.
+    pub fn upload(
+        ctx: &MetalContext,
+        dims: &FusedLayerDimensions,
+        intermediate: usize,
+        weights: &FullLayerWeights,
+        cos_table: &[f32],
+        sin_table: &[f32],
+    ) -> Result<Self, EngineError> {
+        validate_full_layer_shapes(dims, intermediate, weights)?;
+        let prologue = MetalWeights::upload(ctx, dims, &weights.prologue, cos_table, sin_table)?;
+        Ok(Self {
+            prologue,
+            intermediate,
+            w_o: ctx.alloc_buffer_with_data(&weights.w_o),
+            ffn_norm: ctx.alloc_buffer_with_data(&weights.ffn_norm),
+            w_gate: ctx.alloc_buffer_with_data(&weights.w_gate),
+            w_up: ctx.alloc_buffer_with_data(&weights.w_up),
+            w_down: ctx.alloc_buffer_with_data(&weights.w_down),
+            o_out: ctx.alloc_buffer::<f32>(dims.hidden_dim),
+            gate_out: ctx.alloc_buffer::<f32>(intermediate),
+            up_out: ctx.alloc_buffer::<f32>(intermediate),
+            silu_out: ctx.alloc_buffer::<f32>(intermediate),
+            down_out: ctx.alloc_buffer::<f32>(dims.hidden_dim),
+        })
+    }
+
+    /// Encodes the layer's fused RMSNorm + QKV + RoPE prologue into a caller-owned
+    /// command buffer, reading the caller's residual-stream buffer as input.
+    pub fn encode_prologue(
+        &self,
+        ctx: &MetalContext,
+        encoder: &metal::ComputeCommandEncoderRef,
+        hidden: &Buffer,
+        pos: usize,
+        eps: f32,
+    ) -> Result<(), EngineError> {
+        self.prologue
+            .encode_prologue(ctx, encoder, hidden, pos, eps)
+    }
+
+    /// This layer's fused query row (RoPE-applied), bound straight into the step's
+    /// paged-attention dispatch — no host round trip.
+    pub fn q_out(&self) -> &Buffer {
+        self.prologue.q_out()
+    }
+
+    /// This layer's roped K output row, still on the device for the pool copy.
+    pub fn k_out(&self) -> &Buffer {
+        self.prologue.k_out()
+    }
+
+    /// This layer's V output row, still on the device for the pool copy.
+    pub fn v_out(&self) -> &Buffer {
+        self.prologue.v_out()
+    }
+
+    /// Reads the layer's K row back to the host after the step's command buffer
+    /// completed, for the KV pool writeback.
+    pub fn read_k(&self) -> Vec<f32> {
+        read_f32(self.prologue.k_out(), self.prologue_dims().kv_dim())
+    }
+
+    /// Reads the layer's V row back to the host after the step's command buffer
+    /// completed, for the KV pool writeback.
+    pub fn read_v(&self) -> Vec<f32> {
+        read_f32(self.prologue.v_out(), self.prologue_dims().kv_dim())
+    }
+
+    fn prologue_dims(&self) -> &FusedLayerDimensions {
+        // MetalWeights keeps its own dims copy; upload validated it against the
+        // dims passed here, so the geometry the scratch was sized for matches.
+        &self.prologue.dims
+    }
+
+    /// The prologue's resident weights — the per-layer submit strategy's entry
+    /// (`decode_step`), kept for the paths that cannot chain a whole step.
+    pub fn as_metal_weights(&self) -> &MetalWeights {
+        &self.prologue
+    }
+
+    /// Encodes the layer tail after attention: O projection + residual add, then
+    /// the SwiGLU MLP (fused-norm gate/up GEMVs, SiLU·gate, down GEMV) + residual
+    /// add, into the caller's command buffer (ticket #110).
+    ///
+    /// Every dependent dispatch gets its own compute encoder: dispatches within a
+    /// single encoder are not guaranteed to be ordered, while encoders on one
+    /// command buffer are. `residual_scale` is the Granite `residual_scale`
+    /// multiplier (1.0 on plain llama) — the same factor the tensor path applies
+    /// via `Model::scale_residual`.
+    pub fn encode_tail(
+        &self,
+        ctx: &MetalContext,
+        command_buffer: &metal::CommandBufferRef,
+        attn_out: &Buffer,
+        hidden: &Buffer,
+        residual_scale: f32,
+        eps: f32,
+        dims: &FusedLayerDimensions,
+    ) -> Result<(), EngineError> {
+        let gemv = ctx
+            .pipelines
+            .get("linear_gemv")
+            .ok_or_else(|| EngineError::Metal("Pipeline 'linear_gemv' not found".into()))?;
+        let residual = ctx
+            .pipelines
+            .get("residual_add")
+            .ok_or_else(|| EngineError::Metal("Pipeline 'residual_add' not found".into()))?;
+        let fused = ctx.pipelines.get("fused_rmsnorm_qkv_rope").ok_or_else(|| {
+            EngineError::Metal("Pipeline 'fused_rmsnorm_qkv_rope' not found".into())
+        })?;
+        let silu = ctx
+            .pipelines
+            .get("silu_gate")
+            .ok_or_else(|| EngineError::Metal("Pipeline 'silu_gate' not found".into()))?;
+
+        let hidden_dim = dims.hidden_dim;
+        let intermediate = self.intermediate;
+
+        // O projection: [q_dim] -> [hidden].
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_linear_gemv(
+            encoder,
+            gemv,
+            attn_out,
+            &self.w_o,
+            &self.o_out,
+            dims.q_dim(),
+            hidden_dim,
+        );
         encoder.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
 
-        Ok((
-            read_f32(&self.q_out, q_dim),
-            read_f32(&self.k_out, kv_dim),
-            read_f32(&self.v_out, kv_dim),
-        ))
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_residual_add(
+            encoder,
+            residual,
+            &self.o_out,
+            hidden,
+            hidden_dim,
+            residual_scale,
+        );
+        encoder.end_encoding();
+
+        // Gate/up: the fused kernel normalises with the FFN norm on the fly; RoPE
+        // off means its output rows are plain adjacent pairs, so any even out_dim
+        // (the intermediate) is representable.
+        let (cos, sin) = self.prologue.rope_tables();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_fused_qkv_gemv(
+            encoder,
+            fused,
+            hidden,
+            &self.ffn_norm,
+            &self.w_gate,
+            cos,
+            sin,
+            &self.gate_out,
+            dims,
+            intermediate,
+            0,
+            eps,
+            false,
+        );
+        encode_fused_qkv_gemv(
+            encoder,
+            fused,
+            hidden,
+            &self.ffn_norm,
+            &self.w_up,
+            cos,
+            sin,
+            &self.up_out,
+            dims,
+            intermediate,
+            0,
+            eps,
+            false,
+        );
+        encoder.end_encoding();
+
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_silu_gate_multiply(
+            encoder,
+            silu,
+            &self.gate_out,
+            &self.up_out,
+            &self.silu_out,
+            intermediate,
+        );
+        encoder.end_encoding();
+
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_linear_gemv(
+            encoder,
+            gemv,
+            &self.silu_out,
+            &self.w_down,
+            &self.down_out,
+            intermediate,
+            hidden_dim,
+        );
+        encoder.end_encoding();
+
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_residual_add(
+            encoder,
+            residual,
+            &self.down_out,
+            hidden,
+            hidden_dim,
+            residual_scale,
+        );
+        encoder.end_encoding();
+
+        Ok(())
     }
 }
 
