@@ -17,10 +17,11 @@
 //! float differences without letting a regression hide.
 
 use candle_core::Tensor;
+use kanso_infer::bench::{evaluate_run_with_timings, run_synthetic_benchmark};
 use kanso_infer::engine::Engine;
 use kanso_infer::error::EngineError;
 use kanso_infer::hardware::Backend;
-use kanso_infer::kv_cache::{BlockTable, KvStorage, KvStorageKind, QuantMode};
+use kanso_infer::kv_cache::{BlockTable, KvCacheType, KvStorage, KvStorageKind, QuantMode};
 use kanso_infer::model::Model;
 
 /// Max |quantized - F32| logit, as a fraction of the F32 logit range (max - min).
@@ -342,4 +343,95 @@ fn int8_engine_generates_the_same_tokens_as_f32() {
         f32_tokens, int8_tokens,
         "INT8 KV changed the greedy trajectory of a mock request"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Ticket #111: the benchmark report carries the KV pool's memory numbers.
+//
+// Floor derivation for the `ratio_vs_f32` row in `gates/fase2.json`, from the
+// two pools' storage layouts — per token, per layer, so `num_layers` and the
+// block geometry cancel in the ratio:
+//
+// - F32 pool: K and V each hold `n_kv_heads * head_dim` f32s
+//   → `8 * h * d` bytes per token (`KvStorageKind::f32_bytes_per_token`).
+// - INT8/FP8 pool: both modes store one byte per K/V element plus one f32
+//   scale per token per head, for K and for V (`QuantizedKvBlock`)
+//   → `2 * h * d + 8 * h` bytes per token
+//   (`QuantizedKvStorage::memory_bytes_per_token`).
+//
+// ratio = 8hd / (2hd + 8h) = 4d / (d + 4) — independent of `n_kv_heads`:
+//   head_dim 64  (SmolLM2-360M: 960 hidden / 15 heads) → 3.765x
+//   head_dim 128 → 3.879x
+//   head_dim 32  → 3.556x
+// The 3.0x floor sits below every geometry a real GGUF bench can run
+// (head_dim ≥ 32) with ≥ 15% margin, while a "quantized" pool that saves
+// nothing (~1.0x) or one that silently stored floats stays red.
+// ---------------------------------------------------------------------------
+
+/// A report from a real engine run carries the same kv numbers as the pool
+/// that served it: the type, the bytes per token, and the ratio against F32
+/// (#111). Read through the JSON the gate itself consumes
+/// (`bench --gate-report`), so the claim must survive the interchange format.
+#[test]
+fn engine_run_report_carries_the_pools_kv_memory_numbers() {
+    for (kv_type, mode) in [
+        (KvCacheType::F32, None),
+        (KvCacheType::Int8, Some(QuantMode::Int8)),
+        (KvCacheType::Fp8, Some(QuantMode::Fp8)),
+    ] {
+        let mut engine = match mode {
+            None => Engine::new(mock(), 1, 64, 16).expect("f32 engine"),
+            Some(mode) => Engine::new_with_budget_and_kv(mock(), 1, 64, 16, usize::MAX, Some(mode))
+                .expect("quantized engine"),
+        };
+        let report = run_synthetic_benchmark(&mut engine, 1, 8, 2, false)
+            .expect("the workload must run to produce a report");
+
+        let json = serde_json::to_value(&report).expect("report serializes");
+        assert_eq!(
+            json.get("kv_type").and_then(serde_json::Value::as_str),
+            Some(kv_type.to_string().as_str()),
+            "the report must name the pool type that served the run"
+        );
+        assert_eq!(
+            json.get("bytes_per_token")
+                .and_then(serde_json::Value::as_u64),
+            Some(engine.kv_storage.memory_bytes_per_token() as u64),
+            "the report must carry the pool's own bytes-per-token, not a claim"
+        );
+        let reported = json
+            .get("ratio_vs_f32")
+            .and_then(serde_json::Value::as_f64)
+            .expect("the report must carry ratio_vs_f32");
+        let pools = engine.kv_storage.memory_ratio_vs_f32() as f64;
+        assert!(
+            (reported - pools).abs() < 1e-6,
+            "reported ratio {reported} disagrees with the pool's own {pools}"
+        );
+        match kv_type {
+            KvCacheType::F32 => assert!(
+                (reported - 1.0).abs() < 1e-9,
+                "the F32 pool is the baseline, so its own ratio is exactly 1.0x"
+            ),
+            KvCacheType::Int8 | KvCacheType::Fp8 => assert!(
+                reported > 1.0,
+                "a quantized pool must report a saving, got {reported}"
+            ),
+        }
+    }
+}
+
+/// The #91/#100 honesty discipline, applied to the kv fields: a report built
+/// without an engine carries no pool numbers at all — `None`, absent from the
+/// JSON — never a zero or a guessed pool type that a floor could misjudge.
+#[test]
+fn report_without_an_engine_carries_no_kv_fields() {
+    let report = evaluate_run_with_timings(100, 1.0, 1, &[10.0], &[5.0], 10, 0.1, 20, 2.0, 42, 0);
+    let json = report.to_json().expect("report serializes");
+    for field in ["kv_type", "bytes_per_token", "ratio_vs_f32"] {
+        assert!(
+            !json.contains(&format!("\"{field}\"")),
+            "an engineless report must not carry '{field}': None means not measured"
+        );
+    }
 }

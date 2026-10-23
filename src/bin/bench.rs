@@ -5,6 +5,7 @@ use kanso_infer::bench::{
 };
 use kanso_infer::engine::Engine;
 use kanso_infer::error::EngineError;
+use kanso_infer::kv_cache::KvCacheType;
 use kanso_infer::model::Model;
 
 #[derive(Parser, Debug)]
@@ -39,6 +40,13 @@ pub struct Args {
     /// KV cache block size
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,
+
+    /// KV cache type: f32 (default), int8 or fp8. The quantized pools are
+    /// host-side only: `metal` refuses them at engine construction (ticket #88).
+    /// The chosen pool's memory numbers land in the report as `kv_type` /
+    /// `bytes_per_token` / `ratio_vs_f32` (ticket #111).
+    #[arg(long, default_value_t = KvCacheType::default())]
+    pub kv_type: KvCacheType,
 
     /// Maximum concurrent running sequences
     #[arg(long, default_value_t = 64)]
@@ -142,6 +150,15 @@ fn print_report(label: &str, report: &BenchmarkReport, backend: Backend) {
     if let Some(ctx) = report.context_len {
         println!("{:<24} context_len={ctx}", "");
     }
+    // The pool that served the run, with its own memory numbers (#111).
+    if let (Some(kv_type), Some(bytes), Some(ratio)) =
+        (report.kv_type, report.bytes_per_token, report.ratio_vs_f32)
+    {
+        println!(
+            "{:<24} kv={kv_type} bytes_per_token={bytes} ratio_vs_f32={ratio:.2}x",
+            ""
+        );
+    }
     if let Some(probes) = &report.probes {
         println!("{:<24} probes: {probes:?}", "");
     }
@@ -154,6 +171,7 @@ fn create_engine_for_workload(
     max_tokens_per_seq: usize,
     block_size: usize,
     max_running: usize,
+    kv_type: KvCacheType,
 ) -> Result<Engine, EngineError> {
     let device = backend.device()?;
     println!(
@@ -168,7 +186,14 @@ fn create_engine_for_workload(
     let blocks_per_seq = max_tokens_per_seq.div_ceil(block_size) + 1;
     let total_blocks = (blocks_per_seq * num_requests.max(1)).max(128);
 
-    Engine::new(model, max_running, total_blocks, block_size)
+    Engine::new_with_budget_and_kv(
+        model,
+        max_running,
+        total_blocks,
+        block_size,
+        usize::MAX,
+        kv_type.mode(),
+    )
 }
 
 /// `bench --gate <budget.json> --gate-report <report.json>`: re-checks an
@@ -376,6 +401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             max_tokens,
             args.block_size,
             args.max_running,
+            args.kv_type,
         )?;
 
         let geometry = kanso_infer::bench::attention_geometry(&engine.model);
@@ -451,6 +477,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             max_tokens,
             args.block_size,
             args.max_running,
+            args.kv_type,
         )?;
         let geometry = kanso_infer::bench::attention_geometry(&engine.model);
 

@@ -155,6 +155,19 @@ pub struct BenchmarkReport {
     /// Absent when no probe was asked for (#100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probes: Option<KernelProbes>,
+    /// Which KV pool served the run, attached only by a run that really used
+    /// an engine, straight from the pool itself (#111). `None` = no engine ran
+    /// (or the report predates the field), so nothing was measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_type: Option<crate::kv_cache::KvCacheType>,
+    /// Bytes of KV the pool named in `kv_type` holds per token (per layer).
+    /// Same `None`-means-unmeasured rule as `kv_type` (#111).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_per_token: Option<usize>,
+    /// How many times smaller that pool is than the F32 pool (`1.0` for F32
+    /// itself). Same `None`-means-unmeasured rule as `kv_type` (#111).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ratio_vs_f32: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speculative: Option<crate::speculative::profiler::SpeculativeReport>,
 }
@@ -217,6 +230,18 @@ impl BenchmarkReport {
     #[must_use]
     pub fn with_probes(mut self, probes: KernelProbes) -> Self {
         self.probes = Some(probes);
+        self
+    }
+
+    /// Attaches the KV pool's memory numbers: which pool type served the run,
+    /// its bytes per token, and its ratio against the F32 pool (#111). Taken
+    /// from the pool itself, so the report cannot disagree with the thing it
+    /// measured.
+    #[must_use]
+    pub fn with_kv_memory(mut self, pool: &crate::kv_cache::KvStorageKind) -> Self {
+        self.kv_type = Some(pool.cache_type());
+        self.bytes_per_token = Some(pool.memory_bytes_per_token());
+        self.ratio_vs_f32 = Some(pool.memory_ratio_vs_f32() as f64);
         self
     }
 
@@ -395,6 +420,9 @@ pub fn evaluate_run_with_timings(
         perplexity_wikitext2: None,
         context_len: None,
         probes: None,
+        kv_type: None,
+        bytes_per_token: None,
+        ratio_vs_f32: None,
         speculative: None,
     }
 }
@@ -516,6 +544,9 @@ fn execute_engine_run(
     } else {
         (delta_matched as f64 / delta_total as f64).min(1.0)
     };
+    // The pool that really served this run (#111): the report carries its own
+    // numbers, so the memory saving is measured, not claimed.
+    let report = report.with_kv_memory(&engine.kv_storage);
     Ok(report)
 }
 pub fn run_benchmark_workload(
