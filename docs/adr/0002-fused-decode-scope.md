@@ -1,6 +1,7 @@
 # ADR 0002 — Scope of the fused Metal layer on the decode path (ticket #87)
 
-**Status:** accepted, with debt recorded.
+**Status:** accepted; the debt recorded below was paid by ticket #110
+(2026-10-23).
 
 ## Context
 
@@ -31,6 +32,13 @@ rows to upload) is likewise a fallback, so the seam never turns a representable-
 question into a decode error.
 
 ## Debt: one command buffer per step, not per layer
+
+> **Paid — 2026-10-23, ticket #110.** The step now chains prologue → PagedAttention
+> v2 (through the #109 encode seam) → O + residual add (new residual-add kernel) →
+> SwiGLU MLP + residual add for every layer into one command buffer per step,
+> committed once, asserted from the production path by
+> `Model::metal_decode_command_buffers`. The section below is kept as the record of
+> why #87 shipped without it.
 
 Acceptance criterion 4 asks for one command buffer per step covering attention/O/MLP. That
 is **not** what this change delivers, and the reason is concrete rather than scheduling:
@@ -68,3 +76,8 @@ The idle-gap and command-buffer gates (ticket #95) now have a production path to
 the number they will report is "one buffer per layer prologue plus the per-op tail", not "one
 buffer per step". Ticket #95 must not calibrate its threshold against the latter until the
 debt above is paid.
+
+> **Ban lifted — 2026-10-23, ticket #110.** The debt above is paid: the wired Metal
+> decode step is one command buffer per step. The per-step metric
+> (`Model::metal_decode_command_buffers`) and the idle-gap threshold in #101 may now
+> be calibrated against one-buffer-per-step.

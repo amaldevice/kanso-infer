@@ -222,6 +222,16 @@ impl KvStorageKind {
         }
     }
 
+    /// The user-facing type of this pool — the inverse of [`KvCacheType::mode`],
+    /// so a report can name the pool that served its run (#111).
+    pub fn cache_type(&self) -> KvCacheType {
+        match self.mode() {
+            None => KvCacheType::F32,
+            Some(QuantMode::Int8) => KvCacheType::Int8,
+            Some(QuantMode::Fp8) => KvCacheType::Fp8,
+        }
+    }
+
     /// The four numbers every pool shares, read from whichever variant holds them.
     ///
     /// They travel together everywhere (`KvSlotPlan`, `PaddedBatch`, the kernel's

@@ -186,9 +186,11 @@ pub struct Model {
     /// The single seam that lets a decode step attend over the block pool instead of a
     /// per-layer gather: `Some` only once a Metal decode step has run (ticket #86).
     paged_attn: RefCell<Option<PagedAttnSeam>>,
-    /// #87: the fused Metal prologue (RMSNorm + QKV + RoPE) as the decode path. `None`
-    /// means this model is outside the kernel geometry, or has not decoded on Metal yet,
-    /// and the per-op path runs instead.
+    /// #87/#110: the fused Metal decode step. Since #110 a whole layer sweep —
+    /// prologue, paged attention, O + residual, SwiGLU MLP + residual — runs on
+    /// one command buffer per step through this seam. `None` means this model is
+    /// outside the kernel geometry, or has not decoded on Metal yet, and the
+    /// per-op path runs instead.
     fused_decode: RefCell<Option<FusedDecodeSeam>>,
 }
 
@@ -257,24 +259,39 @@ impl Model {
         self.fused_decode
             .borrow()
             .as_ref()
-            .map(FusedDecodeSeam::steps)
+            .map(FusedDecodeSeam::layer_sweeps)
             .unwrap_or(0)
     }
 
-    /// Command buffers the fused decode seam submitted.
+    /// Command buffers the Metal decode path created, across both decode seams
+    /// (ticket #110).
     ///
-    /// This counts **only the fused prologue's own Metal context**. It is not a
-    /// total for the step: the paged-attention seam owns a second `MetalContext`,
-    /// and the tensor path's GEMMs are submitted by candle on the device queue,
-    /// neither of which is visible here. Read it as "the prologue's submissions",
-    /// never as "command buffers per decode step" — the per-step total does not
-    /// exist yet (ADR-0002 records that debt).
-    pub fn fused_prologue_command_buffers(&self) -> usize {
-        self.fused_decode
+    /// The first metric that measures the **per-step total**: since #110 the fused
+    /// seam spends exactly one command buffer per decode step (prologue, paged
+    /// attention, O + residual and SwiGLU MLP + residual for every layer chained
+    /// into it), and the paged-attention seam spends none while riding that
+    /// buffer — so a fused step moves this by 1. A step on the fallback loop
+    /// instead spends, per layer, the paged-attention wrapper's buffer plus the
+    /// fused prologue's when the seam exists: the geometry fallback (no seam
+    /// built, per-op prologue on the device queue) moves by the layer count,
+    /// the hybrid-offload step (seam built, FFN dispatched per layer) by twice
+    /// that. What stays outside the metric on purpose
+    /// (ADR 0002 scope): the final norm and lm_head run on the tensor path,
+    /// submitted by candle on the device queue.
+    pub fn metal_decode_command_buffers(&self) -> usize {
+        let fused = self
+            .fused_decode
             .borrow()
             .as_ref()
             .map(FusedDecodeSeam::command_buffers)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let paged = self
+            .paged_attn
+            .borrow()
+            .as_ref()
+            .map(PagedAttnSeam::command_buffers)
+            .unwrap_or(0);
+        fused + paged
     }
 
     /// Batched forwards (`forward_batch`) issued so far (#45 acceptance hook).
@@ -1442,7 +1459,9 @@ impl Model {
         let num_kv_heads = self.config.num_key_value_heads;
 
         let token_ids = Tensor::from_slice(tokens, (total,), &self.device)?;
-        let mut hidden = self.embed(&token_ids)?;
+        // Not `mut` here: the one-command-buffer branch reads it once and produces
+        // the step's final row; only the fallback loop rebinds it per layer.
+        let hidden = self.embed(&token_ids)?;
 
         let (cos, sin) = self.rope_cos_sin(positions)?;
         let cos = cos.reshape((total, 1, head_dim / 2))?;
@@ -1541,93 +1560,168 @@ impl Model {
         }
         let fused_pos = positions[0];
 
-        for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
-            // The prologue reads this layer's input row, which the previous layer just
-            // wrote back into `hidden`, so it is read here and not once before the loop.
-            let fused = match fused_seam.as_mut() {
-                Some(seam) if fused_decode && fused_pos <= seam.max_pos() => {
-                    let row = hidden.flatten_all()?.to_vec1::<f32>()?;
-                    Some(seam.prologue(
-                        layer_idx,
-                        &row,
-                        fused_pos,
-                        self.config.rms_norm_eps as f32,
-                    )?)
-                }
-                _ => None,
-            };
-            let (q, k, v) = match fused {
-                // The fused kernel already applied RoPE, so the rows below are final.
-                Some((q, k, v)) => (
-                    Tensor::from_vec(q, (1, num_q_heads, head_dim), &self.device)?,
-                    Tensor::from_vec(k, (1, num_kv_heads, head_dim), &self.device)?,
-                    Tensor::from_vec(v, (1, num_kv_heads, head_dim), &self.device)?,
-                ),
-                None => {
-                    let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
-                    let (q, k, v) = self.project_qkv(layer, &normed)?;
-                    let q = q.reshape((total, num_q_heads, head_dim))?;
-                    let k = k.reshape((total, num_kv_heads, head_dim))?;
-                    let v = v.reshape((total, num_kv_heads, head_dim))?;
-                    (
-                        self.rope_apply(&q, &cos, &sin)?,
-                        self.rope_apply(&k, &cos, &sin)?,
-                        v,
-                    )
-                }
-            };
+        // #110: the one-command-buffer step. The same conditions the #87 wiring
+        // checked, plus the two that make a chained sweep valid: no hybrid FFN
+        // offload owning the layer tail, and the step's paged geometry being built
+        // (Metal pure decode). Everything else — bigger batches, other backends,
+        // off-geometry models, hybrid offload, a position past the resident rotary
+        // tables — keeps the loop below, which itself runs the per-layer fused
+        // prologue since #87.
+        let single_buffer_step = fused_decode
+            && fused_seam.is_some()
+            && self.hybrid_pipeline.is_none()
+            && paged_decode.is_some()
+            && fused_seam
+                .as_ref()
+                .is_some_and(|seam| fused_pos <= seam.max_pos());
 
-            // Scatter this step's K/V into the physical blocks the scheduler mapped.
-            kv_storage.write_kv_slots(layer_idx, &slot_plan, &k, &v)?;
+        let single_buffer_paged = if single_buffer_step {
+            paged_decode.as_ref()
+        } else {
+            None
+        };
 
-            let attn_out = match (&paged_decode, &decode_layout) {
-                (Some(paged), _) => {
-                    // #86: the kernel reads K/V out of the block pool itself, so the
-                    // history is not gathered, padded or copied per layer.
-                    self.metal_paged_attention(&q, kv_storage, layer_idx, paged)?
-                }
-                (None, Some(layout)) => {
-                    // One query token per sequence: the whole batch attends in a single
-                    // padded GEMM instead of one attention pass per sequence (which is
-                    // what per-op overhead makes expensive at small batch sizes).
-                    // ponytail: each sequence is padded to the longest context in the batch,
-                    // so ragged batches waste lanes; a varlen kernel drops the padding.
-                    self.batch_decode_attention(&q, kv_storage, layer_idx, layout)?
-                }
-                (None, None) => {
-                    // Steps that mix prefill chunks with decode tokens attend per sequence
-                    // instead (those steps are latency- not throughput-critical).
-                    // ponytail: per-sequence attention costs one gather + a dozen ops per
-                    // sequence; a varlen/paged kernel over the whole batch removes that.
-                    let mut attn_rows = Vec::with_capacity(num_seqs);
-                    for s in 0..num_seqs {
-                        let q_s = q.narrow(0, offsets[s], query_lens[s])?.transpose(0, 1)?;
-                        let (k_all, v_all) = kv_storage.gather_blocks(
+        let hidden = if let Some(paged) = single_buffer_paged {
+            // The step consumes the embedding row and produces the final residual
+            // row on the device; K/V rows come back per layer for the pool writeback
+            // (the GPU published them into the seam's device pool copy directly, so
+            // the pool itself is written after the single commit-and-wait).
+            let embedding_row = hidden.flatten_all()?.to_vec1::<f32>()?;
+            let kv_pool = kv_storage.f32_pool()?;
+            let head_dim = self.config.head_dim();
+            let shape = AttnShape {
+                num_heads: self.config.num_attention_heads,
+                num_kv_heads: self.config.num_key_value_heads,
+                head_dim,
+                scale: self.attention_scale(head_dim) as f32,
+            };
+            let residual_scale = self.config.residual_scale.unwrap_or(1.0);
+
+            let mut paged_seam = self.paged_attn.borrow_mut();
+            if paged_seam.is_none() {
+                *paged_seam = Some(PagedAttnSeam::new(
+                    self.config.num_hidden_layers,
+                    &self.device,
+                )?);
+            }
+            let paged_seam = paged_seam.as_mut().expect("just built");
+            let seam = fused_seam.as_mut().expect("checked above");
+            let rows = seam.run_step(
+                paged_seam,
+                kv_pool,
+                paged,
+                &embedding_row,
+                fused_pos,
+                self.config.rms_norm_eps as f32,
+                residual_scale,
+                &shape,
+            )?;
+
+            // Write the step's K/V back into the pool the engine owns: same rows the
+            // per-op path scatters before attention, written after the step's single
+            // submission completed.
+            let num_kv_heads = self.config.num_key_value_heads;
+            for (layer_idx, (k, v)) in rows.k.iter().zip(rows.v.iter()).enumerate() {
+                let k = Tensor::from_vec(k.clone(), (1, num_kv_heads, head_dim), &self.device)?;
+                let v = Tensor::from_vec(v.clone(), (1, num_kv_heads, head_dim), &self.device)?;
+                kv_storage.write_kv_slots(layer_idx, &slot_plan, &k, &v)?;
+            }
+            self.paged_attention_calls.fetch_add(
+                self.config.num_hidden_layers as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Tensor::from_vec(rows.hidden, (1, self.config.hidden_size), &self.device)?
+        } else {
+            let mut hidden = hidden;
+            for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+                // The prologue reads this layer's input row, which the previous layer just
+                // wrote back into `hidden`, so it is read here and not once before the loop.
+                let fused = match fused_seam.as_mut() {
+                    Some(seam) if fused_decode && fused_pos <= seam.max_pos() => {
+                        let row = hidden.flatten_all()?.to_vec1::<f32>()?;
+                        Some(seam.prologue(
                             layer_idx,
-                            &block_tables[s],
-                            context_lens[s],
-                        )?;
-                        let attn = self.gqa_attention(
-                            &q_s,
-                            &k_all.transpose(0, 1)?,
-                            &v_all.transpose(0, 1)?,
-                            masks[s].as_ref(),
-                        )?;
-                        attn_rows.push(
-                            attn.transpose(0, 1)?
-                                .reshape((query_lens[s], num_q_heads * head_dim))?,
-                        );
+                            &row,
+                            fused_pos,
+                            self.config.rms_norm_eps as f32,
+                        )?)
                     }
-                    Tensor::cat(&attn_rows.iter().collect::<Vec<_>>(), 0)?
-                }
-            };
-            let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
-            hidden = (hidden + &self.scale_residual(attn_proj)?)?;
+                    _ => None,
+                };
+                let (q, k, v) = match fused {
+                    // The fused kernel already applied RoPE, so the rows below are final.
+                    Some((q, k, v)) => (
+                        Tensor::from_vec(q, (1, num_q_heads, head_dim), &self.device)?,
+                        Tensor::from_vec(k, (1, num_kv_heads, head_dim), &self.device)?,
+                        Tensor::from_vec(v, (1, num_kv_heads, head_dim), &self.device)?,
+                    ),
+                    None => {
+                        let normed = self.rmsnorm(&hidden, &layer.attn_norm)?;
+                        let (q, k, v) = self.project_qkv(layer, &normed)?;
+                        let q = q.reshape((total, num_q_heads, head_dim))?;
+                        let k = k.reshape((total, num_kv_heads, head_dim))?;
+                        let v = v.reshape((total, num_kv_heads, head_dim))?;
+                        (
+                            self.rope_apply(&q, &cos, &sin)?,
+                            self.rope_apply(&k, &cos, &sin)?,
+                            v,
+                        )
+                    }
+                };
 
-            let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
-            let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
-            hidden = (hidden + &self.scale_residual(ffn_out)?)?;
-        }
+                // Scatter this step's K/V into the physical blocks the scheduler mapped.
+                kv_storage.write_kv_slots(layer_idx, &slot_plan, &k, &v)?;
+
+                let attn_out = match (&paged_decode, &decode_layout) {
+                    (Some(paged), _) => {
+                        // #86: the kernel reads K/V out of the block pool itself, so the
+                        // history is not gathered, padded or copied per layer.
+                        self.metal_paged_attention(&q, kv_storage, layer_idx, paged)?
+                    }
+                    (None, Some(layout)) => {
+                        // One query token per sequence: the whole batch attends in a single
+                        // padded GEMM instead of one attention pass per sequence (which is
+                        // what per-op overhead makes expensive at small batch sizes).
+                        // ponytail: each sequence is padded to the longest context in the batch,
+                        // so ragged batches waste lanes; a varlen kernel drops the padding.
+                        self.batch_decode_attention(&q, kv_storage, layer_idx, layout)?
+                    }
+                    (None, None) => {
+                        // Steps that mix prefill chunks with decode tokens attend per sequence
+                        // instead (those steps are latency- not throughput-critical).
+                        // ponytail: per-sequence attention costs one gather + a dozen ops per
+                        // sequence; a varlen/paged kernel over the whole batch removes that.
+                        let mut attn_rows = Vec::with_capacity(num_seqs);
+                        for s in 0..num_seqs {
+                            let q_s = q.narrow(0, offsets[s], query_lens[s])?.transpose(0, 1)?;
+                            let (k_all, v_all) = kv_storage.gather_blocks(
+                                layer_idx,
+                                &block_tables[s],
+                                context_lens[s],
+                            )?;
+                            let attn = self.gqa_attention(
+                                &q_s,
+                                &k_all.transpose(0, 1)?,
+                                &v_all.transpose(0, 1)?,
+                                masks[s].as_ref(),
+                            )?;
+                            attn_rows.push(
+                                attn.transpose(0, 1)?
+                                    .reshape((query_lens[s], num_q_heads * head_dim))?,
+                            );
+                        }
+                        Tensor::cat(&attn_rows.iter().collect::<Vec<_>>(), 0)?
+                    }
+                };
+                let attn_proj = self.linear(&layer.attn_output, &attn_out)?;
+                hidden = (hidden + &self.scale_residual(attn_proj)?)?;
+
+                let ffn_normed = self.rmsnorm(&hidden, &layer.ffn_norm)?;
+                let ffn_out = self.forward_mlp_block(layer_idx, &ffn_normed, layer)?;
+                hidden = (hidden + &self.scale_residual(ffn_out)?)?;
+            }
+            hidden
+        };
 
         let final_normed = self.rmsnorm(&hidden, &self.weights.norm)?;
 

@@ -1,6 +1,6 @@
 use crate::error::EngineError;
 use crate::metal::context::MetalContext;
-use metal::{Buffer, MTLSize};
+use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
 
 pub use crate::metal::paged_attention::{
     PagedAttentionParams, cpu_paged_attention, gpu_paged_attention_v2,
@@ -27,6 +27,21 @@ pub fn cpu_silu_gate_multiply(gate: &[f32], up: &[f32]) -> Vec<f32> {
             let silu = g / (1.0 + (-g).exp());
             silu * u
         })
+        .collect()
+}
+
+/// CPU reference of the residual add (ticket #110): `hidden + proj * scale`, the
+/// same op the tensor path computes as `hidden + scale_residual(proj)`.
+pub fn cpu_residual_add(hidden: &[f32], proj: &[f32], scale: f32) -> Vec<f32> {
+    assert_eq!(
+        hidden.len(),
+        proj.len(),
+        "hidden and proj must have same length"
+    );
+    hidden
+        .iter()
+        .zip(proj.iter())
+        .map(|(&h, &p)| h + p * scale)
         .collect()
 }
 
@@ -218,6 +233,45 @@ pub fn gpu_rope(
     Ok(())
 }
 
+/// Encodes the SiLU·gate multiply into a caller-owned encoder (ticket #110): one
+/// thread per element, no command buffer of its own. The self-committing
+/// [`gpu_silu_gate_multiply_buffer`] wraps this — one encoding logic, two submit
+/// strategies (#86).
+pub fn encode_silu_gate_multiply(
+    encoder: &ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    gate_buf: &Buffer,
+    up_buf: &Buffer,
+    out_buf: &Buffer,
+    len: usize,
+) {
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(gate_buf), 0);
+    encoder.set_buffer(1, Some(up_buf), 0);
+    encoder.set_buffer(2, Some(out_buf), 0);
+
+    dispatch_elementwise(encoder, len);
+}
+
+/// Dispatches one thread per element over `len` lanes, the geometry the
+/// elementwise kernels (`silu_gate`, `residual_add`) are written for.
+fn dispatch_elementwise(encoder: &ComputeCommandEncoderRef, len: usize) {
+    let total_threads = len as u64;
+    let threadgroup_width = total_threads.clamp(1, 256);
+    encoder.dispatch_threads(
+        MTLSize {
+            width: total_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: threadgroup_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 pub fn gpu_silu_gate_multiply_buffer(
     ctx: &MetalContext,
     gate_buf: &Buffer,
@@ -232,26 +286,7 @@ pub fn gpu_silu_gate_multiply_buffer(
 
     let command_buffer = ctx.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(pipeline);
-
-    encoder.set_buffer(0, Some(gate_buf), 0);
-    encoder.set_buffer(1, Some(up_buf), 0);
-    encoder.set_buffer(2, Some(out_buf), 0);
-
-    let total_threads = len as u64;
-    let threadgroup_width = total_threads.clamp(1, 256);
-    let threads_per_grid = MTLSize {
-        width: total_threads,
-        height: 1,
-        depth: 1,
-    };
-    let threads_per_threadgroup = MTLSize {
-        width: threadgroup_width,
-        height: 1,
-        depth: 1,
-    };
-
-    encoder.dispatch_threads(threads_per_grid, threads_per_threadgroup);
+    encode_silu_gate_multiply(encoder, pipeline, gate_buf, up_buf, out_buf, len);
     encoder.end_encoding();
 
     command_buffer.commit();
@@ -280,4 +315,78 @@ pub fn gpu_silu_gate_multiply(
         std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len);
     }
     Ok(out)
+}
+
+/// Encodes the residual add (`hidden += proj * scale`, in place on `hidden`) into
+/// a caller-owned encoder (ticket #110). Written together with its production
+/// caller — the one-command-buffer decode step in `src/model/fused_decode.rs` —
+/// which chains it after the O projection and after the MLP down projection.
+pub fn encode_residual_add(
+    encoder: &ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    proj_buf: &Buffer,
+    hidden_buf: &Buffer,
+    len: usize,
+    scale: f32,
+) {
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(proj_buf), 0);
+    encoder.set_buffer(1, Some(hidden_buf), 0);
+    encoder.set_bytes(
+        2,
+        std::mem::size_of::<f32>() as u64,
+        &scale as *const f32 as *const _,
+    );
+
+    dispatch_elementwise(encoder, len);
+}
+
+/// Dispatches the residual add on a self-created command buffer: encode via
+/// [`encode_residual_add`], commit, wait. The submit strategy callers that do not
+/// own a command buffer keep (ticket #110, same split as #109).
+pub fn gpu_residual_add_buffer(
+    ctx: &MetalContext,
+    proj_buf: &Buffer,
+    hidden_buf: &Buffer,
+    len: usize,
+    scale: f32,
+) -> Result<(), EngineError> {
+    let pipeline = ctx
+        .pipelines
+        .get("residual_add")
+        .ok_or_else(|| EngineError::Metal("Pipeline 'residual_add' not found in cache".into()))?;
+
+    let command_buffer = ctx.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encode_residual_add(encoder, pipeline, proj_buf, hidden_buf, len, scale);
+    encoder.end_encoding();
+
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    Ok(())
+}
+
+/// Residual add on host slices: uploads, dispatches and reads back the updated
+/// residual stream. Reference entry for parity tests; the decode step uses the
+/// encode form above.
+pub fn gpu_residual_add(
+    ctx: &MetalContext,
+    hidden: &[f32],
+    proj: &[f32],
+    scale: f32,
+) -> Result<Vec<f32>, EngineError> {
+    assert_eq!(
+        hidden.len(),
+        proj.len(),
+        "hidden and proj must have same length"
+    );
+    let len = hidden.len();
+
+    let proj_buf = ctx.alloc_buffer_with_data(proj);
+    let hidden_buf = ctx.alloc_buffer_with_data(hidden);
+
+    gpu_residual_add_buffer(ctx, &proj_buf, &hidden_buf, len, scale)?;
+
+    Ok(crate::metal::fused_layer::read_f32(&hidden_buf, len))
 }

@@ -129,6 +129,7 @@ fn fase2_budget_declares_the_f15_rows() {
         "ctx_latency_ratio",
         "spec_speedup_ratio",
         "sse_stream_consumed",
+        "ratio_vs_f32",
     ] {
         assert!(
             metrics.iter().any(|m| m == expected),
@@ -244,6 +245,7 @@ fn fase2_declares_which_f15_rows_are_measurable_today() {
         "spec_speedup_ratio",
         "ctx_latency_ratio",
         "sse_stream_consumed",
+        "ratio_vs_f32",
     ] {
         assert_eq!(
             row_in(&budget, metric).status,
@@ -537,5 +539,113 @@ fn the_ci_self_check_evidence_makes_the_gate_red() {
         2,
         "an unweighed report must skip, not pass or fail:\n{}",
         skipped.format_table()
+    );
+}
+
+/// A report carrying KV pool numbers, the way `bench --kv-type int8` emits it
+/// — injected through the JSON interchange the gate itself reads
+/// (`--gate-report`), so the test exercises exactly what CI consumes (#111).
+fn with_kv_fields(
+    report: &BenchmarkReport,
+    kv_type: &str,
+    bytes_per_token: usize,
+    ratio_vs_f32: f64,
+) -> BenchmarkReport {
+    let mut value = serde_json::to_value(report).expect("report serializes");
+    let obj = value.as_object_mut().expect("report is a JSON object");
+    obj.insert("kv_type".into(), serde_json::json!(kv_type));
+    obj.insert("bytes_per_token".into(), serde_json::json!(bytes_per_token));
+    obj.insert("ratio_vs_f32".into(), serde_json::json!(ratio_vs_f32));
+    serde_json::from_value(value).expect("report with kv fields parses")
+}
+
+/// Ticket #111: the kv-ratio floor judges quantized pools. A pool that saves
+/// almost nothing (1.5x) is red; a real one (3.75x at head_dim 64) is green;
+/// the F32 pool is the baseline and makes no compression claim, so its row
+/// skips instead of going red on an honest `bench --kv-type f32` run; and a
+/// report no engine filled has no number to judge, which is a skip too.
+#[test]
+fn kv_ratio_floor_is_judged_per_pool_type() {
+    let budget = asset_free(&fase2(), &["ratio_vs_f32"]);
+
+    // Below the floor: red, and the row names itself.
+    let report = with_kv_fields(&weighed_report(10.0, 200.0), "int8", 24, 1.5);
+    let outcome = evaluate_gate(&budget, &report).expect("gate evaluates");
+    assert_eq!(
+        row(&outcome, "ratio_vs_f32").verdict,
+        GateVerdict::Violated,
+        "1.5x is under the 3.0x floor:\n{}",
+        outcome.format_table()
+    );
+    assert_eq!(outcome.code(), 1);
+    assert!(
+        outcome
+            .reasons()
+            .iter()
+            .any(|r| r.starts_with("ratio_vs_f32: violated")),
+        "the red verdict must name the kv row: {:?}",
+        outcome.reasons()
+    );
+
+    // Above the floor: green.
+    let report = with_kv_fields(&weighed_report(10.0, 200.0), "int8", 24, 3.75);
+    let outcome = evaluate_gate(&budget, &report).expect("gate evaluates");
+    assert_eq!(
+        row(&outcome, "ratio_vs_f32").verdict,
+        GateVerdict::Passed,
+        "3.75x clears the 3.0x floor"
+    );
+
+    // F32 is the baseline (1.0x by definition): skipping is the honest verdict.
+    let report = with_kv_fields(&weighed_report(10.0, 200.0), "f32", 64, 1.0);
+    let outcome = evaluate_gate(&budget, &report).expect("gate evaluates");
+    match &row(&outcome, "ratio_vs_f32").verdict {
+        GateVerdict::Skipped(reason) => assert!(
+            reason.contains("baseline"),
+            "the skip must say the F32 pool is the baseline, got '{reason}'"
+        ),
+        other => panic!(
+            "an F32 run makes no compression claim, so it must not be {other:?} against a quantized floor"
+        ),
+    }
+
+    // No engine ran: no kv numbers to judge, so the row skips.
+    let outcome = evaluate_gate(&budget, &weighed_report(10.0, 200.0)).expect("gate evaluates");
+    match &row(&outcome, "ratio_vs_f32").verdict {
+        GateVerdict::Skipped(reason) => assert!(
+            reason.contains("no engine run") || reason.contains("carries no"),
+            "the skip must say why there is no number, got '{reason}'"
+        ),
+        other => panic!("expected a skip, got {other:?}"),
+    }
+}
+
+/// Ticket #111 extends the CI self-check: the committed violation evidence
+/// carries a synthetic INT8 pool at 2.0x — below the 3.0x floor — so the
+/// self-check budget must exit 1 on the kv row too, proving this floor can
+/// also go red, not just the bandwidth one.
+#[test]
+fn the_ci_self_check_evidence_breaks_the_kv_floor_too() {
+    let evidence = std::fs::read_to_string(repo_path("gates/self-check-violation.json"))
+        .expect("gates/self-check-violation.json is committed for the CI self-check");
+    let report: BenchmarkReport =
+        serde_json::from_str(&evidence).expect("the self-check evidence report parses");
+    let budget = GateBudget::from_file(&repo_path("gates/self-check-budget.json"))
+        .expect("gates/self-check-budget.json parses");
+    let outcome = evaluate_gate(&budget, &report).expect("gate evaluates");
+
+    assert_eq!(
+        outcome.code(),
+        1,
+        "the kv floor must be able to go red:\n{}",
+        outcome.format_table()
+    );
+    assert!(
+        outcome
+            .reasons()
+            .iter()
+            .any(|r| r.starts_with("ratio_vs_f32: violated")),
+        "the red verdict must name the kv row: {:?}",
+        outcome.reasons()
     );
 }

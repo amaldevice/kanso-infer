@@ -158,13 +158,13 @@ pub const FEATURES: &[FeatureSpec] = &[
         wired: wired!(crate::model::Model::metal_paged_attention),
     },
     FeatureSpec {
-        // Ticket #87: the wired part is the layer *prologue* — fused RMSNorm + QKV + RoPE,
-        // one command buffer per layer, entered from `Model::forward_batch`. Attention
-        // stays on the #86 paged-attention path and O/MLP stay on the tensor path, so the
-        // "one command buffer per step covering attention/O/MLP" criterion is still debt:
-        // chaining it needs a residual-add and a SwiGLU kernel that do not exist yet
-        // (spec #82 puts new kernels out of scope). Recorded in
-        // `docs/adr/0002-fused-decode-scope.md`, not hidden behind the ✅.
+        // Ticket #110: the whole decoder layer — fused RMSNorm + QKV + RoPE prologue,
+        // PagedAttention v2, O-projection + residual add, SwiGLU MLP + residual add —
+        // runs on ONE command buffer per decode step, entered from
+        // `Model::forward_batch` and measured by `Model::metal_decode_command_buffers`.
+        // ADR 0002's debt (one buffer per layer prologue only) is paid; the final norm
+        // and lm_head stay on the tensor path by that ADR's scope. Geometries the
+        // kernels cannot represent keep the per-op fallback.
         name: "Fused Metal llama-layer kernel",
         status: FeatureStatus::Wired,
         exec_pointer: "src/metal/fused_layer.rs src/model/fused_decode.rs",
